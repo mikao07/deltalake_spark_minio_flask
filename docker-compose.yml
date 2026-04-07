@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: car_rental_flask_app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      # 基礎 Flask 設定
+      PORT: "5000"
+      FLASK_DEBUG: "true"
+      LOG_LEVEL: "INFO"
+      
+      # MinIO / S3A 連線設定 (指向你的 Ubuntu 主機)
+      # 這裡會優先讀取環境變數，若無則使用後方的預設值
+      MINIO_ENDPOINT: "http://192.168.137.130:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      
+      # 資料路徑設定
+      BUCKET_NAME: "data-lake"
+      BRONZE_TABLE_PATH: "s3a://data-lake/bronze/raw_features"
+      
+      # Spark 連線 MinIO 的關鍵參數 (修正 Path Not Found 的核心)
+      S3A_PATH_STYLE_ACCESS: "true"
+      S3A_CONNECTION_SSL_ENABLED: "false"
+      S3A_IMPL: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+
+    # 因為連線到外部 Linux，不需要再 depends_on 本地服務
+    restart: always

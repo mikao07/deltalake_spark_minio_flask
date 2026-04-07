@@ -1,0 +1,13 @@
+Flask==3.0.3
+minio==7.2.10
+psutil==5.9.8
+Pillow==10.3.0
+pytesseract==0.3.10
+
+# Delta Lake / Spark（版本需互相相容）
+delta-spark==2.4.0
+pyspark==3.4.1
+
+# Gold 層 Jieba 分詞（與 Notebook；executors 亦可改用 JIEBA_ZIP_PATH + addPyFile）
+jieba>=0.42.1
+
