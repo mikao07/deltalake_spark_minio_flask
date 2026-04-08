@@ -10,7 +10,8 @@ Flask + Spark + Delta Lake 的簡化示範專案，透過 API 讀寫/維護 Delt
 - **Delta Upsert**：`POST /delta/upsert`（可用 `ADMIN_TOKEN` 保護）
 - **僅保留最新批次**：`POST /delta/cleanup-latest-only`（可用 `ADMIN_TOKEN` 保護，支援 `dry_run`）
 - **Bronze OCR 攝入**（對齊 `MinIO_DeltaLake_Spark_1.1.ipynb`）：`POST /delta/ocr/bronze/run` — 以 `binaryFile` 讀 MinIO 影像 → Tesseract → 寫入 Delta Bronze
-- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，欄位 `file` 或 `files`）— 寫入 `BUCKET_NAME` 下 `RAW_IMAGE_PREFIX`；可選 `run_ocr=true` 上傳後接續跑 Bronze OCR
+- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，欄位 `file` 或 `files`，且 `dataset_id` 必填）— 寫入 `BUCKET_NAME` 下 `RAW_IMAGE_PREFIX/{dataset_id}/...`；預設若 **同名物件已存在** 會自動改為 `檔名_YYYYMMDD_HHMMSS.ext`（`on_duplicate=suffix`），亦可設為 `overwrite` 覆寫；可選 `run_ocr=true` 上傳後接續跑 Bronze OCR（只跑該 dataset）
+- **查詢既有 dataset_id**：`GET /api/datasets`
 
 ### 需求
 
@@ -50,6 +51,8 @@ python .\app.py
 ```
 
 預設會在 `http://127.0.0.1:5000` 服務。
+
+瀏覽器上傳圖至 MinIO（含 dataset_id、可手動觸發指定 dataset OCR）：開啟 **`http://127.0.0.1:5000/upload`**。
 
 ### Docker Compose（MinIO + Web 一鍵起）
 
@@ -132,16 +135,17 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/cleanup-latest-
 curl.exe -s -X POST "http://127.0.0.1:5000/api/upload/images" `
   -H "X-Admin-Token: YOUR_TOKEN" `
   -F "file=@C:\path\to\photo.png" `
+  -F "dataset_id=invoice_ocr" `
   -F "run_ocr=true" `
   -F "write_mode=append"
 ```
 
 （PowerShell 7+ 也可用 `Invoke-RestMethod -Form`。）
 
-Bronze OCR（僅跑 OCR、不上傳；先 dry-run 確認路徑）：
+Bronze OCR（僅跑 OCR、不上傳；先 dry-run 確認路徑，可指定 dataset）：
 
 ```powershell
-$body = @{ dry_run = $true } | ConvertTo-Json
+$body = @{ dry_run = $true; dataset_id = "invoice_ocr" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run" -ContentType "application/json" -Body $body
 ```
 
@@ -152,4 +156,23 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run"
 ```powershell
 pip install -r requirements-dev.txt
 pytest -q
+```
+
+### Requirements 檔案用途
+
+- `requirements.txt`：日常開發用主依賴清單（維護成本較低）。
+- `requirements-dev.txt`：僅開發/測試工具（目前為 `pytest`）。
+- `requirements-lock.txt`：部署或重現環境時使用（版本全鎖定，結果較可重現）。
+
+常見使用方式：
+
+```powershell
+# 開發
+pip install -r requirements.txt
+
+# 測試工具
+pip install -r requirements-dev.txt
+
+# 部署 / 嚴格重現
+pip install -r requirements-lock.txt
 ```

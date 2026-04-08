@@ -69,3 +69,6 @@ RAW_IMAGES_PATH = os.getenv("RAW_IMAGES_PATH", f"s3a://{BUCKET_NAME}/{RAW_IMAGE_
 OCR_LANG = os.getenv("OCR_LANG", "chi_tra+eng")
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 
+# 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
+UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()
+

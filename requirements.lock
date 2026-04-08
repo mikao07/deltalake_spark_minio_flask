@@ -1,0 +1,11 @@
+﻿# Locked dependencies for this project
+# Generated from current project requirements and resolved jieba version.
+Flask==3.0.3
+minio==7.2.10
+psutil==5.9.8
+Pillow==10.3.0
+pytesseract==0.3.10
+
+delta-spark==2.4.0
+pyspark==3.4.1
+jieba==0.42.1

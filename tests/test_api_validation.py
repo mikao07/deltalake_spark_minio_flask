@@ -1,4 +1,5 @@
 import os
+from io import BytesIO
 
 
 def _set_env(monkeypatch):
@@ -22,6 +23,14 @@ def test_health_ok(monkeypatch):
     r = c.get("/health")
     assert r.status_code == 200
     assert r.get_json() == {"status": "ok"}
+
+
+def test_upload_page_ok(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.get("/upload")
+    assert r.status_code == 200
+    assert b"upload-form" in r.data
+    assert b"result-table" in r.data
 
 
 def test_delta_read_requires_table_path(monkeypatch):
@@ -69,9 +78,19 @@ def test_delta_gold_word_frequency_run_dry_run(monkeypatch):
 
 def test_upload_images_requires_file(monkeypatch):
     c = _client(monkeypatch)
-    r = c.post("/api/upload/images", data={})
+    r = c.post("/api/upload/images", data={"dataset_id": "demo"})
     assert r.status_code == 400
     assert "file" in r.get_json()["error"] or "檔案" in r.get_json()["error"]
+
+
+def test_upload_images_requires_dataset_id(monkeypatch):
+    c = _client(monkeypatch)
+    data = {
+        "file": (BytesIO(b"fake"), "x.png"),
+    }
+    r = c.post("/api/upload/images", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert "dataset_id" in r.get_json()["error"]
 
 
 def test_delta_ocr_bronze_run_dry_run_no_spark(monkeypatch):
@@ -85,6 +104,19 @@ def test_delta_ocr_bronze_run_dry_run_no_spark(monkeypatch):
     assert j["status"] == "dry_run"
     assert "raw_images_path" in j
     assert "bronze_path" in j
+
+
+def test_delta_ocr_bronze_run_dry_run_with_dataset(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/ocr/bronze/run",
+        json={"dry_run": True, "dataset_id": "invoice_ocr"},
+    )
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] == "dry_run"
+    assert j["dataset_id"] == "invoice_ocr"
+    assert j["raw_images_path"].endswith("/invoice_ocr/")
 
 
 def test_delta_gold_word_frequency_run_rejects_bad_coalesce(monkeypatch):

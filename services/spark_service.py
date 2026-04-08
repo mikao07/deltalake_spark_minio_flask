@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from typing import Any, Dict, Iterable, List
 
@@ -249,6 +250,24 @@ _COMMON_NOISE = _FINAL_NOISE + [
 _MIN_WORD_LENGTH = 2
 
 
+def _normalize_dataset_id_or_none(dataset_id: str | None) -> str | None:
+    if dataset_id is None:
+        return None
+    raw = str(dataset_id).strip().lower()
+    if not raw:
+        return None
+    safe = re.sub(r"[^a-z0-9_-]", "", raw)
+    return safe or None
+
+
+def _filter_df_by_dataset_id(df: DataFrame, dataset_id: str | None) -> DataFrame:
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if not ds:
+        return df
+    # image_path 來源為 raw/images/{dataset_id}/...，用路徑片段過濾
+    return df.filter(col("image_path").contains(f"/{ds}/"))
+
+
 def register_jieba_pyfile_if_needed(spark: SparkSession, jieba_zip_path: str | None) -> None:
     """
     將 MinIO 上的 jieba.zip 分發給 executors（與 Notebook 的 spark.sparkContext.addPyFile 相同）。
@@ -354,18 +373,28 @@ def run_gold_word_frequency_etl(
     write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
 
 
-def get_gold_word_frequency_data(limit: int = 10) -> List[Dict[str, Any]]:
+def get_gold_word_frequency_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict[str, Any]]:
     """
     讀取 Gold 詞頻表（GOLD_WORD_COUNT_PATH）依 frequency 降序前 N 筆。
     """
 
     spark = SparkManager().spark
-    df = (
-        read_delta_table(spark, GOLD_WORD_COUNT_PATH)
-        .orderBy(col("frequency").desc())
-        .limit(limit)
-    )
-    return [row.asDict(recursive=True) for row in df.collect()]
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if not ds:
+        df = (
+            read_delta_table(spark, GOLD_WORD_COUNT_PATH)
+            .orderBy(col("frequency").desc())
+            .limit(lim)
+        )
+        return [row.asDict(recursive=True) for row in df.collect()]
+
+    # 指定 dataset_id 時，直接從 Silver OCR 即時計算詞頻，避免混合不同資料集
+    register_jieba_pyfile_if_needed(spark, JIEBA_ZIP_PATH)
+    df_silver = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
+    df_silver = _filter_df_by_dataset_id(df_silver, ds)
+    df_wc = build_gold_word_frequency_dataframe(df_silver, apply_noise_filter=True).limit(lim)
+    return [row.asDict(recursive=True) for row in df_wc.collect()]
 
 
 # ---------------------------------------------------------------------------
@@ -393,13 +422,15 @@ def add_etl_timestamp(df: DataFrame, col_name: str = "etl_update_timestamp") -> 
 # ---------------------------------------------------------------------------
 # 核心功能
 # ---------------------------------------------------------------------------
-def get_bronze_data() -> List[Dict[str, Any]]:
+def get_bronze_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict[str, Any]]:
     """
     讀取 `BRONZE_TABLE_PATH` 並回傳前 10 筆資料（JSON 可序列化格式）。
     """
 
     spark = SparkManager().spark
-    df = read_delta_table(spark, BRONZE_TABLE_PATH).limit(10)
+    lim = max(1, min(int(limit), 200))
+    df = read_delta_table(spark, BRONZE_TABLE_PATH)
+    df = _filter_df_by_dataset_id(df, dataset_id).limit(lim)
     return [row.asDict(recursive=True) for row in df.collect()]
 
 

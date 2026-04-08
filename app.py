@@ -15,7 +15,7 @@ from config import (
     RAW_IMAGES_PATH,
     SILVER_OCR_TABLE_PATH,
 )
-from services.minio_upload import upload_file_bytes
+from services.minio_upload import list_dataset_ids, normalize_dataset_id, upload_file_bytes
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
 from services.spark_service import (
     SparkManager,
@@ -139,31 +139,53 @@ def health():
     return {"status": "ok"}
 
 
-def _safe_bronze_preview():
+def _safe_bronze_preview(dataset_id: str | None = None):
     try:
-        return get_bronze_data(), None
+        return get_bronze_data(limit=10, dataset_id=dataset_id), None
     except Exception as e:
         _logger.warning("bronze_preview_failed: %s", e)
         return [], str(e)
 
 
-def _safe_gold_preview(limit: int = 15):
+def _safe_gold_preview(limit: int = 15, dataset_id: str | None = None):
     try:
-        return get_gold_word_frequency_data(limit=limit), None
+        return get_gold_word_frequency_data(limit=limit, dataset_id=dataset_id), None
     except Exception as e:
         _logger.warning("gold_preview_failed: %s", e)
         return [], str(e)
 
 
+@app.get("/upload")
+def upload_page():
+    """瀏覽器上傳圖片至 MinIO（表單 POST 改由前端 fetch 呼叫 /api/upload/images）。"""
+    return render_template("upload.html")
+
+
 @app.get("/")
 def index():
+    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    selected_dataset_id: str | None = None
+    if dataset_raw:
+        try:
+            selected_dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError:
+            selected_dataset_id = None
+
+    dataset_options: list[str] = []
+    try:
+        dataset_options = list_dataset_ids()
+    except Exception as e:
+        _logger.warning("list_dataset_ids_for_index_failed: %s", e)
+
     sys_status = get_system_status()
-    bronze_rows, bronze_error = _safe_bronze_preview()
-    gold_rows, gold_error = _safe_gold_preview(limit=15)
+    bronze_rows, bronze_error = _safe_bronze_preview(dataset_id=selected_dataset_id)
+    gold_rows, gold_error = _safe_gold_preview(limit=15, dataset_id=selected_dataset_id)
     return render_template(
         "index.html",
         cpu_percent=sys_status.get("cpu_percent"),
         memory_percent=sys_status.get("memory_percent"),
+        dataset_options=dataset_options,
+        selected_dataset_id=selected_dataset_id,
         bronze_rows=bronze_rows,
         bronze_error=bronze_error,
         gold_rows=gold_rows,
@@ -176,6 +198,20 @@ def index():
 @app.get("/api/status")
 def api_status():
     return jsonify(get_system_status())
+
+
+@app.get("/api/datasets")
+def api_datasets():
+    """列出 MinIO raw/images 下已存在的 dataset_id。"""
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+    try:
+        datasets = list_dataset_ids()
+    except Exception as e:
+        _logger.warning("list_dataset_ids_failed: %s", e)
+        return _json_error(f"讀取 dataset_id 清單失敗：{e}", 503)
+    return jsonify({"datasets": datasets, "count": len(datasets)})
 
 
 @app.get("/api/gold/word-frequency")
@@ -192,10 +228,19 @@ def api_gold_word_frequency():
         return _json_error("limit 必須是整數。", 400)
     limit = max(1, min(limit, 200))
 
-    rows = get_gold_word_frequency_data(limit=limit)
+    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    dataset_id: str | None = None
+    if dataset_raw:
+        try:
+            dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+    rows = get_gold_word_frequency_data(limit=limit, dataset_id=dataset_id)
     return jsonify(
         {
             "path": GOLD_WORD_COUNT_PATH,
+            "dataset_id": dataset_id,
             "rows": rows,
             "count": len(rows),
         }
@@ -410,6 +455,7 @@ def delta_ocr_bronze_run():
 
     body（欄位皆可選，路徑須符合 ALLOWED_DELTA_PATH_PREFIXES）:
       {
+        "dataset_id": "invoice_ocr",
         "raw_images_path": "s3a://data-lake/raw/images/",
         "bronze_path": "s3a://data-lake/bronze/raw_features/",
         "write_mode": "overwrite",
@@ -430,13 +476,24 @@ def delta_ocr_bronze_run():
     if not isinstance(body, dict):
         return _json_error("body 必須是 JSON object。", 400)
 
+    dataset_raw = body.get("dataset_id")
+    dataset_id: str | None = None
+    if dataset_raw is not None:
+        if not isinstance(dataset_raw, str):
+            return _json_error("dataset_id 必須是字串。", 400)
+        try:
+            dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
     raw_raw = body.get("raw_images_path")
     bronze_raw = body.get("bronze_path")
-    raw_images_path = (
-        raw_raw.strip()
-        if isinstance(raw_raw, str) and raw_raw.strip()
-        else RAW_IMAGES_PATH
-    )
+    if isinstance(raw_raw, str) and raw_raw.strip():
+        raw_images_path = raw_raw.strip()
+    else:
+        raw_images_path = RAW_IMAGES_PATH
+        if dataset_id:
+            raw_images_path = f"{raw_images_path.rstrip('/')}/{dataset_id}/"
     bronze_path = (
         bronze_raw.strip()
         if isinstance(bronze_raw, str) and bronze_raw.strip()
@@ -458,6 +515,7 @@ def delta_ocr_bronze_run():
     if dry_run:
         payload: Dict[str, Any] = {
             "status": "dry_run",
+            "dataset_id": dataset_id,
             "raw_images_path": raw_images_path,
             "bronze_path": bronze_path,
             "write_mode": write_mode,
@@ -496,6 +554,7 @@ def delta_ocr_bronze_run():
     return jsonify(
         {
             "status": "ok",
+            "dataset_id": dataset_id,
             "raw_images_path": raw_images_path,
             "bronze_path": bronze_path,
             "write_mode": write_mode,
@@ -514,9 +573,11 @@ def api_upload_images():
     表單欄位：
     - file：單檔，或
     - files：多檔（可重複欄位名 files）
-    - subfolder（可選）：寫在 raw/images/ 底下的子目錄名（僅允許英數、-、_、/）
+    - dataset_id（必填）：資料分類代碼（英數、-、_），會寫入 raw/images/{dataset_id}/...
+    - subfolder（可選）：寫在 raw/images/{dataset_id}/ 底下的子目錄名（僅允許英數、-、_、/）
     - run_ocr（可選）：true / 1 時，上傳完成後呼叫既有 Bronze OCR（Spark）
     - write_mode（可選，僅當 run_ocr 時）：overwrite 或 append，預設 append（避免覆寫整張 Bronze 表）
+    - on_duplicate（可選）：suffix（預設，同名已存在則改為 檔名_時間戳.ext）或 overwrite（覆寫）
 
     需設定 MINIO_ACCESS_KEY / MINIO_SECRET_KEY；若設定 ADMIN_TOKEN 則需 header X-Admin-Token。
     """
@@ -526,6 +587,10 @@ def api_upload_images():
         return err
 
     from pathlib import Path
+
+    dataset_id = (request.form.get("dataset_id") or "").strip().lower()
+    if not dataset_id:
+        return _json_error("dataset_id 必填。", 400)
 
     subfolder = request.form.get("subfolder") or None
     if subfolder is not None:
@@ -541,6 +606,11 @@ def api_upload_images():
 
     if not file_list:
         return _json_error("請提供檔案：欄位名 file 或 files。", 400)
+
+    dup_policy = request.form.get("on_duplicate", "").strip().lower()
+    if dup_policy and dup_policy not in ("suffix", "overwrite"):
+        return _json_error('on_duplicate 必須是 \"suffix\" 或 \"overwrite\"。', 400)
+    on_duplicate_arg = dup_policy if dup_policy else None
 
     uploaded: List[Dict[str, Any]] = []
     for f in file_list:
@@ -558,9 +628,11 @@ def api_upload_images():
         try:
             info = upload_file_bytes(
                 filename=name,
+                dataset_id=dataset_id,
                 data=data,
                 content_type=f.mimetype or None,
                 subfolder=subfolder,
+                on_duplicate=on_duplicate_arg,
             )
         except RuntimeError as e:
             return _json_error(str(e), 503)
@@ -581,7 +653,7 @@ def api_upload_images():
         try:
             run_bronze_ocr_ingest(
                 spark,
-                raw_images_path=RAW_IMAGES_PATH,
+                raw_images_path=f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
                 bronze_path=BRONZE_TABLE_PATH,
                 write_mode=wm,
             )
@@ -591,7 +663,8 @@ def api_upload_images():
             _logger.exception("upload_then_ocr_failed")
             return _json_error(f"OCR 執行失敗：{e}", 500)
         ocr_payload = {
-            "raw_images_path": RAW_IMAGES_PATH,
+            "dataset_id": normalize_dataset_id(dataset_id),
+            "raw_images_path": f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
             "bronze_path": BRONZE_TABLE_PATH,
             "write_mode": wm,
         }
@@ -599,6 +672,7 @@ def api_upload_images():
     out: Dict[str, Any] = {
         "status": "ok",
         "count": len(uploaded),
+        "dataset_id": dataset_id,
         "uploaded": uploaded,
         "raw_images_prefix": RAW_IMAGES_PATH,
     }
