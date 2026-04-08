@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import os
 from typing import Optional
+from urllib.parse import urlparse
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, length, lit, udf
 from pyspark.sql.types import StringType
+from minio.error import S3Error
+
+from config import BUCKET_NAME, RAW_IMAGE_PREFIX
+from services.minio_upload import ensure_bucket, get_minio_client
 
 
 def _ocr_binary_to_text(image_content) -> Optional[str]:
@@ -61,6 +66,80 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
 _ocr_udf = udf(_ocr_binary_to_text, StringType())
 
 
+def _extract_bucket_and_prefix(raw_images_path: str) -> tuple[str, str]:
+    path = (raw_images_path or "").strip()
+    if not path.startswith("s3a://"):
+        raise ValueError("raw_images_path 必須是 s3a://bucket/prefix 形式。")
+    u = urlparse(path)
+    bucket = (u.netloc or "").strip()
+    prefix = (u.path or "").lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    if not bucket:
+        raise ValueError("raw_images_path 缺少 bucket。")
+    return bucket, prefix
+
+
+def _list_and_read_via_minio(raw_images_path: str, limit: int | None = None) -> list[dict]:
+    """
+    使用 MinIO SDK 列檔並讀取 bytes。回傳 list[{"image_path","image_content"}]。
+    """
+    bucket, prefix = _extract_bucket_and_prefix(raw_images_path)
+    client = get_minio_client()
+    ensure_bucket(client, bucket)
+
+    rows: list[dict] = []
+    max_n = None if limit is None else max(1, int(limit))
+    try:
+        for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+            name = getattr(obj, "object_name", "") or ""
+            if not name or name.endswith("/"):
+                continue
+            if max_n is not None and len(rows) >= max_n:
+                break
+            resp = client.get_object(bucket, name)
+            try:
+                data = resp.read()
+            finally:
+                resp.close()
+                resp.release_conn()
+            rows.append(
+                {
+                    "image_path": f"s3a://{bucket}/{name}",
+                    "image_content": data,
+                }
+            )
+    except S3Error as e:
+        raise RuntimeError(f"MinIO SDK 讀取影像失敗：{e}") from e
+    return rows
+
+
+def _build_df_paths(spark: SparkSession, raw_images_path: str):
+    """
+    優先使用 Spark binaryFile；若為 0 筆則 fallback 到 MinIO SDK。
+    """
+    df_paths = (
+        spark.read.format("binaryFile")
+        .load(raw_images_path)
+        .select(
+            col("path").alias("image_path"),
+            col("content").alias("image_content"),
+        )
+    )
+    try:
+        cnt = df_paths.limit(1).count()
+    except Exception:
+        cnt = 0
+    if cnt > 0:
+        return df_paths
+
+    # Spark binaryFile 讀不到時 fallback（常見於特定 MinIO/S3A 相容性）
+    rows = _list_and_read_via_minio(raw_images_path, limit=None)
+    if not rows:
+        return spark.createDataFrame([], "image_path string, image_content binary")
+    return spark.createDataFrame(rows)
+
+
 def run_bronze_ocr_ingest(
     spark: SparkSession,
     *,
@@ -77,14 +156,7 @@ def run_bronze_ocr_ingest(
     if write_mode not in ("overwrite", "append"):
         raise ValueError('write_mode 必須是 \"overwrite\" 或 \"append\"。')
 
-    df_paths = (
-        spark.read.format("binaryFile")
-        .load(raw_images_path)
-        .select(
-            col("path").alias("image_path"),
-            col("content").alias("image_content"),
-        )
-    )
+    df_paths = _build_df_paths(spark, raw_images_path)
 
     df_ocr = (
         df_paths.withColumn("extracted_text", _ocr_udf(col("image_content")))
@@ -105,6 +177,8 @@ def preview_raw_images_sample(
     """回傳即將送 OCR 的檔案路徑與內容長度（不執行 Tesseract，供 dry_run 用）。"""
 
     lim = max(1, min(int(limit), 50))
+
+    # 先走 Spark binaryFile
     df = (
         spark.read.format("binaryFile")
         .load(raw_images_path)
@@ -114,4 +188,13 @@ def preview_raw_images_sample(
         )
         .limit(lim)
     )
-    return [row.asDict(recursive=True) for row in df.collect()]
+    rows = [row.asDict(recursive=True) for row in df.collect()]
+    if rows:
+        return rows
+
+    # Spark 看不到時 fallback 到 MinIO SDK
+    sdk_rows = _list_and_read_via_minio(raw_images_path, limit=lim)
+    return [
+        {"image_path": r["image_path"], "content_length": len(r["image_content"])}
+        for r in sdk_rows
+    ]

@@ -12,10 +12,18 @@ from config import (
     BUCKET_NAME,
     BRONZE_TABLE_PATH,
     GOLD_WORD_COUNT_PATH,
+    MINIO_ENDPOINT,
+    RAW_IMAGE_PREFIX,
     RAW_IMAGES_PATH,
     SILVER_OCR_TABLE_PATH,
 )
-from services.minio_upload import list_dataset_ids, normalize_dataset_id, upload_file_bytes
+from services.minio_upload import (
+    ensure_bucket,
+    get_minio_client,
+    list_dataset_ids,
+    normalize_dataset_id,
+    upload_file_bytes,
+)
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
 from services.spark_service import (
     SparkManager,
@@ -212,6 +220,183 @@ def api_datasets():
         _logger.warning("list_dataset_ids_failed: %s", e)
         return _json_error(f"讀取 dataset_id 清單失敗：{e}", 503)
     return jsonify({"datasets": datasets, "count": len(datasets)})
+
+
+@app.get("/api/debug/storage-check")
+def api_debug_storage_check():
+    """
+    對比 MinIO SDK 與 Spark binaryFile 對同一路徑的可見檔案，快速定位環境不一致問題。
+    query:
+      - dataset_id（可選）
+      - limit（可選，預設 10，最大 50）
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    raw = request.args.get("dataset_id", "").strip().lower()
+    dataset_id: str | None = None
+    if raw:
+        try:
+            dataset_id = normalize_dataset_id(raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+    lim_raw = request.args.get("limit", "10")
+    try:
+        limit = int(lim_raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 50))
+
+    # 同步產生 Spark 端要讀的 s3a path
+    spark_raw_path = RAW_IMAGES_PATH
+    if dataset_id:
+        spark_raw_path = f"{spark_raw_path.rstrip('/')}/{dataset_id}/"
+
+    # MinIO SDK 端 prefix
+    prefix = RAW_IMAGE_PREFIX.strip("/").strip()
+    if dataset_id:
+        prefix = f"{prefix}/{dataset_id}/"
+    else:
+        prefix = f"{prefix}/"
+
+    minio_items: list[str] = []
+    minio_err: str | None = None
+    try:
+        client = get_minio_client()
+        ensure_bucket(client, BUCKET_NAME)
+        for obj in client.list_objects(BUCKET_NAME, prefix=prefix, recursive=True):
+            name = getattr(obj, "object_name", "") or ""
+            if name:
+                minio_items.append(name)
+            if len(minio_items) >= limit:
+                break
+    except Exception as e:
+        minio_err = str(e)
+
+    spark_items: list[dict] = []
+    spark_err: str | None = None
+    try:
+        spark = _get_spark_manager().spark
+        spark_items = preview_raw_images_sample(spark, spark_raw_path, limit=limit)
+    except Exception as e:
+        spark_err = str(e)
+
+    return jsonify(
+        {
+            "dataset_id": dataset_id,
+            "config": {
+                "MINIO_ENDPOINT": MINIO_ENDPOINT,
+                "BUCKET_NAME": BUCKET_NAME,
+                "RAW_IMAGE_PREFIX": RAW_IMAGE_PREFIX,
+                "RAW_IMAGES_PATH": RAW_IMAGES_PATH,
+            },
+            "resolved": {
+                "sdk_prefix": prefix,
+                "spark_raw_images_path": spark_raw_path,
+            },
+            "minio_sdk": {
+                "count": len(minio_items),
+                "items": minio_items,
+                "error": minio_err,
+            },
+            "spark_binaryfile": {
+                "count": len(spark_items),
+                "items": spark_items,
+                "error": spark_err,
+            },
+        }
+    )
+
+
+@app.get("/api/health/storage")
+def api_health_storage():
+    """
+    Storage 健康檢查（MinIO SDK vs Spark S3A 可見性）：
+    - ok: 兩邊都能看到資料（或皆可連線且無錯）
+    - degraded: MinIO SDK 有資料但 Spark S3A 看不到（通常需走 fallback）
+    - down: 至少一邊發生連線/讀取錯誤且無法提供可用結果
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    raw = request.args.get("dataset_id", "").strip().lower()
+    dataset_id: str | None = None
+    if raw:
+        try:
+            dataset_id = normalize_dataset_id(raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+    lim_raw = request.args.get("limit", "10")
+    try:
+        limit = int(lim_raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 50))
+
+    spark_raw_path = RAW_IMAGES_PATH
+    if dataset_id:
+        spark_raw_path = f"{spark_raw_path.rstrip('/')}/{dataset_id}/"
+
+    prefix = RAW_IMAGE_PREFIX.strip("/").strip()
+    if dataset_id:
+        prefix = f"{prefix}/{dataset_id}/"
+    else:
+        prefix = f"{prefix}/"
+
+    sdk_count = 0
+    sdk_error: str | None = None
+    try:
+        client = get_minio_client()
+        ensure_bucket(client, BUCKET_NAME)
+        for _ in client.list_objects(BUCKET_NAME, prefix=prefix, recursive=True):
+            sdk_count += 1
+            if sdk_count >= limit:
+                break
+    except Exception as e:
+        sdk_error = str(e)
+
+    spark_count = 0
+    spark_error: str | None = None
+    try:
+        spark = _get_spark_manager().spark
+        spark_count = len(preview_raw_images_sample(spark, spark_raw_path, limit=limit))
+    except Exception as e:
+        spark_error = str(e)
+
+    status = "ok"
+    hint = "storage looks healthy"
+    if sdk_error or spark_error:
+        if sdk_error and spark_error:
+            status = "down"
+            hint = "both MinIO SDK and Spark S3A checks failed"
+        else:
+            status = "degraded"
+            hint = "one check failed; OCR may rely on fallback path"
+    elif sdk_count > 0 and spark_count == 0:
+        status = "degraded"
+        hint = "MinIO SDK can list objects but Spark S3A cannot; using fallback is recommended"
+
+    http_code = 200 if status == "ok" else 503 if status == "down" else 200
+    return (
+        jsonify(
+            {
+                "status": status,
+                "hint": hint,
+                "dataset_id": dataset_id,
+                "resolved": {
+                    "sdk_prefix": prefix,
+                    "spark_raw_images_path": spark_raw_path,
+                },
+                "minio_sdk": {"count": sdk_count, "error": sdk_error},
+                "spark_binaryfile": {"count": spark_count, "error": spark_error},
+            }
+        ),
+        http_code,
+    )
 
 
 @app.get("/api/gold/word-frequency")
@@ -538,6 +723,20 @@ def delta_ocr_bronze_run():
         return jsonify(payload)
 
     spark = _get_spark_manager().spark
+    # 避免「看似成功但其實無資料」：正式執行前先確認至少有 1 筆可處理影像
+    try:
+        sample_files = preview_raw_images_sample(spark, raw_images_path, limit=1)
+    except Exception as e:
+        _logger.warning("ocr_bronze_precheck_failed: %s", e)
+        return _json_error(f"檢查 OCR 來源路徑失敗：{e}", 400)
+    if not sample_files:
+        return _json_error(
+            "OCR 來源路徑沒有可處理圖片，請先確認上傳位置與 dataset_id 是否一致。",
+            400,
+            dataset_id=dataset_id,
+            raw_images_path=raw_images_path,
+        )
+
     try:
         run_bronze_ocr_ingest(
             spark,

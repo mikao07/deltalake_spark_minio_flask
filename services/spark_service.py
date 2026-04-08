@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List
 
 import psutil
@@ -51,6 +52,30 @@ PACKAGES = (
 S3A_CONNECTION_SSL_ENABLED_VALUE = S3A_CONNECTION_SSL_ENABLED
 
 
+def _normalize_s3a_endpoint(raw_endpoint: str) -> tuple[str, str]:
+    """
+    將 MINIO_ENDPOINT 正規化給 Spark S3A 使用：
+    - endpoint: host:port（不含 scheme）
+    - ssl_enabled: "true" / "false"
+    """
+    raw = (raw_endpoint or "").strip()
+    if not raw:
+        return "127.0.0.1:9000", "false"
+
+    if "://" in raw:
+        u = urlparse(raw)
+        host = u.hostname or "127.0.0.1"
+        if u.port:
+            endpoint = f"{host}:{u.port}"
+        else:
+            endpoint = f"{host}:443" if u.scheme == "https" else f"{host}:9000"
+        ssl_enabled = "true" if u.scheme == "https" else "false"
+        return endpoint, ssl_enabled
+
+    # 已是 host[:port] 形式，ssl 跟隨現有設定
+    return raw, str(S3A_CONNECTION_SSL_ENABLED_VALUE).strip().lower()
+
+
 class SparkManager:
     """
     SparkSession 單例管理器，確保整個 App 運行期間只會被建立一次。
@@ -76,6 +101,8 @@ class SparkManager:
         if not MINIO_SECRET_KEY or not str(MINIO_SECRET_KEY).strip():
             raise ValueError("缺少 `MINIO_SECRET_KEY`（請在環境變數中設定）。")
 
+        s3a_endpoint, s3a_ssl_enabled = _normalize_s3a_endpoint(MINIO_ENDPOINT)
+
         # 依照 Notebook Cell 1：SparkSession 配置（Delta + S3A/MinIO）
         self.spark = (
             SparkSession.builder.appName(app_name)
@@ -85,13 +112,13 @@ class SparkManager:
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
             .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
             # MinIO S3A（完全參考 config.py）
-            .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+            .config("spark.hadoop.fs.s3a.endpoint", s3a_endpoint)
             .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
             .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
             .config("spark.hadoop.fs.s3a.path.style.access", S3A_PATH_STYLE_ACCESS)
             .config("spark.hadoop.fs.s3a.impl", S3A_IMPL)
             .config("spark.hadoop.fs.s3a.endpoint.region", S3A_ENDPOINT_REGION)
-            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", S3A_CONNECTION_SSL_ENABLED_VALUE)
+            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", s3a_ssl_enabled)
             # 中文 / UTF-8 編碼修正（對齊 Notebook）
             .config("spark.executorEnv.LANG", "en_US.UTF-8")
             .config("spark.executorEnv.LC_ALL", "en_US.UTF-8")

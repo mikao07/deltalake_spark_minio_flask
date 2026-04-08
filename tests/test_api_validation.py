@@ -119,6 +119,29 @@ def test_delta_ocr_bronze_run_dry_run_with_dataset(monkeypatch):
     assert j["raw_images_path"].endswith("/invoice_ocr/")
 
 
+def test_delta_ocr_bronze_run_empty_source_returns_400(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    monkeypatch.setattr(
+        flask_app,
+        "preview_raw_images_sample",
+        lambda spark, raw_images_path, limit=1: [],
+    )
+    class _Dummy:
+        spark = object()
+
+    monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _Dummy())
+    r = c.post(
+        "/delta/ocr/bronze/run",
+        json={"dataset_id": "invoice_ocr", "write_mode": "append", "dry_run": False},
+    )
+    assert r.status_code == 400
+    j = r.get_json()
+    assert "沒有可處理圖片" in j["error"]
+    assert j["dataset_id"] == "invoice_ocr"
+
+
 def test_delta_gold_word_frequency_run_rejects_bad_coalesce(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(
@@ -127,4 +150,31 @@ def test_delta_gold_word_frequency_run_rejects_bad_coalesce(monkeypatch):
     )
     assert r.status_code == 400
     assert "coalesce_partitions" in r.get_json()["error"]
+
+
+def test_health_storage_ok_with_mock(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    class _DummySpark:
+        spark = object()
+
+    class _DummyClient:
+        def bucket_exists(self, bucket):
+            return True
+
+        def list_objects(self, bucket, prefix=None, recursive=False):
+            yield object()
+
+    monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _DummySpark())
+    monkeypatch.setattr(flask_app, "get_minio_client", lambda: _DummyClient())
+    monkeypatch.setattr(flask_app, "ensure_bucket", lambda client, bucket: None)
+    monkeypatch.setattr(flask_app, "preview_raw_images_sample", lambda spark, path, limit=10: [{"x": 1}])
+
+    r = c.get("/api/health/storage?dataset_id=drinks&limit=5")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] in ("ok", "degraded")
+    assert "minio_sdk" in j
+    assert "spark_binaryfile" in j
 

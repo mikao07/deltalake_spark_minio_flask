@@ -12,6 +12,7 @@ Flask + Spark + Delta Lake 的簡化示範專案，透過 API 讀寫/維護 Delt
 - **Bronze OCR 攝入**（對齊 `MinIO_DeltaLake_Spark_1.1.ipynb`）：`POST /delta/ocr/bronze/run` — 以 `binaryFile` 讀 MinIO 影像 → Tesseract → 寫入 Delta Bronze
 - **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，欄位 `file` 或 `files`，且 `dataset_id` 必填）— 寫入 `BUCKET_NAME` 下 `RAW_IMAGE_PREFIX/{dataset_id}/...`；預設若 **同名物件已存在** 會自動改為 `檔名_YYYYMMDD_HHMMSS.ext`（`on_duplicate=suffix`），亦可設為 `overwrite` 覆寫；可選 `run_ocr=true` 上傳後接續跑 Bronze OCR（只跑該 dataset）
 - **查詢既有 dataset_id**：`GET /api/datasets`
+- **Storage 健康檢查**（SDK vs Spark S3A）：`GET /api/health/storage`
 
 ### 需求
 
@@ -40,9 +41,11 @@ pip install -r requirements.txt
 ```powershell
 $env:MINIO_ACCESS_KEY="your_access_key"
 $env:MINIO_SECRET_KEY="your_secret_key"
-$env:MINIO_ENDPOINT="http://127.0.0.1:9000"
+$env:MINIO_ENDPOINT="127.0.0.1:9000"
 $env:BUCKET_NAME="data-lake"
 ```
+
+> 建議 `MINIO_ENDPOINT` 使用 `host:port`（例如 `127.0.0.1:9000`），對 Spark S3A 相容性通常較穩。
 
 3) 啟動 Flask：
 

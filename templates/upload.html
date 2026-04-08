@@ -94,6 +94,20 @@
         </div>
       </form>
 
+      <div class="card shadow-sm mt-3">
+        <div class="card-body">
+          <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap">
+            <h2 class="h6 mb-0">Storage Health（MinIO SDK vs Spark S3A）</h2>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-check-health">檢查健康狀態</button>
+          </div>
+          <div class="mt-2 small" id="health-status-wrap">
+            <span class="badge text-bg-secondary" id="health-badge">未檢查</span>
+            <span class="ms-2 text-muted" id="health-text">輸入 dataset_id 後可檢查。</span>
+          </div>
+          <div class="small text-muted mt-2" id="health-detail"></div>
+        </div>
+      </div>
+
       <div id="result-wrap" class="mt-4 d-none">
         <h2 class="h6 text-secondary mb-2">上傳結果</h2>
         <div class="table-responsive border rounded bg-white shadow-sm">
@@ -162,6 +176,60 @@
         const d = document.createElement("div");
         d.textContent = s;
         return d.innerHTML;
+      }
+
+      function setHealth(status, text, detail) {
+        const badge = document.getElementById("health-badge");
+        const txt = document.getElementById("health-text");
+        const det = document.getElementById("health-detail");
+        const map = {
+          ok: "text-bg-success",
+          degraded: "text-bg-warning",
+          down: "text-bg-danger",
+          unknown: "text-bg-secondary",
+        };
+        badge.className = "badge " + (map[status] || map.unknown);
+        badge.textContent = status || "unknown";
+        txt.textContent = text || "";
+        det.textContent = detail || "";
+      }
+
+      async function checkStorageHealth() {
+        const datasetId = document.getElementById("dataset_id").value.trim().toLowerCase();
+        if (!datasetId) {
+          setHealth("unknown", "請先輸入 dataset_id。", "");
+          return;
+        }
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = {};
+        if (tok) headers["X-Admin-Token"] = tok;
+        setHealth("unknown", "檢查中...", "");
+        try {
+          const url =
+            "/api/health/storage?dataset_id=" +
+            encodeURIComponent(datasetId) +
+            "&limit=10";
+          const res = await fetch(url, { headers });
+          const txt = await res.text();
+          let data = {};
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            setHealth("down", "檢查失敗", (data && data.error) || txt || res.statusText);
+            return;
+          }
+          const s = data.status || "unknown";
+          const detail =
+            "sdk_count=" +
+            ((data.minio_sdk && data.minio_sdk.count) ?? "-") +
+            ", spark_count=" +
+            ((data.spark_binaryfile && data.spark_binaryfile.count) ?? "-") +
+            (data.hint ? " | " + data.hint : "");
+          setHealth(s, "dataset_id=" + datasetId, detail);
+        } catch (err) {
+          setHealth("down", "檢查失敗", String(err));
+        }
       }
 
       document.getElementById("upload-form").addEventListener("submit", async function (e) {
@@ -309,8 +377,10 @@
         if (this.value) {
           document.getElementById("dataset_id").value = this.value;
           document.getElementById("ocr_dataset_id").value = this.value;
+          checkStorageHealth();
         }
       });
+      document.getElementById("btn-check-health").addEventListener("click", checkStorageHealth);
 
       document.getElementById("btn-run-ocr").addEventListener("click", async function () {
         const note = document.getElementById("manual-ocr-note");
