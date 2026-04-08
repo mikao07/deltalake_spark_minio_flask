@@ -27,14 +27,19 @@ from services.minio_upload import (
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
 from services.spark_service import (
     SparkManager,
+    analyze_bronze_duplicates,
     add_etl_timestamp,
+    deduplicate_bronze_table,
     delete_older_than_latest_batch,
     get_bronze_data,
+    get_gold_delta_table_preview,
     get_gold_word_frequency_data,
+    get_silver_ocr_data,
     get_system_status,
     merge_upsert_by_key,
     records_to_df,
     read_delta_table,
+    run_silver_ocr_etl,
     run_gold_word_frequency_etl,
 )
 
@@ -147,9 +152,9 @@ def health():
     return {"status": "ok"}
 
 
-def _safe_bronze_preview(dataset_id: str | None = None):
+def _safe_bronze_preview(dataset_id: str | None = None, *, limit: int = 10):
     try:
-        return get_bronze_data(limit=10, dataset_id=dataset_id), None
+        return get_bronze_data(limit=limit, dataset_id=dataset_id), None
     except Exception as e:
         _logger.warning("bronze_preview_failed: %s", e)
         return [], str(e)
@@ -160,6 +165,22 @@ def _safe_gold_preview(limit: int = 15, dataset_id: str | None = None):
         return get_gold_word_frequency_data(limit=limit, dataset_id=dataset_id), None
     except Exception as e:
         _logger.warning("gold_preview_failed: %s", e)
+        return [], str(e)
+
+
+def _safe_silver_preview(limit: int = 30, dataset_id: str | None = None):
+    try:
+        return get_silver_ocr_data(limit=limit, dataset_id=dataset_id), None
+    except Exception as e:
+        _logger.warning("silver_preview_failed: %s", e)
+        return [], str(e)
+
+
+def _safe_gold_disk_preview(limit: int = 50, dataset_id: str | None = None):
+    try:
+        return get_gold_delta_table_preview(limit=limit, dataset_id=dataset_id), None
+    except Exception as e:
+        _logger.warning("gold_disk_preview_failed: %s", e)
         return [], str(e)
 
 
@@ -200,6 +221,55 @@ def index():
         gold_error=gold_error,
         gold_table_path=GOLD_WORD_COUNT_PATH,
         silver_ocr_table_path=SILVER_OCR_TABLE_PATH,
+    )
+
+
+@app.get("/layers")
+def layers_preview_page():
+    """
+    獨立頁：預覽銅／銀／金層表格內容，方便對照 OCR → 銀層 → 詞頻何處異常（避免首頁過擠）。
+    """
+    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    selected_dataset_id: str | None = None
+    if dataset_raw:
+        try:
+            selected_dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError:
+            selected_dataset_id = None
+
+    limit_raw = request.args.get("limit", "30")
+    try:
+        preview_limit = max(5, min(int(limit_raw), 100))
+    except (TypeError, ValueError):
+        preview_limit = 30
+
+    dataset_options: list[str] = []
+    try:
+        dataset_options = list_dataset_ids()
+    except Exception as e:
+        _logger.warning("list_dataset_ids_for_layers_failed: %s", e)
+
+    bronze_rows, bronze_error = _safe_bronze_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+    silver_rows, silver_error = _safe_silver_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+    gold_disk_rows, gold_disk_error = _safe_gold_disk_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+    gold_live_rows, gold_live_error = _safe_gold_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+
+    return render_template(
+        "layers.html",
+        dataset_options=dataset_options,
+        selected_dataset_id=selected_dataset_id,
+        preview_limit=preview_limit,
+        bronze_path=BRONZE_TABLE_PATH,
+        silver_path=SILVER_OCR_TABLE_PATH,
+        gold_path=GOLD_WORD_COUNT_PATH,
+        bronze_rows=bronze_rows,
+        bronze_error=bronze_error,
+        silver_rows=silver_rows,
+        silver_error=silver_error,
+        gold_disk_rows=gold_disk_rows,
+        gold_disk_error=gold_disk_error,
+        gold_live_rows=gold_live_rows,
+        gold_live_error=gold_live_error,
     )
 
 
@@ -553,6 +623,142 @@ def delta_cleanup_latest_only():
     return jsonify({"status": "ok", "target_path": target_path, "timestamp_col": timestamp_col})
 
 
+@app.get("/api/debug/bronze-duplicates")
+def api_debug_bronze_duplicates():
+    """檢查 Bronze 重複資料概況（image_path 與 skip-key）。"""
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    bronze_path = (request.args.get("bronze_path") or "").strip() or BRONZE_TABLE_PATH
+    err = _validate_delta_path(bronze_path)
+    if err:
+        return err
+
+    spark = _get_spark_manager().spark
+    try:
+        result = analyze_bronze_duplicates(spark, bronze_path)
+    except Exception as e:
+        _logger.exception("bronze_duplicates_check_failed")
+        return _json_error(f"Bronze 查重失敗：{e}", 500, bronze_path=bronze_path)
+    return jsonify({"status": "ok", **result})
+
+
+@app.post("/delta/bronze/deduplicate")
+def delta_bronze_deduplicate():
+    """
+    Bronze 去重（預設 dry_run=true）。
+    body:
+      {
+        "bronze_path": "s3a://.../bronze/raw_features/",
+        "strategy": "skipkey",
+        "dry_run": true
+      }
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    bronze_raw = body.get("bronze_path")
+    bronze_path = bronze_raw.strip() if isinstance(bronze_raw, str) and bronze_raw.strip() else BRONZE_TABLE_PATH
+    err = _validate_delta_path(bronze_path)
+    if err:
+        return err
+
+    strategy = body.get("strategy", "skipkey")
+    if not isinstance(strategy, str) or strategy not in ("skipkey", "image_path"):
+        return _json_error('strategy 必須是 "skipkey" 或 "image_path"。', 400)
+
+    dry_run = bool(body.get("dry_run", True))
+    spark = _get_spark_manager().spark
+    try:
+        result = deduplicate_bronze_table(
+            spark,
+            bronze_path,
+            strategy=strategy,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        return _json_error(str(e), 400, bronze_path=bronze_path)
+    except Exception as e:
+        _logger.exception("bronze_deduplicate_failed")
+        return _json_error(f"Bronze 去重失敗：{e}", 500, bronze_path=bronze_path)
+
+    return jsonify({"status": "dry_run" if dry_run else "ok", **result})
+
+
+@app.post("/delta/silver/ocr/run")
+def delta_silver_ocr_run():
+    """
+    執行 Silver OCR ETL：Bronze OCR -> 清洗/去重 -> MERGE 至 Silver OCR。
+
+    body（皆可選）:
+      {
+        "dataset_id": "invoice_ocr",
+        "bronze_path": "s3a://.../bronze/raw_features/",
+        "silver_ocr_path": "s3a://.../silver/ocr_features/",
+        "dry_run": false
+      }
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    dataset_id: str | None = None
+    if dataset_raw is not None:
+        if not isinstance(dataset_raw, str):
+            return _json_error("dataset_id 必須是字串。", 400)
+        try:
+            dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+    bronze_raw = body.get("bronze_path")
+    silver_raw = body.get("silver_ocr_path")
+    bronze_path = bronze_raw.strip() if isinstance(bronze_raw, str) and bronze_raw.strip() else BRONZE_TABLE_PATH
+    silver_ocr_path = (
+        silver_raw.strip() if isinstance(silver_raw, str) and silver_raw.strip() else SILVER_OCR_TABLE_PATH
+    )
+
+    err = _validate_delta_path(bronze_path)
+    if err:
+        return err
+    err = _validate_delta_path(silver_ocr_path)
+    if err:
+        return err
+
+    dry_run = bool(body.get("dry_run", False))
+    if dry_run:
+        return jsonify(
+            {
+                "status": "dry_run",
+                "dataset_id": dataset_id,
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+            }
+        )
+
+    try:
+        result = run_silver_ocr_etl(
+            bronze_path=bronze_path,
+            silver_ocr_path=silver_ocr_path,
+            dataset_id=dataset_id,
+        )
+    except Exception as e:
+        _logger.exception("silver_ocr_run_failed")
+        return _json_error(f"Silver OCR ETL 失敗：{e}", 500)
+    return jsonify({"status": "ok", **result})
+
+
 @app.post("/delta/gold/word-frequency/run")
 def delta_gold_word_frequency_run():
     """
@@ -560,6 +766,7 @@ def delta_gold_word_frequency_run():
 
     body（皆可選）:
       {
+        "dataset_id": "invoice_ocr",
         "silver_ocr_path": "s3a://.../silver/ocr_features/",
         "gold_path": "s3a://.../gold/word_frequency/",
         "apply_noise_filter": true,
@@ -575,6 +782,16 @@ def delta_gold_word_frequency_run():
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    dataset_id: str | None = None
+    if dataset_raw is not None:
+        if not isinstance(dataset_raw, str):
+            return _json_error("dataset_id 必須是字串。", 400)
+        try:
+            dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
 
     silver_raw = body.get("silver_ocr_path")
     gold_raw = body.get("gold_path")
@@ -607,6 +824,7 @@ def delta_gold_word_frequency_run():
         return jsonify(
             {
                 "status": "dry_run",
+                "dataset_id": dataset_id,
                 "silver_ocr_path": silver_ocr_path,
                 "gold_path": gold_path,
                 "apply_noise_filter": apply_noise_filter,
@@ -618,16 +836,161 @@ def delta_gold_word_frequency_run():
     run_gold_word_frequency_etl(
         silver_ocr_path=silver_ocr_path,
         gold_path=gold_path,
+        dataset_id=dataset_id,
         apply_noise_filter=apply_noise_filter,
         coalesce_partitions=coalesce_partitions,
     )
     return jsonify(
         {
             "status": "ok",
+            "dataset_id": dataset_id,
             "silver_ocr_path": silver_ocr_path,
             "gold_path": gold_path,
             "apply_noise_filter": apply_noise_filter,
             "coalesce_partitions": coalesce_partitions,
+        }
+    )
+
+
+@app.post("/delta/pipeline/to-gold/run")
+def delta_pipeline_to_gold_run():
+    """
+    一鍵執行完整流程：Bronze OCR -> Silver OCR -> Gold 詞頻（同一個 dataset_id）。
+
+    body:
+      {
+        "dataset_id": "invoice_ocr",
+        "write_mode": "append",
+        "apply_noise_filter": true,
+        "coalesce_partitions": 1,
+        "dry_run": false
+      }
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    if not isinstance(dataset_raw, str) or not dataset_raw.strip():
+        return _json_error("dataset_id 必填。", 400)
+    try:
+        dataset_id = normalize_dataset_id(dataset_raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    write_mode = body.get("write_mode", "append")
+    if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append"):
+        return _json_error('write_mode 必須是 "overwrite" 或 "append"。', 400)
+
+    apply_noise_filter = body.get("apply_noise_filter", True)
+    if not isinstance(apply_noise_filter, bool):
+        return _json_error("apply_noise_filter 必須是布林值。", 400)
+
+    coalesce_raw = body.get("coalesce_partitions", 1)
+    try:
+        coalesce_partitions = int(coalesce_raw)
+    except (TypeError, ValueError):
+        return _json_error("coalesce_partitions 必須是整數。", 400)
+
+    raw_images_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{dataset_id}/"
+    err = _validate_delta_path(raw_images_path)
+    if err:
+        return err
+    err = _validate_delta_path(BRONZE_TABLE_PATH)
+    if err:
+        return err
+    err = _validate_delta_path(SILVER_OCR_TABLE_PATH)
+    if err:
+        return err
+    err = _validate_delta_path(GOLD_WORD_COUNT_PATH)
+    if err:
+        return err
+
+    dry_run = bool(body.get("dry_run", False))
+    if dry_run:
+        return jsonify(
+            {
+                "status": "dry_run",
+                "dataset_id": dataset_id,
+                "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+                "raw_images_path": raw_images_path,
+                "bronze_path": BRONZE_TABLE_PATH,
+                "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+                "gold_path": GOLD_WORD_COUNT_PATH,
+                "write_mode": write_mode,
+                "apply_noise_filter": apply_noise_filter,
+                "coalesce_partitions": coalesce_partitions,
+            }
+        )
+
+    spark = _get_spark_manager().spark
+    # 前置檢查：來源路徑至少有 1 張圖
+    try:
+        sample = preview_raw_images_sample(spark, raw_images_path, limit=1)
+    except Exception as e:
+        return _json_error(f"檢查來源路徑失敗：{e}", 400)
+    if not sample:
+        return _json_error(
+            "來源 dataset_id 沒有可處理圖片。",
+            400,
+            dataset_id=dataset_id,
+            raw_images_path=raw_images_path,
+        )
+
+    # Step 1: Bronze OCR
+    try:
+        bronze_result = run_bronze_ocr_ingest(
+            spark,
+            raw_images_path=raw_images_path,
+            bronze_path=BRONZE_TABLE_PATH,
+            write_mode=write_mode,
+        )
+    except Exception as e:
+        _logger.exception("pipeline_bronze_ocr_failed")
+        return _json_error(f"Bronze OCR 失敗：{e}", 500)
+
+    # Step 2: Silver OCR
+    try:
+        silver_result = run_silver_ocr_etl(
+            bronze_path=BRONZE_TABLE_PATH,
+            silver_ocr_path=SILVER_OCR_TABLE_PATH,
+            dataset_id=dataset_id,
+        )
+    except Exception as e:
+        _logger.exception("pipeline_silver_ocr_failed")
+        return _json_error(f"Silver OCR ETL 失敗：{e}", 500)
+
+    # Step 3: Gold
+    try:
+        run_gold_word_frequency_etl(
+            silver_ocr_path=SILVER_OCR_TABLE_PATH,
+            gold_path=GOLD_WORD_COUNT_PATH,
+            dataset_id=dataset_id,
+            apply_noise_filter=apply_noise_filter,
+            coalesce_partitions=coalesce_partitions,
+        )
+    except Exception as e:
+        _logger.exception("pipeline_gold_failed")
+        return _json_error(f"Gold ETL 失敗：{e}", 500)
+
+    return jsonify(
+        {
+            "status": "ok",
+            "dataset_id": dataset_id,
+            "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+            "raw_images_path": raw_images_path,
+            "bronze_path": BRONZE_TABLE_PATH,
+            "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+            "gold_path": GOLD_WORD_COUNT_PATH,
+            "write_mode": write_mode,
+            "apply_noise_filter": apply_noise_filter,
+            "coalesce_partitions": coalesce_partitions,
+            "bronze_result": bronze_result,
+            "silver_result": silver_result,
         }
     )
 
@@ -738,7 +1101,7 @@ def delta_ocr_bronze_run():
         )
 
     try:
-        run_bronze_ocr_ingest(
+        bronze_result = run_bronze_ocr_ingest(
             spark,
             raw_images_path=raw_images_path,
             bronze_path=bronze_path,
@@ -757,6 +1120,7 @@ def delta_ocr_bronze_run():
             "raw_images_path": raw_images_path,
             "bronze_path": bronze_path,
             "write_mode": write_mode,
+            "bronze_result": bronze_result,
         }
     )
 
@@ -850,7 +1214,7 @@ def api_upload_images():
             return _json_error('write_mode 必須是 \"overwrite\" 或 \"append\"。', 400)
         spark = _get_spark_manager().spark
         try:
-            run_bronze_ocr_ingest(
+            bronze_result = run_bronze_ocr_ingest(
                 spark,
                 raw_images_path=f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
                 bronze_path=BRONZE_TABLE_PATH,
@@ -866,6 +1230,7 @@ def api_upload_images():
             "raw_images_path": f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
             "bronze_path": BRONZE_TABLE_PATH,
             "write_mode": wm,
+            "bronze_result": bronze_result,
         }
 
     out: Dict[str, Any] = {

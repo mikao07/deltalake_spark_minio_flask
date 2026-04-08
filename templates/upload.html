@@ -11,8 +11,9 @@
   </head>
   <body class="bg-light">
     <div class="container py-4" style="max-width: 800px">
-      <nav class="mb-3 small">
+      <nav class="mb-3 small d-flex flex-wrap gap-3">
         <a href="{{ url_for('index') }}">← 返回 Dashboard</a>
+        <a href="{{ url_for('layers_preview_page') }}">資料層預覽（銅／銀／金）</a>
       </nav>
 
       <h1 class="h4 mb-3">上傳圖片至 MinIO（raw/images）</h1>
@@ -63,7 +64,14 @@
           </div>
           <div class="form-check mb-3">
             <input class="form-check-input" type="checkbox" id="run_ocr" name="run_ocr" />
-            <label class="form-check-label" for="run_ocr">上傳後執行 Bronze OCR（Spark，可能較久）</label>
+            <label class="form-check-label" for="run_ocr">上傳後只做 Bronze OCR（Spark，可能較久）</label>
+          </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="run_pipeline_gold" name="run_pipeline_gold" />
+            <label class="form-check-label" for="run_pipeline_gold">
+              上傳後一鍵跑到金層（Bronze OCR → Silver → Gold，最久但更省事）
+            </label>
+            <div class="form-text">與上一項擇一即可；一鍵已含銅層，不需再勾「只做 Bronze」。</div>
           </div>
           <div class="mb-3">
             <label class="form-label">同名物件已存在時（MinIO）</label>
@@ -73,7 +81,7 @@
             </select>
           </div>
           <div class="mb-3">
-            <label class="form-label">OCR 寫入模式（僅在勾選上傳後 OCR 時）</label>
+            <label class="form-label">寫入模式（勾選上傳後 Bronze／一鍵金層 時使用）</label>
             <select class="form-select" id="write_mode" name="write_mode">
               <option value="append" selected>append（追加至 Bronze，不覆寫整表）</option>
               <option value="overwrite">overwrite（覆寫整張 Bronze 表，慎用）</option>
@@ -108,6 +116,38 @@
         </div>
       </div>
 
+      <div class="card shadow-sm mt-3">
+        <div class="card-body">
+          <h2 class="h6 mb-2">Bronze 表：重複檢查與清理</h2>
+          <p class="small text-muted mb-3">
+            不需輸入 dataset_id；會檢查整張 Bronze Delta。若已設定 <code>ADMIN_TOKEN</code>，請填上方管理 Token。
+            「清理」會以選擇的策略分組，只保留每組最新 <code>ingestion_timestamp</code> 一筆。
+          </p>
+          <div class="row g-2 align-items-end mb-2">
+            <div class="col-12 col-md-6">
+              <label class="form-label small mb-0">去重策略</label>
+              <select class="form-select form-select-sm" id="bronze_dedup_strategy">
+                <option value="skipkey" selected>skipkey（dataset_id + file_hash + ocr_signature，建議）</option>
+                <option value="image_path">image_path（舊表相容）</option>
+              </select>
+            </div>
+            <div class="col-12 col-md-6 d-flex flex-wrap gap-2">
+              <button type="button" class="btn btn-sm btn-outline-primary" id="btn-bronze-check-dup">
+                查重
+              </button>
+              <button type="button" class="btn btn-sm btn-outline-danger" id="btn-bronze-dedup">
+                清理重複
+              </button>
+            </div>
+          </div>
+          <pre
+            class="small bg-white border rounded p-2 mb-0"
+            style="max-height: 220px; overflow: auto"
+            id="bronze-dedup-result"
+          >（尚未查詢）</pre>
+        </div>
+      </div>
+
       <div id="result-wrap" class="mt-4 d-none">
         <h2 class="h6 text-secondary mb-2">上傳結果</h2>
         <div class="table-responsive border rounded bg-white shadow-sm">
@@ -123,15 +163,32 @@
           </table>
         </div>
         <p class="small text-muted mt-2 mb-0 d-none" id="ocr-note"></p>
+        <div id="upload-pipeline-progress-wrap" class="d-none mt-2">
+          <div class="progress" style="height: 8px">
+            <div
+              id="upload-pipeline-progress-bar"
+              class="progress-bar bg-primary"
+              role="progressbar"
+              style="width: 0%"
+              aria-valuenow="0"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            ></div>
+          </div>
+          <p class="small text-secondary mt-2 mb-0" id="upload-pipeline-progress-text"></p>
+        </div>
       </div>
 
       <div class="card shadow-sm mt-4">
         <div class="card-body">
-          <h2 class="h6 mb-3">手動執行 OCR（只針對單一 dataset_id）</h2>
+          <h2 class="h6 mb-3">手動執行（只針對單一 dataset_id）</h2>
+          <p class="small text-muted mb-2">
+            第一次建新分類時，只要上方已填 <code>dataset_id</code>，這裡可留空，會自動沿用上方同一個 id。
+          </p>
           <div class="row g-2 align-items-end">
             <div class="col-12 col-md-6">
-              <label class="form-label">dataset_id</label>
-              <input class="form-control" id="ocr_dataset_id" placeholder="例如：invoice_ocr" />
+              <label class="form-label">dataset_id（可選，留空則用上方）</label>
+              <input class="form-control" id="ocr_dataset_id" placeholder="留空則使用上方 dataset_id" />
             </div>
             <div class="col-12 col-md-4">
               <label class="form-label">write_mode</label>
@@ -143,6 +200,26 @@
             <div class="col-12 col-md-2 d-grid">
               <button type="button" class="btn btn-outline-primary" id="btn-run-ocr">執行 OCR</button>
             </div>
+            <div class="col-12 col-md-12 d-grid mt-2">
+              <button type="button" class="btn btn-primary" id="btn-run-pipeline-gold">
+                一鍵跑到金層（Bronze -> Silver -> Gold）
+              </button>
+            </div>
+          </div>
+          <div id="pipeline-progress-wrap" class="d-none mt-3">
+            <div class="text-secondary small mb-1">一鍵金層進度</div>
+            <div class="progress" style="height: 8px">
+              <div
+                id="pipeline-progress-bar"
+                class="progress-bar bg-primary"
+                role="progressbar"
+                style="width: 0%"
+                aria-valuenow="0"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              ></div>
+            </div>
+            <p class="small text-secondary mt-2 mb-0" id="pipeline-progress-text"></p>
           </div>
           <p class="small text-muted mt-2 mb-0" id="manual-ocr-note"></p>
         </div>
@@ -255,7 +332,12 @@
         const sub = document.getElementById("subfolder").value.trim();
         const onDup = document.getElementById("on_duplicate").value;
         const runOcr = document.getElementById("run_ocr").checked;
+        const runPipelineGold = document.getElementById("run_pipeline_gold").checked;
         const writeMode = document.getElementById("write_mode").value;
+        if (runOcr && runPipelineGold) {
+          alert("請擇一：「只做 Bronze OCR」或「一鍵跑到金層」，不要兩個都勾。");
+          return;
+        }
         const tok = document.getElementById("admin_token").value.trim();
         const headers = {};
         if (tok) headers["X-Admin-Token"] = tok;
@@ -309,7 +391,26 @@
             anyUploaded = true;
           }
 
-          if (runOcr && anyUploaded) {
+          if (runPipelineGold && anyUploaded) {
+            const uploadProg = createPipelineProgressUi(
+              "upload-pipeline-progress-wrap",
+              "upload-pipeline-progress-bar",
+              "upload-pipeline-progress-text"
+            );
+            ocrNote.classList.remove("d-none");
+            ocrNote.className = "small text-muted mt-2 mb-0";
+            ocrNote.textContent = "一鍵金層執行中（分三階段），請看下方進度。";
+            const pipeResult = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, uploadProg);
+            if (pipeResult.ok) {
+              ocrNote.textContent =
+                "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" + writeMode + "）";
+              ocrNote.className = "small text-success mt-2 mb-0";
+            } else {
+              ocrNote.textContent =
+                "一鍵金層：失敗（第 " + pipeResult.step + " 步）— " + (pipeResult.error || "未知錯誤");
+              ocrNote.className = "small text-danger mt-2 mb-0";
+            }
+          } else if (runOcr && anyUploaded) {
             const ocrHeaders = Object.assign({ "Content-Type": "application/json" }, headers);
             const ocrRes = await fetch("/delta/ocr/bronze/run", {
               method: "POST",
@@ -382,13 +483,303 @@
       });
       document.getElementById("btn-check-health").addEventListener("click", checkStorageHealth);
 
+      function adminHeadersOnly() {
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = {};
+        if (tok) headers["X-Admin-Token"] = tok;
+        return headers;
+      }
+
+      function adminHeadersJson() {
+        const h = adminHeadersOnly();
+        h["Content-Type"] = "application/json";
+        return h;
+      }
+
+      /** 建立一鍵金層進度 UI 控制器（bar / text / wrap 為元素 id 後綴所屬區塊） */
+      function createPipelineProgressUi(wrapId, barId, textId) {
+        const wrap = document.getElementById(wrapId);
+        const bar = document.getElementById(barId);
+        const text = document.getElementById(textId);
+        return {
+          show: function () {
+            wrap.classList.remove("d-none");
+            bar.classList.add("progress-bar-striped", "progress-bar-animated");
+          },
+          hide: function () {
+            wrap.classList.add("d-none");
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+          },
+          set: function (step, total, label, pct) {
+            const p = Math.max(0, Math.min(100, pct));
+            bar.style.width = p + "%";
+            bar.setAttribute("aria-valuenow", String(p));
+            text.textContent = "步驟 " + step + "/" + total + "：" + label;
+          },
+          done: function () {
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+          },
+        };
+      }
+
+      /**
+       * 分三段呼叫 API，讓瀏覽器能即時更新進度（等同後端一鍵流程）。
+       * 回傳 { ok, error?, step?, data? }
+       */
+      async function runPipelineToGoldWithProgress(datasetId, writeMode, headers, progressUi) {
+        const h = Object.assign({ "Content-Type": "application/json" }, headers);
+        const post = async function (url, body) {
+          const res = await fetch(url, { method: "POST", headers: h, body: JSON.stringify(body) });
+          const txt = await res.text();
+          let data = {};
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          return { res: res, txt: txt, data: data };
+        };
+
+        progressUi.show();
+        progressUi.set(1, 3, "銅層 Bronze OCR（讀圖、Tesseract）…", 12);
+
+        const r1 = await post("/delta/ocr/bronze/run", {
+          dataset_id: datasetId,
+          write_mode: writeMode,
+          dry_run: false,
+        });
+        if (!r1.res.ok || !(r1.data && r1.data.status === "ok")) {
+          progressUi.done();
+          return {
+            ok: false,
+            step: 1,
+            error: (r1.data && r1.data.error) || r1.txt || r1.res.statusText || "銅層失敗",
+          };
+        }
+
+        progressUi.set(2, 3, "銀層 Silver ETL（清洗、MERGE）…", 45);
+        const r2 = await post("/delta/silver/ocr/run", { dataset_id: datasetId, dry_run: false });
+        if (!r2.res.ok || !(r2.data && r2.data.status === "ok")) {
+          progressUi.done();
+          return {
+            ok: false,
+            step: 2,
+            error: (r2.data && r2.data.error) || r2.txt || r2.res.statusText || "銀層失敗",
+          };
+        }
+
+        progressUi.set(3, 3, "金層 Gold（詞頻）…", 78);
+        const r3 = await post("/delta/gold/word-frequency/run", {
+          dataset_id: datasetId,
+          apply_noise_filter: true,
+          coalesce_partitions: 1,
+          dry_run: false,
+        });
+        if (!r3.res.ok || !(r3.data && r3.data.status === "ok")) {
+          progressUi.done();
+          return {
+            ok: false,
+            step: 3,
+            error: (r3.data && r3.data.error) || r3.txt || r3.res.statusText || "金層失敗",
+          };
+        }
+
+        progressUi.set(3, 3, "全部完成", 100);
+        progressUi.done();
+        return { ok: true, bronze: r1.data, silver: r2.data, gold: r3.data };
+      }
+
+      /** 手動區塊：有填 ocr_dataset_id 則用之，否則沿用上方 dataset_id（方便第一次建新 id） */
+      function resolveManualDatasetId() {
+        const bottom = document.getElementById("ocr_dataset_id").value.trim().toLowerCase();
+        if (bottom) return bottom;
+        return document.getElementById("dataset_id").value.trim().toLowerCase();
+      }
+
+      (function syncManualDatasetPlaceholder() {
+        const top = document.getElementById("dataset_id");
+        const bottom = document.getElementById("ocr_dataset_id");
+        top.addEventListener("blur", function () {
+          const u = top.value.trim().toLowerCase();
+          if (!u) return;
+          if (!bottom.value.trim()) bottom.value = u;
+        });
+        document.getElementById("run_ocr").addEventListener("change", function () {
+          if (this.checked) document.getElementById("run_pipeline_gold").checked = false;
+        });
+        document.getElementById("run_pipeline_gold").addEventListener("change", function () {
+          if (this.checked) document.getElementById("run_ocr").checked = false;
+        });
+      })();
+
+      /** 將查重 API 結果轉成看得懂的中文說明 */
+      function formatBronzeDuplicateCheckZh(data) {
+        if (!data || typeof data !== "object") return "無法解讀回應內容。";
+        const path = data.bronze_path || "（未知路徑）";
+        const total = typeof data.total_rows === "number" ? data.total_rows : null;
+        const lines = [];
+        lines.push("【Bronze（銅層）重複檢查結果】");
+        lines.push("");
+        lines.push("資料表位置：" + path);
+        if (total !== null) {
+          lines.push("目前總共有 " + total + " 筆資料。");
+        } else {
+          lines.push("無法取得總筆數。");
+        }
+        lines.push("");
+
+        const hasPath = data.has_image_path === true;
+        const dupPathRows = data.duplicate_image_path_rows;
+        const dupPathGroups = data.duplicate_image_path_groups;
+        if (hasPath && typeof dupPathRows === "number" && dupPathRows >= 0) {
+          lines.push("— 依「圖片路徑」（同一張圖在表裡出現多次）—");
+          if (dupPathRows === 0) {
+            lines.push("沒有發現重複：每個路徑最多只出現一次。");
+          } else {
+            lines.push(
+              "發現重複：約有 " +
+                dupPathRows +
+                " 筆是多出來的（可清理），牽涉約 " +
+                (typeof dupPathGroups === "number" ? dupPathGroups : "—") +
+                " 組相同路徑。"
+            );
+            lines.push("（清理時若選「image_path」策略，會每個路徑只留最新一筆。）");
+          }
+        } else if (!hasPath) {
+          lines.push("— 依「圖片路徑」— 此表沒有 image_path 欄位，無法用這種方式統計。");
+        }
+
+        lines.push("");
+        const hasSkip = data.has_skip_key_columns === true;
+        const dupSkipRows = data.duplicate_skipkey_rows;
+        const dupSkipGroups = data.duplicate_skipkey_groups;
+        if (hasSkip && typeof dupSkipRows === "number" && dupSkipRows >= 0) {
+          lines.push("— 依「資料集 + 檔案內容指紋 + OCR 版本」（較精準）—");
+          if (dupSkipRows === 0) {
+            lines.push("沒有發現重複：同一組合最多只出現一次。");
+          } else {
+            lines.push(
+              "發現重複：約有 " +
+                dupSkipRows +
+                " 筆是多出來的（可清理），牽涉約 " +
+                (typeof dupSkipGroups === "number" ? dupSkipGroups : "—") +
+                " 組相同組合。"
+            );
+            lines.push("（清理時建議選「skipkey」策略。）");
+          }
+        } else {
+          lines.push("— 依「資料集 + 檔案指紋 + OCR 版本」—");
+          lines.push(
+            "目前 Bronze 表裡還沒有這些欄位（或尚未用新版 OCR 寫入），無法用這種方式統計。"
+          );
+          lines.push("若要以較精準方式去重，可之後用「skipkey」策略清理（須先有對應欄位）。");
+        }
+
+        lines.push("");
+        lines.push(
+          "【與 MinIO 畫面不一樣？】這裡的「總筆數」是 Delta 表「目前有效」的資料列數（用 Spark 讀表統計），"
+        );
+        lines.push(
+          "不是 MinIO 裡看到的 part-*.parquet 檔案個數。一張表可以有很多個 Parquet 檔（多次寫入、未合併），"
+        );
+        lines.push(
+          "列數仍可能很少；若曾有覆寫或刪除，舊版產生的檔案可能還留在桶子裡，要等 VACUUM 才會清掉，但已不再算在表內。"
+        );
+        lines.push("");
+        lines.push(
+          "小結：「可清理的重複列」數字越大代表多餘列越多；若都是 0 表示在該規則下表已很整潔。"
+        );
+        return lines.join("\n");
+      }
+
+      /** 將去重 API 結果轉成中文說明 */
+      function formatBronzeDedupResultZh(data) {
+        if (!data || typeof data !== "object") return "無法解讀回應內容。";
+        const strat =
+          data.strategy === "image_path"
+            ? "同一圖片路徑只留一筆（image_path）"
+            : "同一資料集＋檔案指紋＋OCR 版本只留一筆（skipkey）";
+        const before = data.total_before;
+        const after = data.total_after;
+        const deleted = data.deleted_rows;
+        const dry = data.dry_run === true;
+        const lines = [];
+        lines.push("【Bronze 清理重複 — 結果】");
+        lines.push("");
+        if (dry) {
+          lines.push("本次為預覽模式（dry_run），尚未實際寫入。");
+        } else {
+          lines.push("已完成寫入（表內容已更新）。");
+        }
+        lines.push("使用策略：" + strat);
+        if (typeof before === "number" && typeof after === "number") {
+          lines.push("清理前：" + before + " 筆；清理後：" + after + " 筆。");
+        }
+        if (typeof deleted === "number") {
+          lines.push("約刪除了 " + deleted + " 筆重複資料（留下的各組都是時間最新的一筆）。");
+        }
+        lines.push("");
+        lines.push("若 Silver／Gold 也要與 Bronze 完全一致，可再對需要的 dataset_id 執行一鍵 ETL。");
+        return lines.join("\n");
+      }
+
+      document.getElementById("btn-bronze-check-dup").addEventListener("click", async function () {
+        const out = document.getElementById("bronze-dedup-result");
+        out.textContent = "查詢中...";
+        try {
+          const res = await fetch("/api/debug/bronze-duplicates", { headers: adminHeadersOnly() });
+          const txt = await res.text();
+          let data = null;
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            out.textContent = "查詢失敗：" + ((data && data.error) || txt || res.statusText);
+            return;
+          }
+          out.textContent = formatBronzeDuplicateCheckZh(data);
+        } catch (err) {
+          out.textContent = "查詢失敗：" + String(err);
+        }
+      });
+
+      document.getElementById("btn-bronze-dedup").addEventListener("click", async function () {
+        const out = document.getElementById("bronze-dedup-result");
+        const strategy = document.getElementById("bronze_dedup_strategy").value;
+        const ok = window.confirm(
+          "確定要清理 Bronze 重複資料？\n\n" +
+            "策略：" +
+            strategy +
+            "\n每組只保留最新 ingestion_timestamp。\n此操作會覆寫 Bronze 表，建議先按「查重」確認數字。"
+        );
+        if (!ok) return;
+        out.textContent = "清理中（可能需較久）...";
+        try {
+          const res = await fetch("/delta/bronze/deduplicate", {
+            method: "POST",
+            headers: adminHeadersJson(),
+            body: JSON.stringify({ strategy: strategy, dry_run: false }),
+          });
+          const txt = await res.text();
+          let data = null;
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            out.textContent = "清理失敗：" + ((data && data.error) || txt || res.statusText);
+            return;
+          }
+          out.textContent = formatBronzeDedupResultZh(data);
+        } catch (err) {
+          out.textContent = "清理失敗：" + String(err);
+        }
+      });
+
       document.getElementById("btn-run-ocr").addEventListener("click", async function () {
         const note = document.getElementById("manual-ocr-note");
-        const datasetId = document.getElementById("ocr_dataset_id").value.trim().toLowerCase();
+        const datasetId = resolveManualDatasetId();
         const writeMode = document.getElementById("ocr_write_mode").value;
         if (!datasetId) {
           note.className = "small text-danger mt-2 mb-0";
-          note.textContent = "請先輸入 dataset_id。";
+          note.textContent = "請先在上方填寫 dataset_id（或在此欄填寫）。";
           return;
         }
         const tok = document.getElementById("admin_token").value.trim();
@@ -426,6 +817,48 @@
         } catch (err) {
           note.className = "small text-danger mt-2 mb-0";
           note.textContent = "OCR 失敗：" + String(err);
+        }
+      });
+
+      document.getElementById("btn-run-pipeline-gold").addEventListener("click", async function () {
+        const note = document.getElementById("manual-ocr-note");
+        const datasetId = resolveManualDatasetId();
+        const writeMode = document.getElementById("ocr_write_mode").value;
+        const btnPipe = document.getElementById("btn-run-pipeline-gold");
+        if (!datasetId) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "請先在上方填寫 dataset_id（或在此欄填寫）。";
+          return;
+        }
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = {};
+        if (tok) headers["X-Admin-Token"] = tok;
+
+        const manualProg = createPipelineProgressUi(
+          "pipeline-progress-wrap",
+          "pipeline-progress-bar",
+          "pipeline-progress-text"
+        );
+        note.className = "small text-muted mt-2 mb-0";
+        note.textContent = "一鍵金層執行中，請看上方進度條與步驟說明。";
+        btnPipe.disabled = true;
+        try {
+          const result = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, manualProg);
+          if (!result.ok) {
+            note.className = "small text-danger mt-2 mb-0";
+            note.textContent =
+              "一鍵 ETL 失敗（第 " + result.step + " 步）：" + (result.error || "未知錯誤");
+            return;
+          }
+          note.className = "small text-success mt-2 mb-0";
+          note.textContent =
+            "一鍵 ETL 成功：dataset_id=" + datasetId + "，已完成 Bronze / Silver / Gold。";
+        } catch (err) {
+          manualProg.done();
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "一鍵 ETL 失敗：" + String(err);
+        } finally {
+          btnPipe.disabled = false;
         }
       });
     </script>

@@ -16,13 +16,18 @@ from pyspark.sql.functions import (
     explode,
     expr,
     length,
+    lit,
     lower,
     max as spark_max,
+    regexp_extract,
     regexp_replace,
+    row_number,
+    trim,
     to_timestamp,
     udf,
 )
 from pyspark.sql.types import ArrayType, StringType
+from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
 from config import (
@@ -230,6 +235,106 @@ def delete_older_than_latest_batch(
     )
 
 
+def _extract_dataset_id_col(df: DataFrame) -> DataFrame:
+    # raw/images/{dataset_id}/...
+    return df.withColumn("dataset_id", regexp_extract(col("image_path"), r"/raw/images/([^/]+)/", 1))
+
+
+def build_silver_ocr_updates_from_bronze(
+    df_bronze: DataFrame,
+    *,
+    dataset_id: str | None = None,
+) -> DataFrame:
+    """
+    Bronze OCR -> Silver 更新集（去重、清洗）。
+    清洗僅做 trim：勿使用 Java \\W 剝除首尾，否則中文正文會被當成「非文字」而整段清空。
+    """
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    df = df_bronze.filter(col("extracted_text").isNotNull())
+    if ds:
+        df = _filter_df_by_dataset_id(df, ds)
+
+    w = Window.partitionBy(col("image_path")).orderBy(col("ingestion_timestamp").desc())
+    df = (
+        df.withColumn("rn", row_number().over(w))
+        .filter(col("rn") == 1)
+        .drop("rn")
+        .select(
+            "image_path",
+            "extracted_text",
+            "source_bucket",
+            col("ingestion_timestamp").alias("latest_ingestion_timestamp"),
+        )
+    )
+
+    # 注意：Spark/Java 預設的 \W「非文字」不含 CJK，会把整段中文當成 \W 從首尾剝掉，導致銀層 extracted_text 變空。
+    # 這裡只削掉首尾「空白」，不再用 [\s\W_]+（與 Notebook 舊式 regex 在中文語料下行為不同，但可避免誤刪正文）。
+    df = df.withColumn("extracted_text", trim(col("extracted_text")))
+    df = _extract_dataset_id_col(df)
+    if ds:
+        df = df.withColumn("dataset_id", lit(ds))
+    return df
+
+
+def run_silver_ocr_etl(
+    *,
+    bronze_path: str | None = None,
+    silver_ocr_path: str | None = None,
+    dataset_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Bronze OCR -> Silver OCR（去重/清洗/MERGE）.
+    """
+    spark = SparkManager().spark
+    bronze = bronze_path or BRONZE_TABLE_PATH
+    silver = silver_ocr_path or SILVER_OCR_TABLE_PATH
+    ds = _normalize_dataset_id_or_none(dataset_id)
+
+    df_bronze = read_delta_table(spark, bronze)
+    df_updates = build_silver_ocr_updates_from_bronze(df_bronze, dataset_id=ds)
+    update_count = int(df_updates.count())
+    if update_count == 0:
+        return {"updated_rows": 0, "dataset_id": ds, "silver_ocr_path": silver, "bronze_path": bronze}
+
+    if delta_table_exists(spark, silver):
+        delta_table = DeltaTable.forPath(spark, silver)
+        target_cols = set(read_delta_table(spark, silver).columns)
+        update_set = {
+            "extracted_text": col("source.extracted_text"),
+            "source_bucket": col("source.source_bucket"),
+            "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
+            "etl_update_timestamp": current_timestamp(),
+        }
+        insert_values = {
+            "image_path": col("source.image_path"),
+            "extracted_text": col("source.extracted_text"),
+            "source_bucket": col("source.source_bucket"),
+            "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
+            "etl_update_timestamp": current_timestamp(),
+        }
+        # 舊 Silver 表可能尚未有 dataset_id，避免 MERGE 直接失敗
+        if "dataset_id" in target_cols:
+            update_set["dataset_id"] = col("source.dataset_id")
+            insert_values["dataset_id"] = col("source.dataset_id")
+        (
+            delta_table.alias("target")
+            .merge(df_updates.alias("source"), "target.image_path = source.image_path")
+            .whenMatchedUpdate(set=update_set)
+            .whenNotMatchedInsert(values=insert_values)
+            .execute()
+        )
+    else:
+        (
+            df_updates.withColumnRenamed("latest_ingestion_timestamp", "ingestion_timestamp")
+            .withColumn("etl_update_timestamp", current_timestamp())
+            .write.format("delta")
+            .mode("overwrite")
+            .save(silver)
+        )
+
+    return {"updated_rows": update_count, "dataset_id": ds, "silver_ocr_path": silver, "bronze_path": bronze}
+
+
 # ---------------------------------------------------------------------------
 # Gold 層：Silver OCR → Jieba 分詞 → 詞頻 → Delta（對齊 MinIO_DeltaLake_Spark_1.1.ipynb）
 # ---------------------------------------------------------------------------
@@ -338,7 +443,8 @@ def build_gold_word_frequency_dataframe(
 ) -> DataFrame:
     """
     從 Silver OCR 表（需含 extracted_text；Notebook 另用到 image_path）產生 keyword / frequency 聚合。
-    apply_noise_filter=True 時採用 Notebook 第二段淨化規則（長度、純數字、短英文、雜訊詞）。
+    apply_noise_filter=True 時採用 Notebook 第二段淨化規則（長度、純數字、**極短英文**、雜訊詞）。
+    英文僅剔除 1～2 個字母（舊版曾剔除 1～4 字，會把 good/food/like 等大量評論常用詞清掉，導致詞頻幾乎為空）。
     """
 
     df_keywords = df_silver_ocr.withColumn(
@@ -355,7 +461,7 @@ def build_gold_word_frequency_dataframe(
         df_exploded = df_keywords_exploded.filter(
             (length(col("keyword")) >= _MIN_WORD_LENGTH)
             & (~col("keyword").rlike("^[0-9]+$"))
-            & (~col("keyword").rlike("^[a-z]{1,4}$"))
+            & (~col("keyword").rlike("^[a-z]{1,2}$"))
             & (~col("keyword").isin(_COMMON_NOISE))
         )
     else:
@@ -384,6 +490,7 @@ def run_gold_word_frequency_etl(
     *,
     silver_ocr_path: str | None = None,
     gold_path: str | None = None,
+    dataset_id: str | None = None,
     apply_noise_filter: bool = True,
     coalesce_partitions: int = 1,
 ) -> None:
@@ -394,10 +501,27 @@ def run_gold_word_frequency_etl(
     spark = SparkManager().spark
     silver = silver_ocr_path or SILVER_OCR_TABLE_PATH
     gold = gold_path or GOLD_WORD_COUNT_PATH
+    ds = _normalize_dataset_id_or_none(dataset_id)
     register_jieba_pyfile_if_needed(spark, JIEBA_ZIP_PATH)
     df_silver = read_delta_table(spark, silver)
+    if ds:
+        df_silver = _filter_df_by_dataset_id(df_silver, ds)
     df_wc = build_gold_word_frequency_dataframe(df_silver, apply_noise_filter=apply_noise_filter)
-    write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
+    if ds:
+        df_wc = df_wc.withColumn("dataset_id", lit(ds))
+        out = df_wc if coalesce_partitions <= 0 else df_wc.coalesce(coalesce_partitions)
+        if delta_table_exists(spark, gold):
+            target_cols = set(read_delta_table(spark, gold).columns)
+            if "dataset_id" in target_cols:
+                DeltaTable.forPath(spark, gold).delete(condition=f"dataset_id = '{ds}'")
+                out.write.format("delta").mode("append").save(gold)
+            else:
+                # 舊 Gold 表沒有 dataset_id 欄位時，先用 overwrite 進行欄位遷移
+                out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
+        else:
+            out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
+    else:
+        write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
 
 
 def get_gold_word_frequency_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict[str, Any]]:
@@ -461,6 +585,40 @@ def get_bronze_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict
     return [row.asDict(recursive=True) for row in df.collect()]
 
 
+def get_silver_ocr_data(limit: int = 30, dataset_id: str | None = None) -> List[Dict[str, Any]]:
+    """
+    讀取 `SILVER_OCR_TABLE_PATH`，依 dataset_id（path 片段）過濾後取前 N 筆。
+    """
+
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    df = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
+    df = _filter_df_by_dataset_id(df, dataset_id)
+    cols = set(df.columns)
+    if "ingestion_timestamp" in cols:
+        df = df.orderBy(col("ingestion_timestamp").desc_nulls_last())
+    elif "etl_update_timestamp" in cols:
+        df = df.orderBy(col("etl_update_timestamp").desc_nulls_last())
+    df = df.limit(lim)
+    return [row.asDict(recursive=True) for row in df.collect()]
+
+
+def get_gold_delta_table_preview(limit: int = 50, dataset_id: str | None = None) -> List[Dict[str, Any]]:
+    """
+    直接讀取已寫入的 Gold Delta 表（非即時自 Silver 重算），供對照落盤結果。
+    若表含 dataset_id 欄位且指定 dataset_id，會過濾該分類。
+    """
+
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    df = read_delta_table(spark, GOLD_WORD_COUNT_PATH)
+    if ds and "dataset_id" in df.columns:
+        df = df.filter(col("dataset_id") == ds)
+    df = df.orderBy(col("frequency").desc()).limit(lim)
+    return [row.asDict(recursive=True) for row in df.collect()]
+
+
 def get_system_status() -> Dict[str, Any]:
     """
     回傳主機 CPU / 記憶體使用率（使用 psutil）。
@@ -472,4 +630,99 @@ def get_system_status() -> Dict[str, Any]:
         "cpu_percent": cpu_percent,
         "memory_percent": mem.percent,
     }
+
+
+def analyze_bronze_duplicates(spark: SparkSession, bronze_path: str) -> Dict[str, Any]:
+    """
+    分析 Bronze 重複資料概況。
+    - image_path 重複
+    - skip-key（dataset_id + file_hash + ocr_signature）重複（若欄位存在）
+    """
+    df = read_delta_table(spark, bronze_path)
+    total_rows = int(df.count())
+    cols = set(df.columns)
+
+    out: Dict[str, Any] = {
+        "bronze_path": bronze_path,
+        "total_rows": total_rows,
+        "has_image_path": "image_path" in cols,
+        "has_skip_key_columns": {"dataset_id", "file_hash", "ocr_signature"}.issubset(cols),
+    }
+
+    if "image_path" in cols:
+        g_path = df.groupBy("image_path").agg(count("*").alias("c")).filter(col("c") > 1)
+        dup_groups = int(g_path.count())
+        dup_rows = g_path.selectExpr("coalesce(sum(c - 1), 0) as d").collect()[0]["d"]
+        out["duplicate_image_path_groups"] = dup_groups
+        out["duplicate_image_path_rows"] = int(dup_rows or 0)
+    else:
+        out["duplicate_image_path_groups"] = -1
+        out["duplicate_image_path_rows"] = -1
+
+    if out["has_skip_key_columns"]:
+        key_cols = ["dataset_id", "file_hash", "ocr_signature"]
+        g_key = df.groupBy(*key_cols).agg(count("*").alias("c")).filter(col("c") > 1)
+        dup_groups = int(g_key.count())
+        dup_rows = g_key.selectExpr("coalesce(sum(c - 1), 0) as d").collect()[0]["d"]
+        out["duplicate_skipkey_groups"] = dup_groups
+        out["duplicate_skipkey_rows"] = int(dup_rows or 0)
+    else:
+        out["duplicate_skipkey_groups"] = -1
+        out["duplicate_skipkey_rows"] = -1
+
+    return out
+
+
+def deduplicate_bronze_table(
+    spark: SparkSession,
+    bronze_path: str,
+    *,
+    strategy: str = "skipkey",
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Bronze 去重（保留每組最新 ingestion_timestamp 一筆）。
+    strategy:
+      - skipkey: dataset_id + file_hash + ocr_signature
+      - image_path: image_path
+    """
+    if strategy not in ("skipkey", "image_path"):
+        raise ValueError('strategy 必須是 "skipkey" 或 "image_path"。')
+
+    df = read_delta_table(spark, bronze_path)
+    cols = set(df.columns)
+    total_before = int(df.count())
+
+    if strategy == "skipkey":
+        req = {"dataset_id", "file_hash", "ocr_signature"}
+        if not req.issubset(cols):
+            raise ValueError("Bronze 缺少 skipkey 欄位（dataset_id/file_hash/ocr_signature）。")
+        keys = ["dataset_id", "file_hash", "ocr_signature"]
+    else:
+        if "image_path" not in cols:
+            raise ValueError("Bronze 缺少 image_path 欄位。")
+        keys = ["image_path"]
+
+    order_col = col("ingestion_timestamp").desc() if "ingestion_timestamp" in cols else col(keys[0]).desc()
+    w = Window.partitionBy(*[col(k) for k in keys]).orderBy(order_col)
+    dedup_df = df.withColumn("_rn_keep", row_number().over(w)).filter(col("_rn_keep") == 1).drop("_rn_keep")
+
+    total_after = int(dedup_df.count())
+    deleted_rows = max(0, total_before - total_after)
+    result = {
+        "bronze_path": bronze_path,
+        "strategy": strategy,
+        "group_keys": keys,
+        "total_before": total_before,
+        "total_after": total_after,
+        "deleted_rows": deleted_rows,
+        "dry_run": bool(dry_run),
+    }
+
+    if dry_run or deleted_rows == 0:
+        return result
+
+    dedup_df.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(bronze_path)
+    result["status"] = "ok"
+    return result
 

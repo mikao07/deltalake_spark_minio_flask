@@ -13,7 +13,12 @@
     <div class="container py-4">
       <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
         <h1 class="h3 mb-0">系統監控與資料湖預覽</h1>
-        <a class="btn btn-outline-primary btn-sm" href="{{ url_for('upload_page') }}">上傳圖片至 MinIO</a>
+        <div class="d-flex flex-wrap gap-2">
+          <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('layers_preview_page') }}"
+            >資料層預覽（銅／銀／金）</a
+          >
+          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('upload_page') }}">上傳圖片至 MinIO</a>
+        </div>
       </div>
       <form method="get" class="card shadow-sm mb-4">
         <div class="card-body py-3">

@@ -12,7 +12,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, length, lit, udf
+from pyspark.sql.functions import col, current_timestamp, length, lit, regexp_extract, sha2, udf
 from pyspark.sql.types import StringType
 from minio.error import S3Error
 
@@ -64,6 +64,17 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
 
 
 _ocr_udf = udf(_ocr_binary_to_text, StringType())
+
+
+def _get_ocr_signature() -> str:
+    # 可用環境變數覆寫，方便升級 OCR 流程後區分版本
+    sig = os.getenv("OCR_SIGNATURE", "").strip()
+    if sig:
+        return sig
+    lang = os.getenv("OCR_LANG", "chi_tra+eng").strip() or "chi_tra+eng"
+    psm = os.getenv("OCR_PSM", "6").strip() or "6"
+    pre = os.getenv("OCR_PREPROCESS_VERSION", "v1").strip() or "v1"
+    return f"tesseract|lang={lang}|psm={psm}|pre={pre}"
 
 
 def _extract_bucket_and_prefix(raw_images_path: str) -> tuple[str, str]:
@@ -146,7 +157,7 @@ def run_bronze_ocr_ingest(
     raw_images_path: str,
     bronze_path: str,
     write_mode: str = "overwrite",
-) -> None:
+) -> dict:
     """
     從 raw_images_path（s3a://.../ 目錄，內含圖檔）讀取 binaryFile，執行 OCR 後寫入 bronze_path。
 
@@ -157,15 +168,64 @@ def run_bronze_ocr_ingest(
         raise ValueError('write_mode 必須是 \"overwrite\" 或 \"append\"。')
 
     df_paths = _build_df_paths(spark, raw_images_path)
+    sig = _get_ocr_signature()
+
+    df_base = (
+        df_paths.withColumn("file_hash", sha2(col("image_content"), 256))
+        .withColumn("dataset_id", regexp_extract(col("image_path"), r"/raw/images/([^/]+)/", 1))
+        .withColumn("ocr_signature", lit(sig))
+    )
+
+    total_input = int(df_base.count())
+    if total_input == 0:
+        return {"input_rows": 0, "processed_rows": 0, "skipped_rows": 0, "ocr_signature": sig}
+
+    # append 模式下，嘗試跳過「同 dataset + 同檔案內容 hash + 同 OCR signature」已處理資料
+    if write_mode == "append":
+        try:
+            df_existing = spark.read.format("delta").load(bronze_path)
+            cols = set(df_existing.columns)
+            if {"dataset_id", "file_hash", "ocr_signature"}.issubset(cols):
+                key_cols = ["dataset_id", "file_hash", "ocr_signature"]
+                existing_keys = df_existing.select(*key_cols).dropDuplicates()
+                df_base = df_base.join(existing_keys, on=key_cols, how="left_anti")
+            elif "image_path" in cols:
+                existing_keys = df_existing.select("image_path").dropDuplicates()
+                df_base = df_base.join(existing_keys, on=["image_path"], how="left_anti")
+        except Exception:
+            # 目標表不存在或 schema 無法讀取時，直接繼續寫入
+            pass
+
+    processed_rows = int(df_base.count())
+    skipped_rows = max(0, total_input - processed_rows)
+    if processed_rows == 0:
+        return {
+            "input_rows": total_input,
+            "processed_rows": 0,
+            "skipped_rows": skipped_rows,
+            "ocr_signature": sig,
+        }
 
     df_ocr = (
-        df_paths.withColumn("extracted_text", _ocr_udf(col("image_content")))
+        df_base.withColumn("extracted_text", _ocr_udf(col("image_content")))
         .withColumn("ingestion_timestamp", current_timestamp())
         .withColumn("source_bucket", lit("raw_images"))
         .drop("image_content")
     )
 
-    df_ocr.write.format("delta").mode(write_mode).save(bronze_path)
+    writer = df_ocr.write.format("delta").mode(write_mode)
+    if write_mode == "append":
+        # 舊 Bronze 僅有 image_path 等欄位時，追加寫入需合併 schema（file_hash / dataset_id / ocr_signature）
+        writer = writer.option("mergeSchema", "true")
+    else:
+        writer = writer.option("overwriteSchema", "true")
+    writer.save(bronze_path)
+    return {
+        "input_rows": total_input,
+        "processed_rows": processed_rows,
+        "skipped_rows": skipped_rows,
+        "ocr_signature": sig,
+    }
 
 
 def preview_raw_images_sample(

@@ -119,6 +119,45 @@ def test_delta_ocr_bronze_run_dry_run_with_dataset(monkeypatch):
     assert j["raw_images_path"].endswith("/invoice_ocr/")
 
 
+def test_delta_silver_ocr_run_dry_run_with_dataset(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/silver/ocr/run",
+        json={"dry_run": True, "dataset_id": "invoice_ocr"},
+    )
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] == "dry_run"
+    assert j["dataset_id"] == "invoice_ocr"
+    assert "bronze_path" in j
+    assert "silver_ocr_path" in j
+
+
+def test_delta_gold_word_frequency_run_dry_run_with_dataset(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/gold/word-frequency/run",
+        json={"dry_run": True, "dataset_id": "invoice_ocr"},
+    )
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] == "dry_run"
+    assert j["dataset_id"] == "invoice_ocr"
+
+
+def test_delta_pipeline_to_gold_run_dry_run(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/pipeline/to-gold/run",
+        json={"dry_run": True, "dataset_id": "invoice_ocr"},
+    )
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] == "dry_run"
+    assert j["dataset_id"] == "invoice_ocr"
+    assert "steps" in j
+
+
 def test_delta_ocr_bronze_run_empty_source_returns_400(monkeypatch):
     c = _client(monkeypatch)
     import app as flask_app
