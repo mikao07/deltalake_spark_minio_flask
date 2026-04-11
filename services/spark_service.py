@@ -48,8 +48,9 @@ from config import (
 # ---------------------------------------------------------------------------
 # 依照 Notebook 的 SparkSession.builder 與 Delta Lake 設定來建立 Spark
 # ---------------------------------------------------------------------------
+# 與 VM / requirements：Spark 3.5 + Delta 3.0（Maven 使用 delta-spark_2.12，非舊版 delta-core）
 PACKAGES = (
-    "io.delta:delta-core_2.12:2.4.0,"
+    "io.delta:delta-spark_2.12:3.0.0,"
     "org.apache.hadoop:hadoop-aws:3.3.4,"
     "com.amazonaws:aws-java-sdk-bundle:1.12.262"
 )
@@ -111,7 +112,7 @@ class SparkManager:
         # 依照 Notebook Cell 1：SparkSession 配置（Delta + S3A/MinIO）
         self.spark = (
             SparkSession.builder.appName(app_name)
-            # Maven 套件載入（hadoop-aws / aws-java-sdk-bundle / delta-core）
+            # Maven 套件載入（hadoop-aws / aws-java-sdk-bundle / delta-spark）
             .config("spark.jars.packages", PACKAGES)
             # Delta Lake
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")

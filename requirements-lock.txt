@@ -1,11 +1,10 @@
-﻿# Locked dependencies for this project
-# Generated from current project requirements and resolved jieba version.
+﻿# Locked dependencies — 對齊 VM：Spark 3.5.0、Delta 3.0.0、Python 3.12（見 Dockerfile）
+# pip install -r requirements-lock.txt
 Flask==3.0.3
 minio==7.2.10
 psutil==5.9.8
 Pillow==10.3.0
 pytesseract==0.3.10
-
-delta-spark==2.4.0
-pyspark==3.4.1
+pyspark==3.5.0
+delta-spark==3.0.0
 jieba==0.42.1

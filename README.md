@@ -1,25 +1,40 @@
 ## car_rental_flask_spark_delta
 
-Flask + Spark + Delta Lake 的簡化示範專案，透過 API 讀寫/維護 Delta table，並提供簡單 Dashboard。
+Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫資料、維護 Delta table，並提供網頁（Dashboard、上傳等）與 REST API。
 
-### 功能
+### 專案結構（重點）
+
+| 路徑 | 說明 |
+|------|------|
+| `app.py` | Flask 入口：路由、管理員 token、Delta 白名單、背景任務等 |
+| `config.py` | 由環境變數讀取 MinIO/S3A、各層 Delta 路徑、OCR、上傳策略 |
+| `services/spark_service.py` | SparkSession、Delta 讀寫、Silver/Gold ETL、系統狀態等 |
+| `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
+| `services/ocr_spark.py` | Bronze OCR：binaryFile → Tesseract → Delta |
+| `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
+| `templates/` | `index.html`、`upload.html`、`layers.html` |
+| `tests/` | `pytest`：API 驗證、MinIO 檔名邏輯（可不透過真 Spark/MinIO） |
+
+### 功能（API 摘要）
 
 - **健康檢查**：`GET /health`
 - **系統狀態**：`GET /api/status`
 - **Delta 預覽**：`POST /delta/read`
 - **Delta Upsert**：`POST /delta/upsert`（可用 `ADMIN_TOKEN` 保護）
 - **僅保留最新批次**：`POST /delta/cleanup-latest-only`（可用 `ADMIN_TOKEN` 保護，支援 `dry_run`）
-- **Bronze OCR 攝入**（對齊 `MinIO_DeltaLake_Spark_1.1.ipynb`）：`POST /delta/ocr/bronze/run` — 以 `binaryFile` 讀 MinIO 影像 → Tesseract → 寫入 Delta Bronze
-- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，欄位 `file` 或 `files`，且 `dataset_id` 必填）— 寫入 `BUCKET_NAME` 下 `RAW_IMAGE_PREFIX/{dataset_id}/...`；預設若 **同名物件已存在** 會自動改為 `檔名_YYYYMMDD_HHMMSS.ext`（`on_duplicate=suffix`），亦可設為 `overwrite` 覆寫；可選 `run_ocr=true` 上傳後接續跑 Bronze OCR（只跑該 dataset）
-- **查詢既有 dataset_id**：`GET /api/datasets`
-- **Storage 健康檢查**（SDK vs Spark S3A）：`GET /api/health/storage`
+- **Bronze OCR 攝入**（對齊 Notebook 流程）：`POST /delta/ocr/bronze/run`
+- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`）
+- **查詢 dataset_id**：`GET /api/datasets`
+- **Storage 健康檢查**：`GET /api/health/storage`
+
+（完整行為以 `app.py` 為準。）
 
 ### 需求
 
-- **Python**：建議 3.10+（3.9 也常見可行）
-- **Java**：Spark 需要 Java（通常 8/11/17 皆可能，依你的 Spark/環境而定）
-- **MinIO**：本機或遠端皆可
-- **OCR（本機或 Docker 映像已含）**：需安裝 [Tesseract](https://github.com/tesseract-ocr/tesseract) 與語言包（繁中 `chi_tra`、英文 `eng`）。Windows 請安裝後可選設定 `TESSERACT_CMD` 指向 `tesseract.exe`
+- **Python**：本機開發建議 **3.12**（與 `Dockerfile` 一致）；`requirements.txt` 為 PySpark 3.5 / Delta 3.0 系）
+- **Java**：Spark 需要 JVM（容器內為 **JDK 17**）
+- **MinIO 或 S3 相容儲存**：本機、遠端或容器內皆可，由 `MINIO_ENDPOINT` 等設定
+- **OCR**：需 [Tesseract](https://github.com/tesseract-ocr/tesseract) 與語言包（繁中、英文）。Windows 可設定 `TESSERACT_CMD` 指向 `tesseract.exe`；**Docker 映像（slim / ubuntu）已含 Tesseract 語言包**
 
 ### 快速開始（Windows / PowerShell）
 
@@ -31,12 +46,10 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2) 設定環境變數（建議用 `.env` 的方式自行載入，或直接在 PowerShell 設定）：
+2) 設定環境變數（建議複製 `.env.example` 為 `.env` 再修改）：
 
-- 請參考 `.env.example`
-- **至少要設定** `MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`
-
-範例（僅示意）：
+- **至少**：`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`
+- **MinIO 位址**：見 `.env.example`；`MINIO_ENDPOINT` 可為 `host:port`（Spark S3A 相容）或 `http://host:port`
 
 ```powershell
 $env:MINIO_ACCESS_KEY="your_access_key"
@@ -45,35 +58,66 @@ $env:MINIO_ENDPOINT="127.0.0.1:9000"
 $env:BUCKET_NAME="data-lake"
 ```
 
-> 建議 `MINIO_ENDPOINT` 使用 `host:port`（例如 `127.0.0.1:9000`），對 Spark S3A 相容性通常較穩。
-
 3) 啟動 Flask：
 
 ```powershell
 python .\app.py
 ```
 
-預設會在 `http://127.0.0.1:5000` 服務。
+預設：`http://127.0.0.1:5000`  
+上傳頁：`http://127.0.0.1:5000/upload`
 
-瀏覽器上傳圖至 MinIO（含 dataset_id、可手動觸發指定 dataset OCR）：開啟 **`http://127.0.0.1:5000/upload`**。
+---
 
-### Docker Compose（MinIO + Web 一鍵起）
+### Docker：檔案該用哪一個？
+
+本專案有 **多份 Compose**，用途不同；**沒有**「一個檔適用所有情境」。
+
+| Compose 檔 | 內容 | 適合情境 |
+|--------------|------|----------|
+| **`docker-compose.yml`** | 僅 **`web`** 服務（預設 **`Dockerfile`** 建置），**不**包含 MinIO | MinIO 在**別台／區網／宿主機**；連線與路徑皆由 **`.env`（環境變數）** 設定，compose 內僅保留預設值 |
+| **`docker-compose(new_minio).yml`** | **MinIO + minio-init + web**（**`Dockerfile`** slim 映像） | 本機想 **一鍵起 MinIO + 應用**（開發／示範） |
+| **`docker-compose - ubuntu.yml`** | **MinIO + minio-init + app**（**`Dockerfile - ubuntu`**，內含 Spark 二進位等） | 需與 **Ubuntu/VM 式** 環境接近、或掛載本機目錄除錯 |
+
+**映像建置對照**
+
+| Dockerfile | 說明 |
+|------------|------|
+| **`Dockerfile`** | `python:3.12-slim` + JDK 17 + Tesseract；`pip install -r requirements-lock.txt` |
+| **`Dockerfile - ubuntu`** | `ubuntu:24.04` + JDK + 下載 **Spark 3.5.0** 至 `/opt/spark` + `pip install -r requirements.txt`；映像較大、建置較久 |
 
 需安裝 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（含 Compose V2）。
+
+#### 情境 A：預設檔（只起 Web，連外部 MinIO）
 
 ```powershell
 docker compose up --build
 ```
 
-- **Web**：`http://127.0.0.1:5000`
+- 會讀取專案根目錄的 **`docker-compose.yml`**，**不會**啟動 MinIO。
+- **`MINIO_ENDPOINT`、`MINIO_ENDPOINT_CLIENT`、Delta 路徑、`WEB_PORT` 等**請在 **`.env`** 設定（複製 `.env.example`）；未設定時使用 compose 內建預設值（例如 `MINIO_ENDPOINT` 預設 `http://127.0.0.1:9000`，連外部 MinIO 時務必改成可連線的位址）。
+- 需有 **`.env`**（若無，請由 `.env.example` 複製），因 compose 使用 `env_file`。
+
+#### 情境 B：本機一鍵 MinIO + Web（slim 映像）
+
+```powershell
+docker compose -f "docker-compose(new_minio).yml" up --build
+```
+
+- **Web**：`http://127.0.0.1:5000`（或 `WEB_PORT`）
 - **MinIO API**：`http://127.0.0.1:9000`
-- **MinIO Console**：`http://127.0.0.1:9001`（預設帳密與 `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` 相同，預設為 `minioadmin` / `minioadmin`）
+- **MinIO Console**：`http://127.0.0.1:9001`（預設帳密見 compose / `.env`）
+- `minio-init` 會建立預設 bucket（`BUCKET_NAME`，預設 `data-lake`）。
 
-`minio-init` 會自動建立 bucket（預設名稱 `data-lake`，可用環境變數 `BUCKET_NAME` 覆寫）。容器內應用透過 `MINIO_ENDPOINT=http://minio:9000` 連 MinIO，無須改程式。
+#### 情境 C：MinIO + Ubuntu/Spark 映像
 
-可選：在專案目錄放 `.env` 覆寫 `MINIO_ROOT_USER`、`MINIO_ROOT_PASSWORD`、`BUCKET_NAME`、`WEB_PORT`、`ADMIN_TOKEN` 等（勿提交真實密碼）。
+```powershell
+docker compose -f "docker-compose - ubuntu.yml" up --build
+```
 
-僅建置並執行 Web 映像（自行連外部 MinIO 時）：
+- 使用 **`Dockerfile - ubuntu`**；並掛載 `.:/app` 與 `./spark-warehouse`（本機改碼可反映進容器，依需求使用）。
+
+#### 僅建置／執行單一 Web 映像（自行連外部 MinIO）
 
 ```powershell
 docker build -t car-rental-web .
@@ -86,15 +130,16 @@ docker run --rm -p 5000:5000 `
 
 （Linux 上將 `host.docker.internal` 改為宿主 IP 或 `--add-host=host.docker.internal:host-gateway`。）
 
-### 安全與治理（建議務必設定）
+---
 
-- **保護高風險端點**：設定 `ADMIN_TOKEN` 後，呼叫需帶 header `X-Admin-Token`
-- **限制可操作路徑**：用 `ALLOWED_DELTA_PATH_PREFIXES` 限制 API 只能處理特定 `s3a://.../` 前綴（逗號分隔）
-  - 未設定時，預設只允許 `s3a://<BUCKET_NAME>/`
+### 安全與治理（建議）
+
+- **高風險 API**：設定 `ADMIN_TOKEN` 後，請求需帶 header `X-Admin-Token`
+- **路徑白名單**：`ALLOWED_DELTA_PATH_PREFIXES`（逗號分隔）；未設定時預設僅 `s3a://<BUCKET_NAME>/`
 
 ### API 範例
 
-Delta 預覽（最多 200 筆；超過會被強制裁切）：
+Delta 預覽：
 
 ```powershell
 $body = @{
@@ -105,7 +150,7 @@ $body = @{
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/read" -ContentType "application/json" -Body $body
 ```
 
-Upsert（若設定 `ADMIN_TOKEN`，請加 `-Headers @{ "X-Admin-Token"="..." }`）：
+Upsert（若啟用 `ADMIN_TOKEN` 請加 `-Headers @{ "X-Admin-Token"="..." }`）：
 
 ```powershell
 $body = @{
@@ -132,7 +177,7 @@ $body = @{
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/cleanup-latest-only" -ContentType "application/json" -Body $body
 ```
 
-上傳一張圖到 MinIO 再（可選）執行 OCR（`curl` 範例，相容性較佳）：
+上傳圖片（可選跑 OCR）：
 
 ```powershell
 curl.exe -s -X POST "http://127.0.0.1:5000/api/upload/images" `
@@ -143,9 +188,7 @@ curl.exe -s -X POST "http://127.0.0.1:5000/api/upload/images" `
   -F "write_mode=append"
 ```
 
-（PowerShell 7+ 也可用 `Invoke-RestMethod -Form`。）
-
-Bronze OCR（僅跑 OCR、不上傳；先 dry-run 確認路徑，可指定 dataset）：
+Bronze OCR（dry-run）：
 
 ```powershell
 $body = @{ dry_run = $true; dataset_id = "invoice_ocr" } | ConvertTo-Json
@@ -154,8 +197,6 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run"
 
 ### 開發：測試
 
-安裝 dev 依賴並執行 pytest：
-
 ```powershell
 pip install -r requirements-dev.txt
 pytest -q
@@ -163,19 +204,15 @@ pytest -q
 
 ### Requirements 檔案用途
 
-- `requirements.txt`：日常開發用主依賴清單（維護成本較低）。
-- `requirements-dev.txt`：僅開發/測試工具（目前為 `pytest`）。
-- `requirements-lock.txt`：部署或重現環境時使用（版本全鎖定，結果較可重現）。
-
-常見使用方式：
+| 檔案 | 用途 |
+|------|------|
+| `requirements.txt` | 主依賴（開發、維護時編輯） |
+| `requirements-dev.txt` | 開發／測試（如 `pytest`） |
+| `requirements-lock.txt` | 鎖定版本；**`Dockerfile`（slim）建置時使用** |
+| `requirements.lock` | 舊版／備份鎖檔；若與 `requirements-lock.txt` 並存，**以 `requirements-lock.txt` + `Dockerfile` 為準** |
 
 ```powershell
-# 開發
 pip install -r requirements.txt
-
-# 測試工具
 pip install -r requirements-dev.txt
-
-# 部署 / 嚴格重現
 pip install -r requirements-lock.txt
 ```

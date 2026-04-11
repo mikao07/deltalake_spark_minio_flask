@@ -9,5 +9,5 @@ pyspark==3.5.0
 delta-spark==3.0.0
 
 # Gold 層 Jieba 分詞（與 Notebook；executors 亦可改用 JIEBA_ZIP_PATH + addPyFile）
-jieba>=0.42.1
+jieba==0.42.1
 

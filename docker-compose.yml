@@ -1,34 +1,45 @@
-# Flask + 外部 MinIO（Ubuntu）；可選同時啟動 Django（見下方 profile）
-# 僅 Web：docker compose up --build
-# 含 Django：docker compose --profile django up --build
+# Flask 僅 web；MinIO 在專案外（區網 / 雲端 / 宿主機）
+# 設定請見 .env（由 .env.example 複製）；勿將含密碼的 .env 提交版本庫
+# 使用：docker compose up --build
+# 可選 Django：docker compose --profile django up --build
 
 services:
   web:
     build: .
     container_name: car_rental_flask_app
     ports:
-      - "5000:5000"
+      - "${WEB_PORT:-5000}:${PORT:-5000}"
     env_file:
       - .env
     environment:
-      PORT: "5000"
-      FLASK_DEBUG: "true"
-      LOG_LEVEL: "INFO"
-      # 指向區網 MinIO（容器內須能連到該 IP）
-      MINIO_ENDPOINT: "http://192.168.137.130:9000"
+      PORT: ${PORT:-5000}
+      FLASK_DEBUG: ${FLASK_DEBUG:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://127.0.0.1:9000}
+      MINIO_ENDPOINT_CLIENT: ${MINIO_ENDPOINT_CLIENT:-127.0.0.1:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      BUCKET_NAME: "data-lake"
-      BRONZE_TABLE_PATH: "s3a://data-lake/bronze/raw_features/"
-      S3A_PATH_STYLE_ACCESS: "true"
-      S3A_CONNECTION_SSL_ENABLED: "false"
-      S3A_IMPL: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+      BUCKET_NAME: ${BUCKET_NAME:-data-lake}
+      BRONZE_TABLE_PATH: ${BRONZE_TABLE_PATH:-s3a://data-lake/bronze/raw_features/}
+      SILVER_TABLE_PATH: ${SILVER_TABLE_PATH:-s3a://data-lake/silver/cleaned_features/}
+      SILVER_OCR_TABLE_PATH: ${SILVER_OCR_TABLE_PATH:-s3a://data-lake/silver/ocr_features/}
+      GOLD_WORD_COUNT_PATH: ${GOLD_WORD_COUNT_PATH:-s3a://data-lake/gold/word_frequency/}
+      JIEBA_ZIP_PATH: ${JIEBA_ZIP_PATH:-s3a://data-lake/jars/dependencies/jieba.zip}
+      RAW_IMAGE_PREFIX: ${RAW_IMAGE_PREFIX:-raw/images/}
+      RAW_IMAGES_PATH: ${RAW_IMAGES_PATH:-s3a://data-lake/raw/images/}
+      OCR_LANG: ${OCR_LANG:-chi_tra+eng}
+      TESSERACT_CMD: ${TESSERACT_CMD:-}
+      UPLOAD_ON_DUPLICATE: ${UPLOAD_ON_DUPLICATE:-suffix}
+      S3A_PATH_STYLE_ACCESS: ${S3A_PATH_STYLE_ACCESS:-true}
+      S3A_CONNECTION_SSL_ENABLED: ${S3A_CONNECTION_SSL_ENABLED:-false}
+      S3A_IMPL: ${S3A_IMPL:-org.apache.hadoop.fs.s3a.S3AFileSystem}
+      S3A_ENDPOINT_REGION: ${S3A_ENDPOINT_REGION:-us-east-1}
+      ALLOWED_DELTA_PATH_PREFIXES: ${ALLOWED_DELTA_PATH_PREFIXES:-s3a://data-lake/}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     networks:
       - backend_net
     restart: always
 
-  # 將你的 Django 專案放在此路徑並具備 Dockerfile 後再啟用：
-  # docker compose --profile django up --build
   django_app:
     profiles: ["django"]
     build: ./your_django_folder
@@ -36,7 +47,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ANALYTICS_API_URL=http://web:5000
+      - ANALYTICS_API_URL=http://web:${PORT:-5000}
     depends_on:
       - web
     networks:

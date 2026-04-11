@@ -1,35 +1,90 @@
-version: '3.8'
+# Ubuntu 映像（Dockerfile - ubuntu：內含 Spark 二進位）+ 本機 MinIO
+# 使用：docker compose -f "docker-compose - ubuntu.yml" up --build
+# 環境變數以 .env 為主（複製自 .env.example）；同 compose 內建 MinIO 時請設
+# MINIO_ENDPOINT=http://minio:9000、MINIO_ENDPOINT_CLIENT=minio:9000
 
 services:
-  # 數據湖倉核心應用 (你剛寫好的 Dockerfile)
+  minio:
+    image: minio/minio:latest
+    container_name: minio_server
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      BUCKET_NAME: ${BUCKET_NAME:-data-lake}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        i=0
+        while [ $$i -lt 60 ]; do
+          if mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; then
+            break
+          fi
+          i=$$((i + 1))
+          sleep 1
+        done
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" \
+          || { echo "minio-init: 無法連線 MinIO"; exit 1; }
+        mc mb "local/$$BUCKET_NAME" --ignore-existing || true
+        exit 0
+
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: "Dockerfile - ubuntu"
     container_name: car_rental_app
     ports:
-      - "5000:5000"
+      - "${WEB_PORT:-5000}:${PORT:-5000}"
+    env_file:
+      - .env
     environment:
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
+      PORT: ${PORT:-5000}
+      FLASK_DEBUG: ${FLASK_DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_ENDPOINT_CLIENT: ${MINIO_ENDPOINT_CLIENT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      BUCKET_NAME: ${BUCKET_NAME:-data-lake}
+      BRONZE_TABLE_PATH: ${BRONZE_TABLE_PATH:-s3a://data-lake/bronze/raw_features/}
+      SILVER_TABLE_PATH: ${SILVER_TABLE_PATH:-s3a://data-lake/silver/cleaned_features/}
+      SILVER_OCR_TABLE_PATH: ${SILVER_OCR_TABLE_PATH:-s3a://data-lake/silver/ocr_features/}
+      GOLD_WORD_COUNT_PATH: ${GOLD_WORD_COUNT_PATH:-s3a://data-lake/gold/word_frequency/}
+      JIEBA_ZIP_PATH: ${JIEBA_ZIP_PATH:-s3a://data-lake/jars/dependencies/jieba.zip}
+      RAW_IMAGE_PREFIX: ${RAW_IMAGE_PREFIX:-raw/images/}
+      RAW_IMAGES_PATH: ${RAW_IMAGES_PATH:-s3a://data-lake/raw/images/}
+      OCR_LANG: ${OCR_LANG:-chi_tra+eng}
+      TESSERACT_CMD: ${TESSERACT_CMD:-}
+      UPLOAD_ON_DUPLICATE: ${UPLOAD_ON_DUPLICATE:-suffix}
+      S3A_PATH_STYLE_ACCESS: ${S3A_PATH_STYLE_ACCESS:-true}
+      S3A_CONNECTION_SSL_ENABLED: ${S3A_CONNECTION_SSL_ENABLED:-false}
+      S3A_IMPL: ${S3A_IMPL:-org.apache.hadoop.fs.s3a.S3AFileSystem}
+      S3A_ENDPOINT_REGION: ${S3A_ENDPOINT_REGION:-us-east-1}
+      ALLOWED_DELTA_PATH_PREFIXES: ${ALLOWED_DELTA_PATH_PREFIXES:-s3a://data-lake/}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     depends_on:
-      - minio
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - .:/app
       - ./spark-warehouse:/app/spark-warehouse
-
-  # MinIO 物件儲存 (對應你 VM 裡的 minio_server)
-  minio:
-    [cite_start]image: minio/minio:latest [cite: 5]
-    [cite_start]container_name: minio_server [cite: 5]
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
-    command: server /data --console-address ":9001"
-    volumes:
-      - minio_data:/data
 
 volumes:
   minio_data:

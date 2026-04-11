@@ -1,5 +1,6 @@
 # Flask + PySpark + Delta；需 JVM 供 Spark 使用
-FROM python:3.11-slim-bookworm
+# 對齊 datalake-vm：Python 3.12
+FROM python:3.12-slim-bookworm
 
 # BuildKit 會帶入；舊版 builder 可能未設定，預設 amd64
 ARG TARGETARCH=amd64
@@ -18,9 +19,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements-lock.txt requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements-lock.txt
 
 COPY app.py config.py ./
 COPY services ./services
