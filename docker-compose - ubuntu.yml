@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # 數據湖倉核心應用 (你剛寫好的 Dockerfile)
+  app:
+    build: .
+    container_name: car_rental_app
+    ports:
+      - "5000:5000"
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    depends_on:
+      - minio
+    volumes:
+      - .:/app
+      - ./spark-warehouse:/app/spark-warehouse
+
+  # MinIO 物件儲存 (對應你 VM 裡的 minio_server)
+  minio:
+    [cite_start]image: minio/minio:latest [cite: 5]
+    [cite_start]container_name: minio_server [cite: 5]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  minio_data:

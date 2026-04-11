@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
@@ -24,6 +24,7 @@ from services.minio_upload import (
     normalize_dataset_id,
     upload_file_bytes,
 )
+from services.async_jobs import job_registry, job_to_public_dict
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
 from services.spark_service import (
     SparkManager,
@@ -108,6 +109,83 @@ def _get_spark_manager() -> SparkManager:
     if _spark_manager is None:
         _spark_manager = SparkManager()
     return _spark_manager
+
+
+def _noop_progress(_step: int, _total: int, _msg: str) -> None:
+    return None
+
+
+def _execute_pipeline_to_gold_inner(
+    *,
+    dataset_id: str,
+    raw_images_path: str,
+    write_mode: str,
+    apply_noise_filter: bool,
+    coalesce_partitions: int,
+    progress: Callable[[int, int, str], None],
+) -> Dict[str, Any]:
+    spark = _get_spark_manager().spark
+    progress(1, 3, "銅層 Bronze OCR…")
+    bronze_result = run_bronze_ocr_ingest(
+        spark,
+        raw_images_path=raw_images_path,
+        bronze_path=BRONZE_TABLE_PATH,
+        write_mode=write_mode,
+    )
+    progress(2, 3, "銀層 Silver ETL…")
+    silver_result = run_silver_ocr_etl(
+        bronze_path=BRONZE_TABLE_PATH,
+        silver_ocr_path=SILVER_OCR_TABLE_PATH,
+        dataset_id=dataset_id,
+    )
+    progress(3, 3, "金層 Gold 詞頻…")
+    run_gold_word_frequency_etl(
+        silver_ocr_path=SILVER_OCR_TABLE_PATH,
+        gold_path=GOLD_WORD_COUNT_PATH,
+        dataset_id=dataset_id,
+        apply_noise_filter=apply_noise_filter,
+        coalesce_partitions=coalesce_partitions,
+    )
+    return {
+        "status": "ok",
+        "dataset_id": dataset_id,
+        "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+        "raw_images_path": raw_images_path,
+        "bronze_path": BRONZE_TABLE_PATH,
+        "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+        "gold_path": GOLD_WORD_COUNT_PATH,
+        "write_mode": write_mode,
+        "apply_noise_filter": apply_noise_filter,
+        "coalesce_partitions": coalesce_partitions,
+        "bronze_result": bronze_result,
+        "silver_result": silver_result,
+    }
+
+
+def _execute_bronze_ocr_inner(
+    *,
+    dataset_id: Optional[str],
+    raw_images_path: str,
+    bronze_path: str,
+    write_mode: str,
+    progress: Callable[[int, int, str], None],
+) -> Dict[str, Any]:
+    spark = _get_spark_manager().spark
+    progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
+    bronze_result = run_bronze_ocr_ingest(
+        spark,
+        raw_images_path=raw_images_path,
+        bronze_path=bronze_path,
+        write_mode=write_mode,
+    )
+    return {
+        "status": "ok",
+        "dataset_id": dataset_id,
+        "raw_images_path": raw_images_path,
+        "bronze_path": bronze_path,
+        "write_mode": write_mode,
+        "bronze_result": bronze_result,
+    }
 
 
 @app.before_request
@@ -290,6 +368,21 @@ def api_datasets():
         _logger.warning("list_dataset_ids_failed: %s", e)
         return _json_error(f"讀取 dataset_id 清單失敗：{e}", 503)
     return jsonify({"datasets": datasets, "count": len(datasets)})
+
+
+@app.get("/api/jobs/<job_id>")
+def api_job_status(job_id: str):
+    """查詢背景任務狀態（pipeline_to_gold / bronze_ocr 等）。須與建立任務時相同的管理憑證。"""
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+    r = job_registry.get(job_id)
+    if not r:
+        return _json_error(
+            "找不到此任務（可能已過期，或若有多個 web worker 請求落到其他程序）。",
+            404,
+        )
+    return jsonify(job_to_public_dict(r))
 
 
 @app.get("/api/debug/storage-check")
@@ -863,8 +956,12 @@ def delta_pipeline_to_gold_run():
         "write_mode": "append",
         "apply_noise_filter": true,
         "coalesce_partitions": 1,
-        "dry_run": false
+        "dry_run": false,
+        "async": false
       }
+
+    - async: true 時立即回傳 job_id（HTTP 202），以 GET /api/jobs/<job_id> 輪詢；
+      預檢（來源路徑至少有 1 張圖）仍同步執行，失敗則不回傳 job。
     """
     err = _require_admin_token_if_configured()
     if err:
@@ -941,58 +1038,47 @@ def delta_pipeline_to_gold_run():
             raw_images_path=raw_images_path,
         )
 
-    # Step 1: Bronze OCR
+    if bool(body.get("async", False)):
+        jid = job_registry.create("pipeline_to_gold", step_total=3)
+
+        def work(progress: Callable[[int, int, str], None]) -> Dict[str, Any]:
+            return _execute_pipeline_to_gold_inner(
+                dataset_id=dataset_id,
+                raw_images_path=raw_images_path,
+                write_mode=write_mode,
+                apply_noise_filter=apply_noise_filter,
+                coalesce_partitions=coalesce_partitions,
+                progress=progress,
+            )
+
+        job_registry.run_async(jid, work)
+        return (
+            jsonify(
+                {
+                    "status": "accepted",
+                    "job_id": jid,
+                    "poll_path": f"/api/jobs/{jid}",
+                    "dataset_id": dataset_id,
+                }
+            ),
+            202,
+        )
+
     try:
-        bronze_result = run_bronze_ocr_ingest(
-            spark,
+        payload = _execute_pipeline_to_gold_inner(
+            dataset_id=dataset_id,
             raw_images_path=raw_images_path,
-            bronze_path=BRONZE_TABLE_PATH,
             write_mode=write_mode,
-        )
-    except Exception as e:
-        _logger.exception("pipeline_bronze_ocr_failed")
-        return _json_error(f"Bronze OCR 失敗：{e}", 500)
-
-    # Step 2: Silver OCR
-    try:
-        silver_result = run_silver_ocr_etl(
-            bronze_path=BRONZE_TABLE_PATH,
-            silver_ocr_path=SILVER_OCR_TABLE_PATH,
-            dataset_id=dataset_id,
-        )
-    except Exception as e:
-        _logger.exception("pipeline_silver_ocr_failed")
-        return _json_error(f"Silver OCR ETL 失敗：{e}", 500)
-
-    # Step 3: Gold
-    try:
-        run_gold_word_frequency_etl(
-            silver_ocr_path=SILVER_OCR_TABLE_PATH,
-            gold_path=GOLD_WORD_COUNT_PATH,
-            dataset_id=dataset_id,
             apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
+            progress=_noop_progress,
         )
+        return jsonify(payload)
+    except ValueError as e:
+        return _json_error(str(e), 400)
     except Exception as e:
-        _logger.exception("pipeline_gold_failed")
-        return _json_error(f"Gold ETL 失敗：{e}", 500)
-
-    return jsonify(
-        {
-            "status": "ok",
-            "dataset_id": dataset_id,
-            "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
-            "raw_images_path": raw_images_path,
-            "bronze_path": BRONZE_TABLE_PATH,
-            "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-            "gold_path": GOLD_WORD_COUNT_PATH,
-            "write_mode": write_mode,
-            "apply_noise_filter": apply_noise_filter,
-            "coalesce_partitions": coalesce_partitions,
-            "bronze_result": bronze_result,
-            "silver_result": silver_result,
-        }
-    )
+        _logger.exception("pipeline_to_gold_failed")
+        return _json_error(f"一鍵 ETL 失敗：{e}", 500)
 
 
 @app.post("/delta/ocr/bronze/run")
@@ -1008,12 +1094,14 @@ def delta_ocr_bronze_run():
         "bronze_path": "s3a://data-lake/bronze/raw_features/",
         "write_mode": "overwrite",
         "dry_run": false,
+        "async": false,
         "include_sample": false,
         "preview_limit": 5
       }
 
     - write_mode: \"overwrite\"（同 Notebook 全表覆寫）或 \"append\"
     - dry_run: 僅驗證路徑；若 include_sample 為 true 會啟動 Spark 從 MinIO 取少量檔案預覽（需憑證）
+    - async: true 時回傳 job_id（HTTP 202），以 GET /api/jobs/<job_id> 輪詢（來源預檢仍同步）
     """
 
     err = _require_admin_token_if_configured()
@@ -1100,29 +1188,45 @@ def delta_ocr_bronze_run():
             raw_images_path=raw_images_path,
         )
 
+    if bool(body.get("async", False)):
+        jid = job_registry.create("bronze_ocr", step_total=1)
+
+        def work(progress: Callable[[int, int, str], None]) -> Dict[str, Any]:
+            return _execute_bronze_ocr_inner(
+                dataset_id=dataset_id,
+                raw_images_path=raw_images_path,
+                bronze_path=bronze_path,
+                write_mode=write_mode,
+                progress=progress,
+            )
+
+        job_registry.run_async(jid, work)
+        return (
+            jsonify(
+                {
+                    "status": "accepted",
+                    "job_id": jid,
+                    "poll_path": f"/api/jobs/{jid}",
+                    "dataset_id": dataset_id,
+                }
+            ),
+            202,
+        )
+
     try:
-        bronze_result = run_bronze_ocr_ingest(
-            spark,
+        out = _execute_bronze_ocr_inner(
+            dataset_id=dataset_id,
             raw_images_path=raw_images_path,
             bronze_path=bronze_path,
             write_mode=write_mode,
+            progress=_noop_progress,
         )
+        return jsonify(out)
     except ValueError as e:
         return _json_error(str(e), 400)
     except Exception as e:
         _logger.exception("ocr_bronze_run_failed")
         return _json_error(f"OCR 攝入失敗：{e}", 500)
-
-    return jsonify(
-        {
-            "status": "ok",
-            "dataset_id": dataset_id,
-            "raw_images_path": raw_images_path,
-            "bronze_path": bronze_path,
-            "write_mode": write_mode,
-            "bronze_result": bronze_result,
-        }
-    )
 
 
 _ALLOWED_IMAGE_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"})

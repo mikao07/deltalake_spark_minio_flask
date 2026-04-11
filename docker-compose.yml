@@ -1,4 +1,6 @@
-version: '3.8'
+# Flask + 外部 MinIO（Ubuntu）；可選同時啟動 Django（見下方 profile）
+# 僅 Web：docker compose up --build
+# 含 Django：docker compose --profile django up --build
 
 services:
   web:
@@ -9,25 +11,37 @@ services:
     env_file:
       - .env
     environment:
-      # 基礎 Flask 設定
       PORT: "5000"
       FLASK_DEBUG: "true"
       LOG_LEVEL: "INFO"
-      
-      # MinIO / S3A 連線設定 (指向你的 Ubuntu 主機)
-      # 這裡會優先讀取環境變數，若無則使用後方的預設值
+      # 指向區網 MinIO（容器內須能連到該 IP）
       MINIO_ENDPOINT: "http://192.168.137.130:9000"
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      
-      # 資料路徑設定
       BUCKET_NAME: "data-lake"
-      BRONZE_TABLE_PATH: "s3a://data-lake/bronze/raw_features"
-      
-      # Spark 連線 MinIO 的關鍵參數 (修正 Path Not Found 的核心)
+      BRONZE_TABLE_PATH: "s3a://data-lake/bronze/raw_features/"
       S3A_PATH_STYLE_ACCESS: "true"
       S3A_CONNECTION_SSL_ENABLED: "false"
       S3A_IMPL: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-
-    # 因為連線到外部 Linux，不需要再 depends_on 本地服務
+    networks:
+      - backend_net
     restart: always
+
+  # 將你的 Django 專案放在此路徑並具備 Dockerfile 後再啟用：
+  # docker compose --profile django up --build
+  django_app:
+    profiles: ["django"]
+    build: ./your_django_folder
+    container_name: feedback_engine_django
+    ports:
+      - "8000:8000"
+    environment:
+      - ANALYTICS_API_URL=http://web:5000
+    depends_on:
+      - web
+    networks:
+      - backend_net
+
+networks:
+  backend_net:
+    driver: bridge

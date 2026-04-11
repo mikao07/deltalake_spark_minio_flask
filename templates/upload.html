@@ -406,8 +406,10 @@
                 "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" + writeMode + "）";
               ocrNote.className = "small text-success mt-2 mb-0";
             } else {
+              const stepPart =
+                pipeResult.step > 0 ? "（第 " + pipeResult.step + " 步）" : "";
               ocrNote.textContent =
-                "一鍵金層：失敗（第 " + pipeResult.step + " 步）— " + (pipeResult.error || "未知錯誤");
+                "一鍵金層：失敗" + stepPart + " — " + (pipeResult.error || "未知錯誤");
               ocrNote.className = "small text-danger mt-2 mb-0";
             }
           } else if (runOcr && anyUploaded) {
@@ -522,69 +524,111 @@
         };
       }
 
+      /** 與 GET /api/jobs 輪詢相同的授權標頭（勿帶 Content-Type）。 */
+      function authHeadersForJobPoll(baseHeaders) {
+        var o = {};
+        if (!baseHeaders) return o;
+        if (baseHeaders["X-Admin-Token"]) o["X-Admin-Token"] = baseHeaders["X-Admin-Token"];
+        if (baseHeaders["Authorization"]) o["Authorization"] = baseHeaders["Authorization"];
+        return o;
+      }
+
       /**
-       * 分三段呼叫 API，讓瀏覽器能即時更新進度（等同後端一鍵流程）。
-       * 回傳 { ok, error?, step?, data? }
+       * 後端一鍵 pipeline（async），以 job 輪詢進度，避免長時間佔用單一 HTTP。
+       * 回傳 { ok, error?, step?, result? }
        */
       async function runPipelineToGoldWithProgress(datasetId, writeMode, headers, progressUi) {
         const h = Object.assign({ "Content-Type": "application/json" }, headers);
-        const post = async function (url, body) {
-          const res = await fetch(url, { method: "POST", headers: h, body: JSON.stringify(body) });
-          const txt = await res.text();
-          let data = {};
-          try {
-            data = JSON.parse(txt);
-          } catch (_) {}
-          return { res: res, txt: txt, data: data };
-        };
+        const pollH = authHeadersForJobPoll(headers);
 
         progressUi.show();
-        progressUi.set(1, 3, "銅層 Bronze OCR（讀圖、Tesseract）…", 12);
+        progressUi.set(0, 3, "送出背景任務…", 5);
 
-        const r1 = await post("/delta/ocr/bronze/run", {
-          dataset_id: datasetId,
-          write_mode: writeMode,
-          dry_run: false,
+        const submitRes = await fetch("/delta/pipeline/to-gold/run", {
+          method: "POST",
+          headers: h,
+          body: JSON.stringify({
+            dataset_id: datasetId,
+            write_mode: writeMode,
+            apply_noise_filter: true,
+            coalesce_partitions: 1,
+            dry_run: false,
+            async: true,
+          }),
         });
-        if (!r1.res.ok || !(r1.data && r1.data.status === "ok")) {
+        const submitTxt = await submitRes.text();
+        let submitData = {};
+        try {
+          submitData = JSON.parse(submitTxt);
+        } catch (_) {}
+        if (!submitRes.ok || submitData.status !== "accepted" || !submitData.job_id) {
           progressUi.done();
           return {
             ok: false,
-            step: 1,
-            error: (r1.data && r1.data.error) || r1.txt || r1.res.statusText || "銅層失敗",
+            step: 0,
+            error:
+              (submitData && submitData.error) ||
+              submitTxt ||
+              submitRes.statusText ||
+              "無法建立背景任務",
           };
         }
 
-        progressUi.set(2, 3, "銀層 Silver ETL（清洗、MERGE）…", 45);
-        const r2 = await post("/delta/silver/ocr/run", { dataset_id: datasetId, dry_run: false });
-        if (!r2.res.ok || !(r2.data && r2.data.status === "ok")) {
-          progressUi.done();
-          return {
-            ok: false,
-            step: 2,
-            error: (r2.data && r2.data.error) || r2.txt || r2.res.statusText || "銀層失敗",
-          };
+        const jobId = submitData.job_id;
+        const deadline = Date.now() + 45 * 60 * 1000;
+
+        while (Date.now() < deadline) {
+          await new Promise(function (r) {
+            setTimeout(r, 900);
+          });
+          const stRes = await fetch("/api/jobs/" + encodeURIComponent(jobId), { headers: pollH });
+          const stTxt = await stRes.text();
+          let st = {};
+          try {
+            st = JSON.parse(stTxt);
+          } catch (_) {}
+          if (!stRes.ok) {
+            progressUi.done();
+            return {
+              ok: false,
+              step: 0,
+              error: (st && st.error) || stTxt || "查詢任務失敗",
+            };
+          }
+
+          var total = st.step_total || 3;
+          var step = typeof st.step === "number" ? st.step : 0;
+          var pct =
+            st.status === "queued"
+              ? 5
+              : total > 0
+                ? Math.min(99, Math.round((Math.max(step, 1) / total) * 100))
+                : 5;
+
+          if (st.status === "succeeded") {
+            progressUi.set(total, total, "全部完成", 100);
+            progressUi.done();
+            return { ok: true, result: st.result };
+          }
+          if (st.status === "failed") {
+            progressUi.done();
+            return {
+              ok: false,
+              step: step || 0,
+              error: st.error || st.message || "任務失敗",
+            };
+          }
+
+          progressUi.set(step || 0, total, st.message || "執行中…", pct);
         }
 
-        progressUi.set(3, 3, "金層 Gold（詞頻）…", 78);
-        const r3 = await post("/delta/gold/word-frequency/run", {
-          dataset_id: datasetId,
-          apply_noise_filter: true,
-          coalesce_partitions: 1,
-          dry_run: false,
-        });
-        if (!r3.res.ok || !(r3.data && r3.data.status === "ok")) {
-          progressUi.done();
-          return {
-            ok: false,
-            step: 3,
-            error: (r3.data && r3.data.error) || r3.txt || r3.res.statusText || "金層失敗",
-          };
-        }
-
-        progressUi.set(3, 3, "全部完成", 100);
         progressUi.done();
-        return { ok: true, bronze: r1.data, silver: r2.data, gold: r3.data };
+        return {
+          ok: false,
+          step: 0,
+          error:
+            "等待逾時（任務仍可能在背景執行，請稍後查 /layers 或以 job_id 再查 /api/jobs）。",
+        };
       }
 
       /** 手動區塊：有填 ocr_dataset_id 則用之，否則沿用上方 dataset_id（方便第一次建新 id） */
@@ -846,8 +890,9 @@
           const result = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, manualProg);
           if (!result.ok) {
             note.className = "small text-danger mt-2 mb-0";
+            const stepPart = result.step > 0 ? "（第 " + result.step + " 步）" : "";
             note.textContent =
-              "一鍵 ETL 失敗（第 " + result.step + " 步）：" + (result.error || "未知錯誤");
+              "一鍵 ETL 失敗" + stepPart + "：" + (result.error || "未知錯誤");
             return;
           }
           note.className = "small text-success mt-2 mb-0";

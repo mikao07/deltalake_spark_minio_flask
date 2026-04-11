@@ -158,6 +158,55 @@ def test_delta_pipeline_to_gold_run_dry_run(monkeypatch):
     assert "steps" in j
 
 
+def test_api_jobs_unknown_returns_404(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.get("/api/jobs/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 404
+
+
+def test_delta_pipeline_to_gold_async_invalid_dataset(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/pipeline/to-gold/run",
+        json={"async": True, "dataset_id": ""},
+    )
+    assert r.status_code == 400
+
+
+def test_delta_pipeline_to_gold_async_returns_accepted(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    monkeypatch.setattr(
+        flask_app,
+        "preview_raw_images_sample",
+        lambda spark, raw_images_path, limit=1: [{"path": "a"}],
+    )
+
+    class _Dummy:
+        spark = object()
+
+    monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _Dummy())
+
+    calls = []
+
+    def fake_run_async(jid, target):
+        calls.append((jid, target))
+
+    monkeypatch.setattr(flask_app.job_registry, "run_async", fake_run_async)
+
+    r = c.post(
+        "/delta/pipeline/to-gold/run",
+        json={"dataset_id": "invoice_ocr", "async": True, "write_mode": "append"},
+    )
+    assert r.status_code == 202
+    j = r.get_json()
+    assert j["status"] == "accepted"
+    assert j["job_id"]
+    assert j["poll_path"] == "/api/jobs/" + j["job_id"]
+    assert len(calls) == 1
+
+
 def test_delta_ocr_bronze_run_empty_source_returns_400(monkeypatch):
     c = _client(monkeypatch)
     import app as flask_app
