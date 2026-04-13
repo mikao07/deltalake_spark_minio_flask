@@ -22,12 +22,21 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **Delta 預覽**：`POST /delta/read`
 - **Delta Upsert**：`POST /delta/upsert`（可用 `ADMIN_TOKEN` 保護）
 - **僅保留最新批次**：`POST /delta/cleanup-latest-only`（可用 `ADMIN_TOKEN` 保護，支援 `dry_run`）
+- **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`（同源）
+- **Gold 詞頻預覽**：`GET /api/gold/word-frequency`
 - **Bronze OCR 攝入**（對齊 Notebook 流程）：`POST /delta/ocr/bronze/run`
 - **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`）
 - **查詢 dataset_id**：`GET /api/datasets`
 - **Storage 健康檢查**：`GET /api/health/storage`
 
 （完整行為以 `app.py` 為準。）
+
+### 首頁 /layers 與 Gold 顯示規則（重要）
+
+- 首頁 Gold 圖表與 `/layers` 的「Gold — 與首頁圖表同源」目前都以 **落盤 Gold Delta 表** 為來源。
+- 帶 `dataset_id` 時會以 Gold 表中的 `dataset_id` 欄位過濾；不再切換成 Silver 即時計算。
+- `/layers` 新增「時間排序」：可切換 `最新在前` / `最舊在前`，方便確認最新上傳是否已進各層。
+- 一鍵 ETL（上傳頁）完成後，會回傳白話說明與關鍵數字（例如 Silver 筆數、Gold 產出筆數、是否成功寫入金層）。
 
 ### 需求
 

@@ -8,6 +8,15 @@ from typing import Any, Callable, Dict, List, Optional
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
+# 本機用 `python app.py` 啟動時，Python 不會自動載入 `.env`（Docker Compose 才會）。
+# 若有安裝 python-dotenv，則在啟動時自動讀取專案根目錄的 `.env`。
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
+
 from config import (
     BUCKET_NAME,
     BRONZE_TABLE_PATH,
@@ -139,7 +148,7 @@ def _execute_pipeline_to_gold_inner(
         dataset_id=dataset_id,
     )
     progress(3, 3, "金層 Gold 詞頻…")
-    run_gold_word_frequency_etl(
+    gold_result = run_gold_word_frequency_etl(
         silver_ocr_path=SILVER_OCR_TABLE_PATH,
         gold_path=GOLD_WORD_COUNT_PATH,
         dataset_id=dataset_id,
@@ -159,6 +168,7 @@ def _execute_pipeline_to_gold_inner(
         "coalesce_partitions": coalesce_partitions,
         "bronze_result": bronze_result,
         "silver_result": silver_result,
+        "gold_result": gold_result,
     }
 
 
@@ -230,9 +240,14 @@ def health():
     return {"status": "ok"}
 
 
-def _safe_bronze_preview(dataset_id: str | None = None, *, limit: int = 10):
+def _safe_bronze_preview(
+    dataset_id: str | None = None,
+    *,
+    limit: int = 10,
+    newest_first: bool = True,
+):
     try:
-        return get_bronze_data(limit=limit, dataset_id=dataset_id), None
+        return get_bronze_data(limit=limit, dataset_id=dataset_id, newest_first=newest_first), None
     except Exception as e:
         _logger.warning("bronze_preview_failed: %s", e)
         return [], str(e)
@@ -246,17 +261,31 @@ def _safe_gold_preview(limit: int = 15, dataset_id: str | None = None):
         return [], str(e)
 
 
-def _safe_silver_preview(limit: int = 30, dataset_id: str | None = None):
+def _safe_silver_preview(
+    limit: int = 30,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+):
     try:
-        return get_silver_ocr_data(limit=limit, dataset_id=dataset_id), None
+        return get_silver_ocr_data(limit=limit, dataset_id=dataset_id, newest_first=newest_first), None
     except Exception as e:
         _logger.warning("silver_preview_failed: %s", e)
         return [], str(e)
 
 
-def _safe_gold_disk_preview(limit: int = 50, dataset_id: str | None = None):
+def _safe_gold_disk_preview(
+    limit: int = 50,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+):
     try:
-        return get_gold_delta_table_preview(limit=limit, dataset_id=dataset_id), None
+        return get_gold_delta_table_preview(
+            limit=limit,
+            dataset_id=dataset_id,
+            newest_first=newest_first,
+        ), None
     except Exception as e:
         _logger.warning("gold_disk_preview_failed: %s", e)
         return [], str(e)
@@ -320,6 +349,8 @@ def layers_preview_page():
         preview_limit = max(5, min(int(limit_raw), 100))
     except (TypeError, ValueError):
         preview_limit = 30
+    sort_by_time = (request.args.get("sort_time", "desc") or "desc").strip().lower()
+    newest_first = sort_by_time != "asc"
 
     dataset_options: list[str] = []
     try:
@@ -327,16 +358,42 @@ def layers_preview_page():
     except Exception as e:
         _logger.warning("list_dataset_ids_for_layers_failed: %s", e)
 
-    bronze_rows, bronze_error = _safe_bronze_preview(limit=preview_limit, dataset_id=selected_dataset_id)
-    silver_rows, silver_error = _safe_silver_preview(limit=preview_limit, dataset_id=selected_dataset_id)
-    gold_disk_rows, gold_disk_error = _safe_gold_disk_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+    bronze_rows, bronze_error = _safe_bronze_preview(
+        limit=preview_limit,
+        dataset_id=selected_dataset_id,
+        newest_first=newest_first,
+    )
+    silver_rows, silver_error = _safe_silver_preview(
+        limit=preview_limit,
+        dataset_id=selected_dataset_id,
+        newest_first=newest_first,
+    )
+    gold_disk_rows, gold_disk_error = _safe_gold_disk_preview(
+        limit=preview_limit,
+        dataset_id=selected_dataset_id,
+        newest_first=newest_first,
+    )
     gold_live_rows, gold_live_error = _safe_gold_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+
+    gold_disk_hint = None
+    if not gold_disk_error and not gold_disk_rows:
+        if selected_dataset_id:
+            gold_disk_hint = (
+                "已選定 dataset_id：落盤預覽只顯示 Gold 表內 dataset_id 與所選相符的列；若不符會空白。"
+                "請改選「全部」後按更新，或確認該 id 已執行金層 ETL 且寫入欄位一致。"
+            )
+        else:
+            gold_disk_hint = (
+                "MinIO 若有很小的 part 檔仍可能 0 列（空 partition）。"
+                "請用 GET /api/gold/word-frequency?limit=20 看 count，或確認金層 ETL 是否產出有效詞頻列。"
+            )
 
     return render_template(
         "layers.html",
         dataset_options=dataset_options,
         selected_dataset_id=selected_dataset_id,
         preview_limit=preview_limit,
+        sort_time=sort_by_time,
         bronze_path=BRONZE_TABLE_PATH,
         silver_path=SILVER_OCR_TABLE_PATH,
         gold_path=GOLD_WORD_COUNT_PATH,
@@ -346,6 +403,7 @@ def layers_preview_page():
         silver_error=silver_error,
         gold_disk_rows=gold_disk_rows,
         gold_disk_error=gold_disk_error,
+        gold_disk_hint=gold_disk_hint,
         gold_live_rows=gold_live_rows,
         gold_live_error=gold_live_error,
     )
@@ -588,6 +646,55 @@ def api_gold_word_frequency():
     return jsonify(
         {
             "path": GOLD_WORD_COUNT_PATH,
+            "dataset_id": dataset_id,
+            "rows": rows,
+            "count": len(rows),
+        }
+    )
+
+
+def _parse_limit_arg(raw: str, *, max_val: int = 200) -> tuple[int | None, Any]:
+    """回傳 (limit, error_response)；error_response 非 None 時應直接 return。"""
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return None, _json_error("limit 必須是整數。", 400)
+    return max(1, min(limit, max_val)), None
+
+
+def _parse_optional_dataset_id() -> tuple[str | None, Any]:
+    """回傳 (dataset_id, error_response)。"""
+    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    if not dataset_raw:
+        return None, None
+    try:
+        return normalize_dataset_id(dataset_raw), None
+    except ValueError as e:
+        return None, _json_error(str(e), 400)
+
+
+@app.get("/api/silver")
+@app.get("/api/silver/ocr")
+def api_silver_ocr():
+    """
+    query: limit（預設 30，最大 200）、dataset_id（可選）
+    讀取 config 的 SILVER_OCR_TABLE_PATH，與 /layers 銀層預覽同源。
+    """
+
+    raw = request.args.get("limit", "30")
+    limit, err = _parse_limit_arg(raw)
+    if err is not None:
+        return err
+    assert limit is not None
+
+    dataset_id, err = _parse_optional_dataset_id()
+    if err is not None:
+        return err
+
+    rows = get_silver_ocr_data(limit=limit, dataset_id=dataset_id)
+    return jsonify(
+        {
+            "path": SILVER_OCR_TABLE_PATH,
             "dataset_id": dataset_id,
             "rows": rows,
             "count": len(rows),
@@ -926,7 +1033,7 @@ def delta_gold_word_frequency_run():
         )
 
     _get_spark_manager()
-    run_gold_word_frequency_etl(
+    gold_result = run_gold_word_frequency_etl(
         silver_ocr_path=silver_ocr_path,
         gold_path=gold_path,
         dataset_id=dataset_id,
@@ -941,6 +1048,9 @@ def delta_gold_word_frequency_run():
             "gold_path": gold_path,
             "apply_noise_filter": apply_noise_filter,
             "coalesce_partitions": coalesce_partitions,
+            "gold_result": gold_result,
+            "是否成功寫入金層": "是" if gold_result.get("is_gold_written") else "否",
+            "白話說明": gold_result.get("summary"),
         }
     )
 

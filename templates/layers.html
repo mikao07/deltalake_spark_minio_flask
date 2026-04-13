@@ -56,13 +56,21 @@
                 {% endfor %}
               </select>
             </div>
+            <div class="col-6 col-md-2">
+              <label class="form-label small mb-1">時間排序</label>
+              <select class="form-select form-select-sm" name="sort_time">
+                <option value="desc" {% if sort_time != 'asc' %}selected{% endif %}>最新在前</option>
+                <option value="asc" {% if sort_time == 'asc' %}selected{% endif %}>最舊在前</option>
+              </select>
+            </div>
             <div class="col-6 col-md-2 d-grid">
               <button type="submit" class="btn btn-sm btn-primary">更新</button>
             </div>
           </div>
           <p class="small text-muted mt-2 mb-0">
             目前：{% if selected_dataset_id %}<code>{{ selected_dataset_id }}</code>{% else %}全部 path{% endif %}
-            · 每表最多 {{ preview_limit }} 列（非全表）。
+            · 每表最多 {{ preview_limit }} 列（非全表）· 時間排序：
+            {% if sort_time == 'asc' %}最舊在前{% else %}最新在前{% endif %}。
           </p>
         </div>
       </form>
@@ -70,9 +78,7 @@
       <div class="alert alert-light border small mb-4 py-2">
         <strong>說明：</strong><br />
         · <strong>金層（落盤）</strong>：讀 Delta 表 <code>{{ gold_path }}</code>，為 ETL 寫入結果。<br />
-        · <strong>金層（首頁同源）</strong>：指定 dataset_id
-        時與首頁圖表相同，為當下自 Silver 即時算出（含雜訊過濾）；未指定 id
-        時為讀落盤表前幾名。<br />
+        · <strong>金層（首頁同源）</strong>：與首頁一致，皆讀落盤 Gold 表；有指定 dataset_id 時會用該欄位過濾。<br />
         · 若「銀層列數遠少於你的圖片張數」，請先確認該 id 的 Bronze OCR 與 Silver ETL 是否已跑完。
       </div>
 
@@ -177,12 +183,15 @@
             </div>
           {% else %}
             <p class="text-muted small mb-0">無資料（可能尚未執行金層 ETL，或篩選後為空）。</p>
+            {% if gold_disk_hint %}
+              <div class="alert alert-info small py-2 mb-0 mt-2">{{ gold_disk_hint }}</div>
+            {% endif %}
           {% endif %}
         </div>
       </section>
 
       <section class="layer-section card shadow-sm">
-        <div class="card-header py-2"><strong>Gold — 與首頁圖表同源（指定 dataset 時為即時自 Silver 計算）</strong></div>
+        <div class="card-header py-2"><strong>Gold — 與首頁圖表同源（讀落盤 Gold）</strong></div>
         <div class="card-body">
           {% if gold_live_error %}
             <div class="alert alert-warning py-2 small mb-0">讀取／計算失敗：{{ gold_live_error }}</div>

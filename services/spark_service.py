@@ -397,8 +397,19 @@ def _filter_df_by_dataset_id(df: DataFrame, dataset_id: str | None) -> DataFrame
     ds = _normalize_dataset_id_or_none(dataset_id)
     if not ds:
         return df
-    # image_path 來源為 raw/images/{dataset_id}/...，用路徑片段過濾
-    return df.filter(col("image_path").contains(f"/{ds}/"))
+    cols = set(df.columns)
+
+    # 優先用欄位 dataset_id 過濾（最穩），避免依賴路徑格式
+    if "dataset_id" in cols:
+        return df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+
+    # 退回用 image_path 推導（兼容 s3a://... 與 Windows 反斜線）
+    if "image_path" in cols:
+        normalized_path = lower(regexp_replace(col("image_path"), r"\\\\", "/"))
+        return df.filter(normalized_path.contains(f"/{ds}/"))
+
+    # 無可用欄位時不過濾（避免整段變空）
+    return df
 
 
 def register_jieba_pyfile_if_needed(spark: SparkSession, jieba_zip_path: str | None) -> None:
@@ -494,7 +505,7 @@ def run_gold_word_frequency_etl(
     dataset_id: str | None = None,
     apply_noise_filter: bool = True,
     coalesce_partitions: int = 1,
-) -> None:
+) -> Dict[str, Any]:
     """
     讀取 Silver OCR Delta → 詞頻 → 覆寫寫入 Gold Delta（完整金層 ETL）。
     """
@@ -507,7 +518,9 @@ def run_gold_word_frequency_etl(
     df_silver = read_delta_table(spark, silver)
     if ds:
         df_silver = _filter_df_by_dataset_id(df_silver, ds)
+    silver_filtered_rows = int(df_silver.count())
     df_wc = build_gold_word_frequency_dataframe(df_silver, apply_noise_filter=apply_noise_filter)
+    gold_output_rows = int(df_wc.count())
     if ds:
         df_wc = df_wc.withColumn("dataset_id", lit(ds))
         out = df_wc if coalesce_partitions <= 0 else df_wc.coalesce(coalesce_partitions)
@@ -524,29 +537,64 @@ def run_gold_word_frequency_etl(
     else:
         write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
 
+    df_gold_after = read_delta_table(spark, gold)
+    gold_total_rows_after = int(df_gold_after.count())
+    gold_dataset_rows_after: int | None = None
+    if ds and "dataset_id" in df_gold_after.columns:
+        gold_dataset_rows_after = int(df_gold_after.filter(trim(lower(col("dataset_id"))) == lit(ds)).count())
+
+    if gold_output_rows > 0:
+        summary = f"金層已完成，這次產出 {gold_output_rows} 筆詞頻資料。"
+    elif silver_filtered_rows > 0:
+        summary = (
+            f"金層流程有執行，但詞頻產出為 0 筆（Silver 篩選後有 {silver_filtered_rows} 筆）。"
+            "通常是分詞後被雜訊規則過濾掉。"
+        )
+    else:
+        summary = "金層流程有執行，但 Silver 篩選後為 0 筆，所以沒有可寫入的金層資料。"
+
+    return {
+        "silver_filtered_rows": silver_filtered_rows,
+        "gold_output_rows": gold_output_rows,
+        "gold_total_rows_after": gold_total_rows_after,
+        "gold_dataset_rows_after": gold_dataset_rows_after,
+        "is_gold_written": gold_output_rows > 0,
+        "summary": summary,
+    }
+
+
+def _order_gold_word_count_df(df: DataFrame) -> DataFrame:
+    """詞頻表預覽預設依 frequency 降序；若無該欄位則不排序（避免讀到舊 schema 時整段失敗）。"""
+    if "frequency" in df.columns:
+        return df.orderBy(col("frequency").desc())
+    return df
+
+
+def _order_df_by_time_if_present(df: DataFrame, *, newest_first: bool = True) -> DataFrame:
+    """
+    若 DataFrame 含時間欄位，依時間排序；否則維持原順序。
+    常見時間欄位優先序：ingestion_timestamp > etl_update_timestamp。
+    """
+    for c in ("ingestion_timestamp", "etl_update_timestamp"):
+        if c in df.columns:
+            return df.orderBy(col(c).desc_nulls_last() if newest_first else col(c).asc_nulls_last())
+    return df
+
 
 def get_gold_word_frequency_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict[str, Any]]:
     """
-    讀取 Gold 詞頻表（GOLD_WORD_COUNT_PATH）依 frequency 降序前 N 筆。
+    讀取 Gold 詞頻表（GOLD_WORD_COUNT_PATH）前 N 筆。
+    指定 dataset_id 時，優先在落盤 Gold 表中以 dataset_id 過濾（符合首頁預期）。
     """
 
     spark = SparkManager().spark
     lim = max(1, min(int(limit), 200))
     ds = _normalize_dataset_id_or_none(dataset_id)
-    if not ds:
-        df = (
-            read_delta_table(spark, GOLD_WORD_COUNT_PATH)
-            .orderBy(col("frequency").desc())
-            .limit(lim)
-        )
-        return [row.asDict(recursive=True) for row in df.collect()]
-
-    # 指定 dataset_id 時，直接從 Silver OCR 即時計算詞頻，避免混合不同資料集
-    register_jieba_pyfile_if_needed(spark, JIEBA_ZIP_PATH)
-    df_silver = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
-    df_silver = _filter_df_by_dataset_id(df_silver, ds)
-    df_wc = build_gold_word_frequency_dataframe(df_silver, apply_noise_filter=True).limit(lim)
-    return [row.asDict(recursive=True) for row in df_wc.collect()]
+    df = read_delta_table(spark, GOLD_WORD_COUNT_PATH)
+    if ds and "dataset_id" in df.columns:
+        df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    df = _order_gold_word_count_df(df).limit(lim)
+    return [row.asDict(recursive=True) for row in df.collect()]
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +622,12 @@ def add_etl_timestamp(df: DataFrame, col_name: str = "etl_update_timestamp") -> 
 # ---------------------------------------------------------------------------
 # 核心功能
 # ---------------------------------------------------------------------------
-def get_bronze_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict[str, Any]]:
+def get_bronze_data(
+    limit: int = 10,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+) -> List[Dict[str, Any]]:
     """
     讀取 `BRONZE_TABLE_PATH` 並回傳前 10 筆資料（JSON 可序列化格式）。
     """
@@ -582,11 +635,17 @@ def get_bronze_data(limit: int = 10, dataset_id: str | None = None) -> List[Dict
     spark = SparkManager().spark
     lim = max(1, min(int(limit), 200))
     df = read_delta_table(spark, BRONZE_TABLE_PATH)
-    df = _filter_df_by_dataset_id(df, dataset_id).limit(lim)
+    df = _filter_df_by_dataset_id(df, dataset_id)
+    df = _order_df_by_time_if_present(df, newest_first=newest_first).limit(lim)
     return [row.asDict(recursive=True) for row in df.collect()]
 
 
-def get_silver_ocr_data(limit: int = 30, dataset_id: str | None = None) -> List[Dict[str, Any]]:
+def get_silver_ocr_data(
+    limit: int = 30,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+) -> List[Dict[str, Any]]:
     """
     讀取 `SILVER_OCR_TABLE_PATH`，依 dataset_id（path 片段）過濾後取前 N 筆。
     """
@@ -595,16 +654,16 @@ def get_silver_ocr_data(limit: int = 30, dataset_id: str | None = None) -> List[
     lim = max(1, min(int(limit), 200))
     df = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
     df = _filter_df_by_dataset_id(df, dataset_id)
-    cols = set(df.columns)
-    if "ingestion_timestamp" in cols:
-        df = df.orderBy(col("ingestion_timestamp").desc_nulls_last())
-    elif "etl_update_timestamp" in cols:
-        df = df.orderBy(col("etl_update_timestamp").desc_nulls_last())
-    df = df.limit(lim)
+    df = _order_df_by_time_if_present(df, newest_first=newest_first).limit(lim)
     return [row.asDict(recursive=True) for row in df.collect()]
 
 
-def get_gold_delta_table_preview(limit: int = 50, dataset_id: str | None = None) -> List[Dict[str, Any]]:
+def get_gold_delta_table_preview(
+    limit: int = 50,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+) -> List[Dict[str, Any]]:
     """
     直接讀取已寫入的 Gold Delta 表（非即時自 Silver 重算），供對照落盤結果。
     若表含 dataset_id 欄位且指定 dataset_id，會過濾該分類。
@@ -615,8 +674,12 @@ def get_gold_delta_table_preview(limit: int = 50, dataset_id: str | None = None)
     ds = _normalize_dataset_id_or_none(dataset_id)
     df = read_delta_table(spark, GOLD_WORD_COUNT_PATH)
     if ds and "dataset_id" in df.columns:
-        df = df.filter(col("dataset_id") == ds)
-    df = df.orderBy(col("frequency").desc()).limit(lim)
+        # 與寫入時 lit(ds) 對齊；避免字串前後空白、大小寫導致篩出 0 列
+        df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    df = _order_df_by_time_if_present(df, newest_first=newest_first)
+    if df is not None and all(c not in df.columns for c in ("ingestion_timestamp", "etl_update_timestamp")):
+        df = _order_gold_word_count_df(df)
+    df = df.limit(lim)
     return [row.asDict(recursive=True) for row in df.collect()]
 
 

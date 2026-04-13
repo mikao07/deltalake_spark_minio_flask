@@ -123,7 +123,8 @@
             <span class="text-secondary small text-break">路徑：{{ gold_table_path }}</span>
           </div>
           <p class="small text-muted mb-3">
-            資料來源 Silver OCR：<span class="text-break">{{ silver_ocr_table_path }}</span>。若需重建金層，請以
+            資料來源 Gold 落盤表：<span class="text-break">{{ gold_table_path }}</span>。上游來源為 Silver OCR：
+            <span class="text-break">{{ silver_ocr_table_path }}</span>。若需重建金層，請以
             <code>POST /delta/gold/word-frequency/run</code>（建議設定 <code>ADMIN_TOKEN</code>）呼叫 ETL。
           </p>
 

@@ -402,8 +402,43 @@
             ocrNote.textContent = "一鍵金層執行中（分三階段），請看下方進度。";
             const pipeResult = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, uploadProg);
             if (pipeResult.ok) {
-              ocrNote.textContent =
-                "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" + writeMode + "）";
+              const gr =
+                pipeResult.result &&
+                pipeResult.result.result &&
+                pipeResult.result.result.gold_result
+                  ? pipeResult.result.result.gold_result
+                  : null;
+              const goldWritten =
+                pipeResult.result &&
+                pipeResult.result.result &&
+                pipeResult.result.result["是否成功寫入金層"]
+                  ? pipeResult.result.result["是否成功寫入金層"]
+                  : null;
+              const summary =
+                pipeResult.result &&
+                pipeResult.result.result &&
+                pipeResult.result.result["白話說明"]
+                  ? pipeResult.result.result["白話說明"]
+                  : null;
+
+              if (summary) {
+                const silverRows = gr && typeof gr.silver_filtered_rows === "number" ? gr.silver_filtered_rows : "—";
+                const goldRows = gr && typeof gr.gold_output_rows === "number" ? gr.gold_output_rows : "—";
+                ocrNote.textContent =
+                  "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" +
+                  writeMode +
+                  "）｜是否成功寫入金層：" +
+                  (goldWritten || "—") +
+                  "｜Silver 筆數：" +
+                  silverRows +
+                  "｜Gold 產出：" +
+                  goldRows +
+                  "。 " +
+                  summary;
+              } else {
+                ocrNote.textContent =
+                  "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" + writeMode + "）";
+              }
               ocrNote.className = "small text-success mt-2 mb-0";
             } else {
               const stepPart =
@@ -896,8 +931,36 @@
             return;
           }
           note.className = "small text-success mt-2 mb-0";
-          note.textContent =
-            "一鍵 ETL 成功：dataset_id=" + datasetId + "，已完成 Bronze / Silver / Gold。";
+          const gr =
+            result.result && result.result.result && result.result.result.gold_result
+              ? result.result.result.gold_result
+              : null;
+          const goldWritten =
+            result.result && result.result.result && result.result.result["是否成功寫入金層"]
+              ? result.result.result["是否成功寫入金層"]
+              : null;
+          const summary =
+            result.result && result.result.result && result.result.result["白話說明"]
+              ? result.result.result["白話說明"]
+              : null;
+          if (summary) {
+            const silverRows = gr && typeof gr.silver_filtered_rows === "number" ? gr.silver_filtered_rows : "—";
+            const goldRows = gr && typeof gr.gold_output_rows === "number" ? gr.gold_output_rows : "—";
+            note.textContent =
+              "一鍵 ETL 成功：dataset_id=" +
+              datasetId +
+              "，已完成 Bronze / Silver / Gold。｜是否成功寫入金層：" +
+              (goldWritten || "—") +
+              "｜Silver 筆數：" +
+              silverRows +
+              "｜Gold 產出：" +
+              goldRows +
+              "。 " +
+              summary;
+          } else {
+            note.textContent =
+              "一鍵 ETL 成功：dataset_id=" + datasetId + "，已完成 Bronze / Silver / Gold。";
+          }
         } catch (err) {
           manualProg.done();
           note.className = "small text-danger mt-2 mb-0";
