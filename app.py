@@ -34,6 +34,7 @@ from services.minio_upload import (
     upload_file_bytes,
 )
 from services.async_jobs import job_registry, job_to_public_dict
+from services.etl_metrics import append_etl_metric, read_etl_metrics
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
 from services.spark_service import (
     SparkManager,
@@ -42,6 +43,7 @@ from services.spark_service import (
     deduplicate_bronze_table,
     delete_older_than_latest_batch,
     get_bronze_data,
+    get_dictionary_usage_status,
     get_gold_delta_table_preview,
     get_gold_word_frequency_data,
     get_silver_ocr_data,
@@ -63,6 +65,16 @@ if not _logger.handlers:
     )
 
 _spark_manager: Optional[SparkManager] = None
+
+
+def _record_etl_metric(payload: Dict[str, Any]) -> None:
+    """
+    ETL 指標落地：失敗只記 warning，不影響主流程。
+    """
+    try:
+        append_etl_metric(payload)
+    except Exception as e:
+        _logger.warning("etl_metric_write_failed: %s", e)
 
 
 def _json_error(message: str, status_code: int = 400, **extra: Any):
@@ -133,43 +145,71 @@ def _execute_pipeline_to_gold_inner(
     coalesce_partitions: int,
     progress: Callable[[int, int, str], None],
 ) -> Dict[str, Any]:
+    started = time.perf_counter()
     spark = _get_spark_manager().spark
-    progress(1, 3, "銅層 Bronze OCR…")
-    bronze_result = run_bronze_ocr_ingest(
-        spark,
-        raw_images_path=raw_images_path,
-        bronze_path=BRONZE_TABLE_PATH,
-        write_mode=write_mode,
-    )
-    progress(2, 3, "銀層 Silver ETL…")
-    silver_result = run_silver_ocr_etl(
-        bronze_path=BRONZE_TABLE_PATH,
-        silver_ocr_path=SILVER_OCR_TABLE_PATH,
-        dataset_id=dataset_id,
-    )
-    progress(3, 3, "金層 Gold 詞頻…")
-    gold_result = run_gold_word_frequency_etl(
-        silver_ocr_path=SILVER_OCR_TABLE_PATH,
-        gold_path=GOLD_WORD_COUNT_PATH,
-        dataset_id=dataset_id,
-        apply_noise_filter=apply_noise_filter,
-        coalesce_partitions=coalesce_partitions,
-    )
-    return {
-        "status": "ok",
-        "dataset_id": dataset_id,
-        "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
-        "raw_images_path": raw_images_path,
-        "bronze_path": BRONZE_TABLE_PATH,
-        "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-        "gold_path": GOLD_WORD_COUNT_PATH,
-        "write_mode": write_mode,
-        "apply_noise_filter": apply_noise_filter,
-        "coalesce_partitions": coalesce_partitions,
-        "bronze_result": bronze_result,
-        "silver_result": silver_result,
-        "gold_result": gold_result,
-    }
+    try:
+        progress(1, 3, "銅層 Bronze OCR…")
+        bronze_result = run_bronze_ocr_ingest(
+            spark,
+            raw_images_path=raw_images_path,
+            bronze_path=BRONZE_TABLE_PATH,
+            write_mode=write_mode,
+        )
+        progress(2, 3, "銀層 Silver ETL…")
+        silver_result = run_silver_ocr_etl(
+            bronze_path=BRONZE_TABLE_PATH,
+            silver_ocr_path=SILVER_OCR_TABLE_PATH,
+            dataset_id=dataset_id,
+        )
+        progress(3, 3, "金層 Gold 詞頻…")
+        gold_result = run_gold_word_frequency_etl(
+            silver_ocr_path=SILVER_OCR_TABLE_PATH,
+            gold_path=GOLD_WORD_COUNT_PATH,
+            dataset_id=dataset_id,
+            apply_noise_filter=apply_noise_filter,
+            coalesce_partitions=coalesce_partitions,
+        )
+        out = {
+            "status": "ok",
+            "dataset_id": dataset_id,
+            "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+            "raw_images_path": raw_images_path,
+            "bronze_path": BRONZE_TABLE_PATH,
+            "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+            "gold_path": GOLD_WORD_COUNT_PATH,
+            "write_mode": write_mode,
+            "apply_noise_filter": apply_noise_filter,
+            "coalesce_partitions": coalesce_partitions,
+            "bronze_result": bronze_result,
+            "silver_result": silver_result,
+            "gold_result": gold_result,
+        }
+        _record_etl_metric(
+            {
+                "etl_name": "pipeline_to_gold",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "bronze_processed_rows": bronze_result.get("processed_rows"),
+                "silver_updated_rows": silver_result.get("updated_rows"),
+                "gold_output_rows": gold_result.get("gold_output_rows"),
+                "is_gold_written": gold_result.get("is_gold_written"),
+                "topic_output_rows": gold_result.get("topic_output_rows"),
+                "topic_frequency_top": gold_result.get("topic_frequency_top"),
+            }
+        )
+        return out
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "pipeline_to_gold",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+            }
+        )
+        raise
 
 
 def _execute_bronze_ocr_inner(
@@ -180,22 +220,46 @@ def _execute_bronze_ocr_inner(
     write_mode: str,
     progress: Callable[[int, int, str], None],
 ) -> Dict[str, Any]:
+    started = time.perf_counter()
     spark = _get_spark_manager().spark
-    progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
-    bronze_result = run_bronze_ocr_ingest(
-        spark,
-        raw_images_path=raw_images_path,
-        bronze_path=bronze_path,
-        write_mode=write_mode,
-    )
-    return {
-        "status": "ok",
-        "dataset_id": dataset_id,
-        "raw_images_path": raw_images_path,
-        "bronze_path": bronze_path,
-        "write_mode": write_mode,
-        "bronze_result": bronze_result,
-    }
+    try:
+        progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
+        bronze_result = run_bronze_ocr_ingest(
+            spark,
+            raw_images_path=raw_images_path,
+            bronze_path=bronze_path,
+            write_mode=write_mode,
+        )
+        out = {
+            "status": "ok",
+            "dataset_id": dataset_id,
+            "raw_images_path": raw_images_path,
+            "bronze_path": bronze_path,
+            "write_mode": write_mode,
+            "bronze_result": bronze_result,
+        }
+        _record_etl_metric(
+            {
+                "etl_name": "bronze_ocr",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "input_rows": bronze_result.get("input_rows"),
+                "output_rows": bronze_result.get("processed_rows"),
+            }
+        )
+        return out
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "bronze_ocr",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+            }
+        )
+        raise
 
 
 @app.before_request
@@ -314,18 +378,36 @@ def index():
         _logger.warning("list_dataset_ids_for_index_failed: %s", e)
 
     sys_status = get_system_status()
-    bronze_rows, bronze_error = _safe_bronze_preview(dataset_id=selected_dataset_id)
     gold_rows, gold_error = _safe_gold_preview(limit=15, dataset_id=selected_dataset_id)
+    topic_rows: List[Dict[str, Any]] = []
+    topic_hint: str | None = None
+    latest_metric_rows = read_etl_metrics(limit=20, dataset_id=selected_dataset_id or None)
+    for item in latest_metric_rows:
+        etl_name = str(item.get("etl_name") or "")
+        if etl_name in ("gold_word_frequency_etl", "pipeline_to_gold"):
+            candidate = item.get("topic_frequency_top") or []
+            if candidate:
+                topic_rows = candidate
+                break
+
+    if selected_dataset_id and not gold_error and not gold_rows:
+        any_rows, any_err = _safe_gold_preview(limit=1, dataset_id=None)
+        if not any_err and any_rows:
+            topic_hint = (
+                "目前 Gold 表有資料，但你選的 dataset_id 沒對應列。"
+                "常見原因是最近一次金層 ETL 以「未指定 dataset_id」執行，導致欄位值為空。"
+            )
+
     return render_template(
         "index.html",
         cpu_percent=sys_status.get("cpu_percent"),
         memory_percent=sys_status.get("memory_percent"),
         dataset_options=dataset_options,
         selected_dataset_id=selected_dataset_id,
-        bronze_rows=bronze_rows,
-        bronze_error=bronze_error,
         gold_rows=gold_rows,
         gold_error=gold_error,
+        topic_rows=topic_rows,
+        topic_hint=topic_hint,
         gold_table_path=GOLD_WORD_COUNT_PATH,
         silver_ocr_table_path=SILVER_OCR_TABLE_PATH,
     )
@@ -374,6 +456,22 @@ def layers_preview_page():
         newest_first=newest_first,
     )
     gold_live_rows, gold_live_error = _safe_gold_preview(limit=preview_limit, dataset_id=selected_dataset_id)
+    etl_metrics_rows = read_etl_metrics(limit=12, dataset_id=selected_dataset_id or None)
+    latest_etl_metric = etl_metrics_rows[0] if etl_metrics_rows else None
+    dictionary_status: Dict[str, Any] = {}
+    try:
+        dictionary_status = get_dictionary_usage_status(_get_spark_manager().spark, selected_dataset_id)
+    except Exception as e:
+        _logger.warning("dictionary_status_check_failed: %s", e)
+        dictionary_status = {
+            "dataset_id": selected_dataset_id,
+            "jieba_userdict_used": False,
+            "jieba_userdict_path": "",
+            "stopwords_used": False,
+            "stopwords_path": "",
+            "stopwords_count": 0,
+            "error": str(e),
+        }
 
     gold_disk_hint = None
     if not gold_disk_error and not gold_disk_rows:
@@ -406,6 +504,9 @@ def layers_preview_page():
         gold_disk_hint=gold_disk_hint,
         gold_live_rows=gold_live_rows,
         gold_live_error=gold_live_error,
+        latest_etl_metric=latest_etl_metric,
+        etl_metrics_rows=etl_metrics_rows,
+        dictionary_status=dictionary_status,
     )
 
 
@@ -441,6 +542,44 @@ def api_job_status(job_id: str):
             404,
         )
     return jsonify(job_to_public_dict(r))
+
+
+@app.get("/api/metrics/etl")
+def api_etl_metrics():
+    """
+    查詢 ETL 指標（最新優先）。
+    query:
+      - limit: 預設 100，最大 1000
+      - dataset_id: 可選
+      - etl_name: 可選（bronze_ocr / silver_ocr_etl / gold_word_frequency_etl / pipeline_to_gold）
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    raw = request.args.get("limit", "100")
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 1000))
+
+    dataset_raw = (request.args.get("dataset_id", "") or "").strip().lower()
+    etl_name_raw = (request.args.get("etl_name", "") or "").strip()
+    dataset_id = normalize_dataset_id(dataset_raw) if dataset_raw else None
+    etl_name = etl_name_raw if etl_name_raw else None
+
+    rows = read_etl_metrics(limit=limit, dataset_id=dataset_id, etl_name=etl_name)
+    return jsonify(
+        {
+            "status": "ok",
+            "count": len(rows),
+            "limit": limit,
+            "dataset_id": dataset_id,
+            "etl_name": etl_name,
+            "rows": rows,
+        }
+    )
 
 
 @app.get("/api/debug/storage-check")
@@ -947,13 +1086,36 @@ def delta_silver_ocr_run():
             }
         )
 
+    started = time.perf_counter()
     try:
         result = run_silver_ocr_etl(
             bronze_path=bronze_path,
             silver_ocr_path=silver_ocr_path,
             dataset_id=dataset_id,
         )
+        _record_etl_metric(
+            {
+                "etl_name": "silver_ocr_etl",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "output_rows": result.get("updated_rows"),
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+            }
+        )
     except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "silver_ocr_etl",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+            }
+        )
         _logger.exception("silver_ocr_run_failed")
         return _json_error(f"Silver OCR ETL 失敗：{e}", 500)
     return jsonify({"status": "ok", **result})
@@ -1033,13 +1195,46 @@ def delta_gold_word_frequency_run():
         )
 
     _get_spark_manager()
-    gold_result = run_gold_word_frequency_etl(
-        silver_ocr_path=silver_ocr_path,
-        gold_path=gold_path,
-        dataset_id=dataset_id,
-        apply_noise_filter=apply_noise_filter,
-        coalesce_partitions=coalesce_partitions,
-    )
+    started = time.perf_counter()
+    try:
+        gold_result = run_gold_word_frequency_etl(
+            silver_ocr_path=silver_ocr_path,
+            gold_path=gold_path,
+            dataset_id=dataset_id,
+            apply_noise_filter=apply_noise_filter,
+            coalesce_partitions=coalesce_partitions,
+        )
+        _record_etl_metric(
+            {
+                "etl_name": "gold_word_frequency_etl",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "gold_path": gold_path,
+                "apply_noise_filter": apply_noise_filter,
+                "output_rows": gold_result.get("gold_output_rows"),
+                "silver_filtered_rows": gold_result.get("silver_filtered_rows"),
+                "is_gold_written": gold_result.get("is_gold_written"),
+                "topic_output_rows": gold_result.get("topic_output_rows"),
+                "topic_frequency_top": gold_result.get("topic_frequency_top"),
+            }
+        )
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "gold_word_frequency_etl",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "gold_path": gold_path,
+                "apply_noise_filter": apply_noise_filter,
+                "error": str(e),
+            }
+        )
+        _logger.exception("gold_word_frequency_run_failed")
+        return _json_error(f"Gold 詞頻 ETL 失敗：{e}", 500)
     return jsonify(
         {
             "status": "ok",

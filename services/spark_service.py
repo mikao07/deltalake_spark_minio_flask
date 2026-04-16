@@ -3,14 +3,17 @@ from __future__ import annotations
 import os
 import re
 import threading
+import logging
 from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List
 
 import psutil
+from pyspark import SparkFiles
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col,
+    collect_set,
     count,
     current_timestamp,
     explode,
@@ -33,7 +36,11 @@ from delta.tables import DeltaTable
 from config import (
     BRONZE_TABLE_PATH,
     GOLD_WORD_COUNT_PATH,
+    JIEBA_USERDICT_DATASET_PATTERN,
+    JIEBA_USERDICT_PATH,
     JIEBA_ZIP_PATH,
+    STOPWORDS_DATASET_PATTERN,
+    STOPWORDS_PATH,
     MINIO_ACCESS_KEY,
     MINIO_ENDPOINT,
     MINIO_SECRET_KEY,
@@ -43,6 +50,8 @@ from config import (
     S3A_PATH_STYLE_ACCESS,
     SILVER_OCR_TABLE_PATH,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +179,20 @@ def delta_table_exists(spark: SparkSession, table_path: str) -> bool:
         return bool(spark._jsparkSession.catalog().tableExists(f"delta.`{table_path}`"))
     except Exception:
         return bool(DeltaTable.isDeltaTable(spark, table_path))
+
+
+def _hadoop_path_exists(spark: SparkSession, path: str) -> bool:
+    """使用 Hadoop FileSystem 檢查路徑是否存在（支援 s3a:// 與本機路徑）。"""
+    if not path or not str(path).strip():
+        return False
+    try:
+        jvm = spark._jvm
+        hconf = spark._jsc.hadoopConfiguration()
+        jpath = jvm.org.apache.hadoop.fs.Path(str(path).strip())
+        fs = jpath.getFileSystem(hconf)
+        return bool(fs.exists(jpath))
+    except Exception:
+        return False
 
 
 def merge_upsert_by_key(
@@ -340,6 +363,8 @@ def run_silver_ocr_etl(
 # Gold 層：Silver OCR → Jieba 分詞 → 詞頻 → Delta（對齊 MinIO_DeltaLake_Spark_1.1.ipynb）
 # ---------------------------------------------------------------------------
 _jieba_pyfile_registered: str | None = None
+_jieba_userdict_registered: str | None = None
+_jieba_segment_udf_cache: dict[str, Any] = {}
 
 # Notebook「淨化後詞頻」步驟的雜訊與長度規則
 _FINAL_NOISE = [
@@ -382,6 +407,38 @@ _COMMON_NOISE = _FINAL_NOISE + [
 ]
 _MIN_WORD_LENGTH = 2
 
+# 痛點主題規則（MVP）：可先用於熱門痛點監控，後續再抽成外部設定檔
+_PAIN_TOPIC_RULES: Dict[str, List[str]] = {
+    "等待時間": ["等很久", "等超久", "久等", "排隊", "等待", "慢", "太久", "時間管理"],
+    "服務態度": ["態度差", "不耐煩", "兇", "服務差", "白眼", "口氣差", "親切", "貼心", "爛", "教育訓練"],
+    "出錯重做": ["做錯", "弄錯", "漏單", "少做", "重做", "做錯了", "漏掉", "沒做", "點錯", "做不出來", "忘記"],
+    "品質口感": ["太甜", "太淡", "沒味道", "難喝", "走味", "稀", "不新鮮", "口感", "硬", "不好喝"],
+    "安全衛生": ["不安全", "危險", "衛生", "髒", "地板黏", "蟲", "異物"],
+    "載具發票":["載具","發票","收據","小票"],
+}
+
+# 進階規則：片語 + 極性詞 + 距離容忍（優先判斷）
+_PAIN_TOPIC_POLARITY_RULES: Dict[str, Dict[str, Any]] = {
+    "服務態度": {
+        "anchors": ["服務態度", "態度", "店員", "服務人員", "員工", "無視"],
+        "negatives": ["差", "不好", "爛", "糟", "差勁", "不耐煩", "兇", "口氣差", "白眼", ""],
+        "max_word_gap": 3,
+        "max_char_gap": 8,
+    },
+    "等待時間": {
+        "anchors": ["等", "等待", "排隊", "出餐", "速度", "等候"],
+        "negatives": ["久", "慢", "太久", "很久", "超久", "超慢", "過久"],
+        "max_word_gap": 3,
+        "max_char_gap": 8,
+    },
+       "品質口感": {
+        "anchors": ["珍珠", ],
+        "negatives": ["硬", "超硬"],
+        "max_word_gap": 3,
+        "max_char_gap": 8,
+    },
+}
+
 
 def _normalize_dataset_id_or_none(dataset_id: str | None) -> str | None:
     if dataset_id is None:
@@ -412,75 +469,416 @@ def _filter_df_by_dataset_id(df: DataFrame, dataset_id: str | None) -> DataFrame
     return df
 
 
-def register_jieba_pyfile_if_needed(spark: SparkSession, jieba_zip_path: str | None) -> None:
+def _resolve_existing_jieba_userdict_path(
+    spark: SparkSession,
+    dataset_id: str | None,
+) -> str | None:
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    pattern = str(JIEBA_USERDICT_DATASET_PATTERN or "").strip()
+    fallback = str(JIEBA_USERDICT_PATH or "").strip()
+
+    dataset_candidate = ""
+    if ds and pattern:
+        try:
+            dataset_candidate = pattern.format(dataset_id=ds).strip()
+        except Exception as e:
+            _logger.warning("invalid_jieba_userdict_dataset_pattern: %s", e)
+            dataset_candidate = ""
+
+    if dataset_candidate:
+        if _hadoop_path_exists(spark, dataset_candidate):
+            return dataset_candidate
+        _logger.warning(
+            "jieba_userdict_missing_dataset_candidate: dataset_id=%s path=%s",
+            ds,
+            dataset_candidate,
+        )
+
+    if fallback:
+        if _hadoop_path_exists(spark, fallback):
+            if dataset_candidate:
+                _logger.warning(
+                    "jieba_userdict_fallback_used: dataset_id=%s fallback_path=%s",
+                    ds,
+                    fallback,
+                )
+            return fallback
+        _logger.warning(
+            "jieba_userdict_missing_fallback: dataset_id=%s path=%s",
+            ds,
+            fallback,
+        )
+
+    return None
+
+
+def _parse_stopwords_lines(lines: Iterable[str]) -> List[str]:
+    """每行一詞；空白行與 # 開頭行略過；行內 # 之後視為註解。詞彙會轉成小寫以配合 keyword 欄位。"""
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in lines:
+        if raw is None:
+            continue
+        line = str(raw).strip()
+        if not line or line.startswith("#"):
+            continue
+        if "#" in line:
+            line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        w = line.lower()
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+def _load_stopwords_from_path(spark: SparkSession, path: str) -> List[str]:
+    try:
+        rows = spark.read.text(str(path).strip()).select("value").collect()
+    except Exception as e:
+        _logger.warning("stopwords_read_failed: path=%s error=%s", path, e)
+        return []
+    lines = [r[0] for r in rows if r[0] is not None]
+    return _parse_stopwords_lines(lines)
+
+
+def _resolve_existing_stopwords_path(
+    spark: SparkSession,
+    dataset_id: str | None,
+) -> str | None:
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    pattern = str(STOPWORDS_DATASET_PATTERN or "").strip()
+    fallback = str(STOPWORDS_PATH or "").strip()
+
+    dataset_candidate = ""
+    if ds and pattern:
+        try:
+            dataset_candidate = pattern.format(dataset_id=ds).strip()
+        except Exception as e:
+            _logger.warning("invalid_stopwords_dataset_pattern: %s", e)
+            dataset_candidate = ""
+
+    if dataset_candidate:
+        if _hadoop_path_exists(spark, dataset_candidate):
+            return dataset_candidate
+        _logger.warning(
+            "stopwords_missing_dataset_candidate: dataset_id=%s path=%s",
+            ds,
+            dataset_candidate,
+        )
+
+    if fallback:
+        if _hadoop_path_exists(spark, fallback):
+            if dataset_candidate:
+                _logger.warning(
+                    "stopwords_fallback_used: dataset_id=%s fallback_path=%s",
+                    ds,
+                    fallback,
+                )
+            return fallback
+        _logger.warning(
+            "stopwords_missing_fallback: dataset_id=%s path=%s",
+            ds,
+            fallback,
+        )
+
+    return None
+
+
+def get_dictionary_usage_status(
+    spark: SparkSession,
+    dataset_id: str | None = None,
+) -> Dict[str, Any]:
+    """
+    回傳目前 dataset 的辭典/停用詞實際套用狀態（供 API/頁面顯示）。
+    """
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
+    stopwords_path = _resolve_existing_stopwords_path(spark, ds)
+    stopwords_count = 0
+    if stopwords_path:
+        stopwords_count = len(_load_stopwords_from_path(spark, stopwords_path))
+    return {
+        "dataset_id": ds,
+        "jieba_userdict_used": bool(userdict_path),
+        "jieba_userdict_path": userdict_path or "",
+        "stopwords_used": bool(stopwords_path),
+        "stopwords_path": stopwords_path or "",
+        "stopwords_count": stopwords_count,
+    }
+
+
+def register_jieba_pyfile_if_needed(
+    spark: SparkSession,
+    jieba_zip_path: str | None,
+    jieba_userdict_path: str | None = None,
+    dataset_id: str | None = None,
+) -> None:
     """
     將 MinIO 上的 jieba.zip 分發給 executors（與 Notebook 的 spark.sparkContext.addPyFile 相同）。
     若 jieba_zip_path 為空，則假設執行環境已 pip 安裝 jieba，不分發 zip。
+    若 jieba_userdict_path 有值，會透過 addFile 分發自訂字典。
     """
 
     global _jieba_pyfile_registered
-    if not jieba_zip_path or not str(jieba_zip_path).strip():
-        return
-    path = str(jieba_zip_path).strip()
-    if _jieba_pyfile_registered == path:
-        return
-    spark.sparkContext.addPyFile(path)
-    _jieba_pyfile_registered = path
+    global _jieba_userdict_registered
+    if jieba_zip_path and str(jieba_zip_path).strip():
+        path = str(jieba_zip_path).strip()
+        if _jieba_pyfile_registered != path:
+            spark.sparkContext.addPyFile(path)
+            _jieba_pyfile_registered = path
+
+    if jieba_userdict_path and str(jieba_userdict_path).strip():
+        userdict_path = str(jieba_userdict_path).strip()
+        if _jieba_userdict_registered != userdict_path:
+            try:
+                spark.sparkContext.addFile(userdict_path)
+                _jieba_userdict_registered = userdict_path
+            except Exception as e:
+                _logger.warning(
+                    "jieba_userdict_distribute_failed: dataset_id=%s path=%s error=%s",
+                    dataset_id,
+                    userdict_path,
+                    e,
+                )
 
 
-def _make_jieba_segment_udf():
+def _make_jieba_segment_udf(
+    jieba_userdict_path: str | None = None,
+    dataset_id_for_log: str | None = None,
+):
+    userdict_basename = ""
+    if jieba_userdict_path and str(jieba_userdict_path).strip():
+        userdict_basename = os.path.basename(str(jieba_userdict_path).strip())
+
     def segment_chinese_jieba_distributed(text):
         if text is None:
             return []
+        if not hasattr(segment_chinese_jieba_distributed, "_jieba_initialized"):
+            segment_chinese_jieba_distributed._jieba_initialized = False
+            segment_chinese_jieba_distributed._jieba_error_logged = False
+            segment_chinese_jieba_distributed._userdict_loaded = False
+            segment_chinese_jieba_distributed._userdict_error_logged = False
         try:
             import jieba
 
-            jieba.initialize()
+            if not segment_chinese_jieba_distributed._jieba_initialized:
+                jieba.initialize()
+                segment_chinese_jieba_distributed._jieba_initialized = True
+
+            if (
+                userdict_basename
+                and not segment_chinese_jieba_distributed._userdict_loaded
+            ):
+                try:
+                    userdict_local_path = SparkFiles.get(userdict_basename)
+                    jieba.load_userdict(userdict_local_path)
+                    segment_chinese_jieba_distributed._userdict_loaded = True
+                except Exception as e:
+                    if not segment_chinese_jieba_distributed._userdict_error_logged:
+                        _logger.warning(
+                            "jieba_userdict_load_failed_once: dataset_id=%s path=%s error=%s",
+                            dataset_id_for_log,
+                            jieba_userdict_path,
+                            e,
+                        )
+                        segment_chinese_jieba_distributed._userdict_error_logged = True
+
             text_cleaned = text
             words = jieba.cut(text_cleaned, cut_all=False)
             return [word.strip().lower() for word in words if len(word.strip()) > 0]
-        except Exception:
+        except Exception as e:
+            if not segment_chinese_jieba_distributed._jieba_error_logged:
+                _logger.warning("jieba_segment_udf_failed_once: %s", e)
+                segment_chinese_jieba_distributed._jieba_error_logged = True
             return []
 
     return udf(segment_chinese_jieba_distributed, ArrayType(StringType()))
 
 
-_jieba_segment_udf = _make_jieba_segment_udf()
+def _get_jieba_segment_udf(
+    jieba_userdict_path: str | None = None,
+    dataset_id_for_log: str | None = None,
+):
+    cache_key = f"{str(jieba_userdict_path or '').strip()}|{str(dataset_id_for_log or '').strip()}"
+    existing = _jieba_segment_udf_cache.get(cache_key)
+    if existing is not None:
+        return existing
+    created = _make_jieba_segment_udf(
+        jieba_userdict_path if str(jieba_userdict_path or "").strip() else None,
+        dataset_id_for_log=dataset_id_for_log,
+    )
+    _jieba_segment_udf_cache[cache_key] = created
+    return created
+
+
+def _build_filtered_keyword_exploded_dataframe(
+    df_silver_ocr: DataFrame,
+    *,
+    dataset_id_for_log: str | None = None,
+    jieba_userdict_path: str | None = None,
+    apply_noise_filter: bool = True,
+    extra_stopwords: Iterable[str] | None = None,
+) -> DataFrame:
+    df_keywords = df_silver_ocr.withColumn(
+        "cleaned_text",
+        lower(regexp_replace(col("extracted_text"), r"[^\p{L}\p{N}\s_]", "")),
+    )
+    segment_udf = _get_jieba_segment_udf(
+        jieba_userdict_path,
+        dataset_id_for_log=dataset_id_for_log,
+    )
+    df_diagnose = df_keywords.withColumn("word_array", segment_udf(col("cleaned_text")))
+    df_keywords_exploded = (
+        df_diagnose.select("image_path", explode(col("word_array")).alias("keyword"))
+        .filter(col("keyword") != "")
+    )
+    if not apply_noise_filter:
+        return df_keywords_exploded
+
+    noise_terms = sorted(set(_COMMON_NOISE) | set(extra_stopwords or []))
+    return df_keywords_exploded.filter(
+        (length(col("keyword")) >= _MIN_WORD_LENGTH)
+        & (~col("keyword").rlike("^[0-9]+$"))
+        & (~col("keyword").rlike("^[a-z]{1,2}$"))
+        & (~col("keyword").isin(noise_terms))
+    )
 
 
 def build_gold_word_frequency_dataframe(
     df_silver_ocr: DataFrame,
     *,
+    dataset_id_for_log: str | None = None,
+    jieba_userdict_path: str | None = None,
     apply_noise_filter: bool = True,
+    extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
     """
     從 Silver OCR 表（需含 extracted_text；Notebook 另用到 image_path）產生 keyword / frequency 聚合。
     apply_noise_filter=True 時採用 Notebook 第二段淨化規則（長度、純數字、**極短英文**、雜訊詞）。
+    extra_stopwords 為外部停用詞表（與內建 _COMMON_NOISE 合併）。
     英文僅剔除 1～2 個字母（舊版曾剔除 1～4 字，會把 good/food/like 等大量評論常用詞清掉，導致詞頻幾乎為空）。
     """
 
-    df_keywords = df_silver_ocr.withColumn(
-        "cleaned_text",
-        lower(regexp_replace(col("extracted_text"), r"[^\p{L}\p{N}\s_]", "")),
+    df_exploded = _build_filtered_keyword_exploded_dataframe(
+        df_silver_ocr,
+        dataset_id_for_log=dataset_id_for_log,
+        jieba_userdict_path=jieba_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords,
     )
-    df_diagnose = df_keywords.withColumn("word_array", _jieba_segment_udf(col("cleaned_text")))
-    df_keywords_exploded = (
-        df_diagnose.select("image_path", explode(col("word_array")).alias("keyword"))
-        .filter(col("keyword") != "")
-    )
-
-    if apply_noise_filter:
-        df_exploded = df_keywords_exploded.filter(
-            (length(col("keyword")) >= _MIN_WORD_LENGTH)
-            & (~col("keyword").rlike("^[0-9]+$"))
-            & (~col("keyword").rlike("^[a-z]{1,2}$"))
-            & (~col("keyword").isin(_COMMON_NOISE))
-        )
-    else:
-        df_exploded = df_keywords_exploded
-
     return (
         df_exploded.groupBy("keyword")
+        .agg(count("*").alias("frequency"))
+        .orderBy(col("frequency").desc())
+    )
+
+
+def _make_topic_label_udf():
+    def _contains_hint(word_set, joined_text, joined_no_space, hint: str) -> bool:
+        h = str(hint).strip().lower()
+        if not h:
+            return False
+        return h in word_set or h in joined_text or h in joined_no_space
+
+    def _is_near_by_word_gap(words: List[str], anchors: List[str], negatives: List[str], max_gap: int) -> bool:
+        anchor_idx = [i for i, w in enumerate(words) if w in anchors]
+        neg_idx = [i for i, w in enumerate(words) if w in negatives]
+        if not anchor_idx or not neg_idx:
+            return False
+        return any(abs(ai - ni) <= max_gap for ai in anchor_idx for ni in neg_idx)
+
+    def _is_near_by_char_gap(joined_no_space: str, anchors: List[str], negatives: List[str], max_gap: int) -> bool:
+        if not joined_no_space:
+            return False
+        for a in anchors:
+            a0 = str(a).strip().lower()
+            if not a0:
+                continue
+            for n in negatives:
+                n0 = str(n).strip().lower()
+                if not n0:
+                    continue
+                if re.search(rf"{re.escape(a0)}.{{0,{max_gap}}}{re.escape(n0)}", joined_no_space):
+                    return True
+                if re.search(rf"{re.escape(n0)}.{{0,{max_gap}}}{re.escape(a0)}", joined_no_space):
+                    return True
+        return False
+
+    def label_topics(words):
+        if not words:
+            return []
+        safe_words = [str(w).strip().lower() for w in words if str(w).strip()]
+        if not safe_words:
+            return []
+        word_set = set(safe_words)
+        joined_text = " ".join(safe_words)
+        joined_no_space = "".join(safe_words)
+        hit_topics: List[str] = []
+
+        # 1) 先走進階「片語 + 極性詞」規則（可抓到：服務態度很差 / 非常差）
+        for topic, cfg in _PAIN_TOPIC_POLARITY_RULES.items():
+            anchors = [str(x).strip().lower() for x in cfg.get("anchors", []) if str(x).strip()]
+            negatives = [str(x).strip().lower() for x in cfg.get("negatives", []) if str(x).strip()]
+            if not anchors or not negatives:
+                continue
+            has_anchor = any(_contains_hint(word_set, joined_text, joined_no_space, a) for a in anchors)
+            has_negative = any(_contains_hint(word_set, joined_text, joined_no_space, n) for n in negatives)
+            if not (has_anchor and has_negative):
+                continue
+
+            max_word_gap = int(cfg.get("max_word_gap", 3))
+            max_char_gap = int(cfg.get("max_char_gap", 8))
+            if _is_near_by_word_gap(safe_words, anchors, negatives, max_word_gap) or _is_near_by_char_gap(
+                joined_no_space,
+                anchors,
+                negatives,
+                max_char_gap,
+            ):
+                hit_topics.append(topic)
+
+        # 2) 再走既有關鍵詞命中規則（補足其他主題與舊資料相容）
+        for topic, hints in _PAIN_TOPIC_RULES.items():
+            if topic in hit_topics:
+                continue
+            for hint in hints:
+                if _contains_hint(word_set, joined_text, joined_no_space, str(hint)):
+                    hit_topics.append(topic)
+                    break
+        return hit_topics
+
+    return udf(label_topics, ArrayType(StringType()))
+
+
+_topic_label_udf = _make_topic_label_udf()
+
+
+def build_gold_pain_topic_frequency_dataframe(
+    df_silver_ocr: DataFrame,
+    *,
+    dataset_id_for_log: str | None = None,
+    jieba_userdict_path: str | None = None,
+    apply_noise_filter: bool = True,
+    extra_stopwords: Iterable[str] | None = None,
+) -> DataFrame:
+    """
+    從同一批評論計算痛點主題頻率（以 image_path 視為單一評論文件，單文件內同主題只計一次）。
+    """
+    df_exploded = _build_filtered_keyword_exploded_dataframe(
+        df_silver_ocr,
+        dataset_id_for_log=dataset_id_for_log,
+        jieba_userdict_path=jieba_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords,
+    )
+    df_doc_keywords = df_exploded.groupBy("image_path").agg(collect_set("keyword").alias("doc_keywords"))
+    df_topics = (
+        df_doc_keywords.withColumn("topics", _topic_label_udf(col("doc_keywords")))
+        .select(explode(col("topics")).alias("topic"))
+    )
+    return (
+        df_topics.groupBy("topic")
         .agg(count("*").alias("frequency"))
         .orderBy(col("frequency").desc())
     )
@@ -514,13 +912,50 @@ def run_gold_word_frequency_etl(
     silver = silver_ocr_path or SILVER_OCR_TABLE_PATH
     gold = gold_path or GOLD_WORD_COUNT_PATH
     ds = _normalize_dataset_id_or_none(dataset_id)
-    register_jieba_pyfile_if_needed(spark, JIEBA_ZIP_PATH)
+    active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
+    register_jieba_pyfile_if_needed(
+        spark,
+        JIEBA_ZIP_PATH,
+        active_userdict_path,
+        dataset_id=ds,
+    )
+    if active_userdict_path:
+        _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
+    else:
+        _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
+    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
+    extra_stopwords: List[str] = []
+    if active_stopwords_path:
+        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+        _logger.info(
+            "stopwords_selected: dataset_id=%s path=%s count=%s",
+            ds,
+            active_stopwords_path,
+            len(extra_stopwords),
+        )
+    else:
+        _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
     df_silver = read_delta_table(spark, silver)
     if ds:
         df_silver = _filter_df_by_dataset_id(df_silver, ds)
     silver_filtered_rows = int(df_silver.count())
-    df_wc = build_gold_word_frequency_dataframe(df_silver, apply_noise_filter=apply_noise_filter)
+    df_wc = build_gold_word_frequency_dataframe(
+        df_silver,
+        dataset_id_for_log=ds,
+        jieba_userdict_path=active_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords if apply_noise_filter else None,
+    )
+    df_topic = build_gold_pain_topic_frequency_dataframe(
+        df_silver,
+        dataset_id_for_log=ds,
+        jieba_userdict_path=active_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords if apply_noise_filter else None,
+    )
     gold_output_rows = int(df_wc.count())
+    topic_output_rows = int(df_topic.count())
+    topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
     if ds:
         df_wc = df_wc.withColumn("dataset_id", lit(ds))
         out = df_wc if coalesce_partitions <= 0 else df_wc.coalesce(coalesce_partitions)
@@ -558,6 +993,13 @@ def run_gold_word_frequency_etl(
         "gold_output_rows": gold_output_rows,
         "gold_total_rows_after": gold_total_rows_after,
         "gold_dataset_rows_after": gold_dataset_rows_after,
+        "jieba_userdict_used": bool(active_userdict_path),
+        "jieba_userdict_path": active_userdict_path or "",
+        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_path": active_stopwords_path or "",
+        "stopwords_count": len(extra_stopwords),
+        "topic_output_rows": topic_output_rows,
+        "topic_frequency_top": topic_frequency_top,
         "is_gold_written": gold_output_rows > 0,
         "summary": summary,
     }

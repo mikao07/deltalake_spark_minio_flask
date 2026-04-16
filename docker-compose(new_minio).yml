@@ -64,7 +64,7 @@ services:
       SILVER_TABLE_PATH: ${SILVER_TABLE_PATH:-s3a://data-lake/silver/cleaned_features/}
       SILVER_OCR_TABLE_PATH: ${SILVER_OCR_TABLE_PATH:-s3a://data-lake/silver/ocr_features/}
       GOLD_WORD_COUNT_PATH: ${GOLD_WORD_COUNT_PATH:-s3a://data-lake/gold/word_frequency/}
-      JIEBA_ZIP_PATH: ${JIEBA_ZIP_PATH:-s3a://data-lake/jars/dependencies/jieba.zip}
+      JIEBA_ZIP_PATH: ${JIEBA_ZIP_PATH:-}
       RAW_IMAGE_PREFIX: ${RAW_IMAGE_PREFIX:-raw/images/}
       RAW_IMAGES_PATH: ${RAW_IMAGES_PATH:-s3a://data-lake/raw/images/}
       OCR_LANG: ${OCR_LANG:-chi_tra+eng}

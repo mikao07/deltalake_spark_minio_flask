@@ -56,8 +56,17 @@ GOLD_WORD_COUNT_PATH = os.getenv(
 # Notebook：JIEBA_ZIP_PATH（上傳至 MinIO 的 jieba.zip，供 executors addPyFile）
 JIEBA_ZIP_PATH = os.getenv(
     "JIEBA_ZIP_PATH",
-    f"s3a://{BUCKET_NAME}/jars/dependencies/jieba.zip",
+    "",
 )
+
+# 可選：Jieba 自訂字典（支援本機路徑或 s3a://；Spark executors 會以 addFile 分發）
+JIEBA_USERDICT_PATH = os.getenv("JIEBA_USERDICT_PATH", "")
+# 可選：依 dataset_id 綁定字典路徑模板，例：s3a://bucket/jieba_dicts/{dataset_id}.txt
+JIEBA_USERDICT_DATASET_PATTERN = os.getenv("JIEBA_USERDICT_DATASET_PATTERN", "")
+
+# 可選：停用詞表（每行一詞；# 開頭為註解；與 jieba 詞典分開）
+STOPWORDS_PATH = os.getenv("STOPWORDS_PATH", "")
+STOPWORDS_DATASET_PATTERN = os.getenv("STOPWORDS_DATASET_PATTERN", "")
 
 # Notebook：RAW_IMAGE_PREFIX（用於拼 RAW_IMAGES_PATH）
 RAW_IMAGE_PREFIX = os.getenv("RAW_IMAGE_PREFIX", "raw/images/")

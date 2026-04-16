@@ -83,6 +83,87 @@
       </div>
 
       <section class="layer-section card shadow-sm">
+        <div class="card-header py-2"><strong>辭典套用狀態（目前篩選）</strong></div>
+        <div class="card-body small">
+          {% if dictionary_status.error %}
+            <div class="alert alert-warning py-2 mb-2">檢查失敗：{{ dictionary_status.error }}</div>
+          {% endif %}
+          <div class="mb-1">
+            <strong>Jieba 自訂辭典：</strong>
+            {% if dictionary_status.jieba_userdict_used %}
+              <span class="text-success">已套用</span>
+              <code class="ms-1">{{ dictionary_status.jieba_userdict_path }}</code>
+            {% else %}
+              <span class="text-danger">未套用</span>
+              <span class="text-muted ms-1">（未找到對應路徑，使用 jieba 內建辭典）</span>
+            {% endif %}
+          </div>
+          <div>
+            <strong>停用詞辭典：</strong>
+            {% if dictionary_status.stopwords_used %}
+              <span class="text-success">已套用</span>
+              <code class="ms-1">{{ dictionary_status.stopwords_path }}</code>
+              <span class="text-muted ms-1">({{ dictionary_status.stopwords_count }} 詞)</span>
+            {% else %}
+              <span class="text-danger">未套用</span>
+              <span class="text-muted ms-1">（僅使用內建 _COMMON_NOISE）</span>
+            {% endif %}
+          </div>
+        </div>
+      </section>
+
+      <section class="layer-section card shadow-sm">
+        <div class="card-header py-2"><strong>ETL 指標摘要（最近）</strong></div>
+        <div class="card-body">
+          {% if latest_etl_metric %}
+            <div class="alert {% if latest_etl_metric.status == 'ok' %}alert-success{% else %}alert-danger{% endif %} py-2 small">
+              <strong>最近一次：</strong>
+              {{ latest_etl_metric.etl_name }} /
+              dataset_id={{ latest_etl_metric.dataset_id or '全部' }} /
+              status={{ latest_etl_metric.status }} /
+              duration={{ latest_etl_metric.duration_ms or '-' }} ms
+              {% if latest_etl_metric.error %}<br />錯誤：{{ latest_etl_metric.error }}{% endif %}
+            </div>
+          {% else %}
+            <p class="text-muted small mb-2">目前沒有 ETL 指標紀錄。</p>
+          {% endif %}
+
+          {% if etl_metrics_rows and etl_metrics_rows|length > 0 %}
+            <div class="table-scroll border rounded">
+              <table class="table table-sm table-striped mb-0 align-middle">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    <th class="small">recorded_at</th>
+                    <th class="small">etl_name</th>
+                    <th class="small">dataset_id</th>
+                    <th class="small">status</th>
+                    <th class="small">duration_ms</th>
+                    <th class="small">output_rows</th>
+                    <th class="small">gold_output_rows</th>
+                    <th class="small">is_gold_written</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for r in etl_metrics_rows %}
+                    <tr>
+                      <td class="small text-break">{{ r.recorded_at or '-' }}</td>
+                      <td class="small">{{ r.etl_name or '-' }}</td>
+                      <td class="small">{{ r.dataset_id or '全部' }}</td>
+                      <td class="small">{{ r.status or '-' }}</td>
+                      <td class="small">{{ r.duration_ms or '-' }}</td>
+                      <td class="small">{{ r.output_rows if r.output_rows is not none else '-' }}</td>
+                      <td class="small">{{ r.gold_output_rows if r.gold_output_rows is not none else '-' }}</td>
+                      <td class="small">{{ r.is_gold_written if r.is_gold_written is not none else '-' }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="layer-section card shadow-sm">
         <div class="card-header py-2"><strong>Bronze（銅層）</strong></div>
         <div class="card-body">
           <p class="path-label text-secondary mb-2">{{ bronze_path }}</p>
