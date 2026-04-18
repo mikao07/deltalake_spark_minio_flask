@@ -12,12 +12,38 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, length, lit, regexp_extract, sha2, udf
+from pyspark.sql.functions import col, current_timestamp, length, lit, lower, regexp_extract, sha2, udf
 from pyspark.sql.types import StringType
 from minio.error import S3Error
 
 from config import BUCKET_NAME, RAW_IMAGE_PREFIX
 from services.minio_upload import ensure_bucket, get_minio_client
+
+_SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
+
+
+def _has_supported_image_extension(path: str) -> bool:
+    p = (path or "").strip().lower()
+    return any(p.endswith(ext) for ext in _SUPPORTED_IMAGE_EXTS)
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    """
+    以常見檔頭判斷是否為圖片，避免非圖片檔混入 OCR。
+    """
+    if not data:
+        return False
+    sig = bytes(data[:16])
+    return (
+        sig.startswith(b"\x89PNG\r\n\x1a\n")
+        or sig.startswith(b"\xff\xd8\xff")  # JPEG
+        or sig.startswith(b"GIF87a")
+        or sig.startswith(b"GIF89a")
+        or sig.startswith(b"BM")  # BMP
+        or (len(sig) >= 12 and sig[0:4] == b"RIFF" and sig[8:12] == b"WEBP")
+        or sig.startswith(b"II*\x00")  # TIFF little-endian
+        or sig.startswith(b"MM\x00*")  # TIFF big-endian
+    )
 
 
 def _ocr_binary_to_text(image_content) -> Optional[str]:
@@ -106,6 +132,8 @@ def _list_and_read_via_minio(raw_images_path: str, limit: int | None = None) -> 
             name = getattr(obj, "object_name", "") or ""
             if not name or name.endswith("/"):
                 continue
+            if not _has_supported_image_extension(name):
+                continue
             if max_n is not None and len(rows) >= max_n:
                 break
             resp = client.get_object(bucket, name)
@@ -114,6 +142,8 @@ def _list_and_read_via_minio(raw_images_path: str, limit: int | None = None) -> 
             finally:
                 resp.close()
                 resp.release_conn()
+            if not _looks_like_image_bytes(data):
+                continue
             rows.append(
                 {
                     "image_path": f"s3a://{bucket}/{name}",
@@ -132,6 +162,9 @@ def _build_df_paths(spark: SparkSession, raw_images_path: str):
     df_paths = (
         spark.read.format("binaryFile")
         .load(raw_images_path)
+        .filter(
+            lower(col("path")).rlike(r".*\.(png|jpg|jpeg|bmp|gif|webp|tif|tiff)$")
+        )
         .select(
             col("path").alias("image_path"),
             col("content").alias("image_content"),
@@ -212,6 +245,18 @@ def run_bronze_ocr_ingest(
         .withColumn("source_bucket", lit("raw_images"))
         .drop("image_content")
     )
+    # OCR 執行失敗（OCR_ERROR_*）的列不寫入 Bronze，避免髒資料擴散到 Silver/Gold。
+    ocr_error_rows = int(df_ocr.filter(col("extracted_text").startswith("OCR_ERROR_")).count())
+    df_ocr = df_ocr.filter(~col("extracted_text").startswith("OCR_ERROR_"))
+    write_rows = int(df_ocr.count())
+    if write_rows == 0:
+        return {
+            "input_rows": total_input,
+            "processed_rows": processed_rows,
+            "skipped_rows": skipped_rows,
+            "ocr_error_rows_dropped": ocr_error_rows,
+            "ocr_signature": sig,
+        }
 
     writer = df_ocr.write.format("delta").mode(write_mode)
     if write_mode == "append":
@@ -222,8 +267,9 @@ def run_bronze_ocr_ingest(
     writer.save(bronze_path)
     return {
         "input_rows": total_input,
-        "processed_rows": processed_rows,
+        "processed_rows": write_rows,
         "skipped_rows": skipped_rows,
+        "ocr_error_rows_dropped": ocr_error_rows,
         "ocr_signature": sig,
     }
 
@@ -242,6 +288,9 @@ def preview_raw_images_sample(
     df = (
         spark.read.format("binaryFile")
         .load(raw_images_path)
+        .filter(
+            lower(col("path")).rlike(r".*\.(png|jpg|jpeg|bmp|gif|webp|tif|tiff)$")
+        )
         .select(
             col("path").alias("image_path"),
             length(col("content")).alias("content_length"),

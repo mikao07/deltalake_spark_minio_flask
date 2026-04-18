@@ -12,31 +12,48 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 | `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
 | `services/ocr_spark.py` | Bronze OCR：binaryFile → Tesseract → Delta |
 | `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
-| `templates/` | `index.html`、`upload.html`、`layers.html` |
+| `templates/` | `index.html`、`upload.html`、`layers.html`（首頁以詞頻與痛點主題快照為主） |
 | `tests/` | `pytest`：API 驗證、MinIO 檔名邏輯（可不透過真 Spark/MinIO） |
+| `.github/workflows/ci.yml` | Push／PR 至 `main`/`master` 時自動執行 `pytest`（GitHub Actions） |
+
+### 資料管線（摘要）
+
+- **Bronze**：`raw/images/{dataset_id}/` 影像 → OCR（Tesseract）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入；讀檔時限圖片副檔名與檔頭（非圖片不進 OCR）。
+- **Silver**：OCR 文字去重、MERGE 至 `SILVER_OCR_TABLE_PATH`。
+- **Gold**：Jieba 分詞、自訂辭典／停用詞（可依 `dataset_id` 綁定路徑）、詞頻表；**痛點主題**（規則式）寫入 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表（可對照多個 `snapshot_at`）。
+- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。
 
 ### 功能（API 摘要）
 
 - **健康檢查**：`GET /health`
 - **系統狀態**：`GET /api/status`
-- **Delta 預覽**：`POST /delta/read`
-- **Delta Upsert**：`POST /delta/upsert`（可用 `ADMIN_TOKEN` 保護）
-- **僅保留最新批次**：`POST /delta/cleanup-latest-only`（可用 `ADMIN_TOKEN` 保護，支援 `dry_run`）
-- **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`（同源）
+- **Delta 預覽**：`POST /delta/read`（路徑須符合 `ALLOWED_DELTA_PATH_PREFIXES`）
+- **Delta Upsert**：`POST /delta/upsert`（需 `ADMIN_TOKEN` 時帶 `X-Admin-Token`）
+- **僅保留最新批次**：`POST /delta/cleanup-latest-only`（同上）
+- **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`
 - **Gold 詞頻預覽**：`GET /api/gold/word-frequency`
-- **Bronze OCR 攝入**（對齊 Notebook 流程）：`POST /delta/ocr/bronze/run`
-- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`）
-- **查詢 dataset_id**：`GET /api/datasets`
-- **Storage 健康檢查**：`GET /api/health/storage`
+- **金層詞頻 ETL**（Silver→Gold）：`POST /delta/gold/word-frequency/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
+- **痛點快照僅重建**（不寫詞頻表）：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
+- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`
+- **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
+- **Silver OCR ETL**：`POST /delta/silver/ocr/run`
+- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`；`MAX_UPLOAD_MB` 限制大小）
+- **查詢 dataset_id**：`GET /api/datasets`（需 `ADMIN_TOKEN` 時）
+- **背景任務**：`GET /api/jobs/<job_id>`（建立非同步 pipeline 時）
+- **Storage 健康檢查**：`GET /api/health/storage`、`GET /api/debug/storage-check`（需 token 時）
 
 （完整行為以 `app.py` 為準。）
 
+**小提示**：部分 `POST` API 的 JSON 若因 `Content-Type` 未帶好而為空，可改用 **URL 查詢字串**補上 `dataset_id` 等欄位（與 body 合併），例如  
+`POST /delta/gold/word-frequency/run?dataset_id=drinks&dry_run=false`。
+
 ### 首頁 /layers 與 Gold 顯示規則（重要）
 
-- 首頁 Gold 圖表與 `/layers` 的「Gold — 與首頁圖表同源」目前都以 **落盤 Gold Delta 表** 為來源。
-- 帶 `dataset_id` 時會以 Gold 表中的 `dataset_id` 欄位過濾；不再切換成 Silver 即時計算。
-- `/layers` 新增「時間排序」：可切換 `最新在前` / `最舊在前`，方便確認最新上傳是否已進各層。
-- 一鍵 ETL（上傳頁）完成後，會回傳白話說明與關鍵數字（例如 Silver 筆數、Gold 產出筆數、是否成功寫入金層）。
+- 首頁 **詞頻**與 **`/layers`** 的 Gold 預覽以 **落盤 Gold 詞頻 Delta** 為來源。
+- **痛點主題**圖表以 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表為來源（可選多個 `snapshot_at` 對照）；**請以金層 ETL 或** `topic-snapshot/rebuild` **寫入快照**，並確認 ETL 有帶正確 `dataset_id`。
+- 帶 `dataset_id` 時會以表內 `dataset_id` 欄位過濾。
+- `/layers` 可切換時間排序；並可檢視 **辭典／停用詞套用狀態**（目前篩選之 `dataset_id`）。
+- 一鍵 ETL 完成後會回傳白話說明與指標（含 `gold_recompute_mode` 等）。
 
 ### 需求
 
@@ -143,8 +160,15 @@ docker run --rm -p 5000:5000 `
 
 ### 安全與治理（建議）
 
-- **高風險 API**：設定 `ADMIN_TOKEN` 後，請求需帶 header `X-Admin-Token`
+- **`ADMIN_TOKEN`**：設定後，多數 **寫入／ETL／上傳／除錯** API 需帶 header `X-Admin-Token`；**未設定**時這些檢查不會生效（僅適合本機開發）。
+- **仍可能為公開的讀取**：例如 `GET /health`、`GET /api/gold/word-frequency`、`POST /delta/read` 等（詳見 `app.py`）；若對外服務請評估是否再加網路隔離或反向代理。
 - **路徑白名單**：`ALLOWED_DELTA_PATH_PREFIXES`（逗號分隔）；未設定時預設僅 `s3a://<BUCKET_NAME>/`
+- **上傳**：`MAX_UPLOAD_MB`（預設 15）；Docker 埠是否只綁 `127.0.0.1` 請依部署決定。
+
+### Delta / 痛點快照（建議）
+
+- **寫入後驗證**：環境變數 **`GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE`**（預設 `true`）會在每次寫入 `topic_snapshot` 後以**不忽略缺檔**方式讀表驗證；失敗則 ETL 報錯，避免誤以為成功。表極大或除錯可設 `false`。
+- **勿手動刪除單一 parquet**：若需清空快照，應**整個 prefix（含 `_delta_log`）**處理，或先備份再刪；再執行 `POST /delta/gold/topic-snapshot/rebuild` 依 Silver 補寫。
 
 ### API 範例
 
@@ -204,12 +228,30 @@ $body = @{ dry_run = $true; dataset_id = "invoice_ocr" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run" -ContentType "application/json" -Body $body
 ```
 
-### 開發：測試
+金層詞頻（dry-run，建議用 `Invoke-RestMethod` 避免 JSON 引號問題）：
+
+```powershell
+$body = @{ dataset_id = "drinks"; dry_run = $true } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/word-frequency/run" `
+  -ContentType "application/json" -Body $body
+```
+
+痛點快照僅重建（需 Silver 已有資料；若啟用 `ADMIN_TOKEN` 請加 `-Headers`）：
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/topic-snapshot/rebuild?dataset_id=drinks"
+```
+
+### 開發：測試與 CI
+
+本機：
 
 ```powershell
 pip install -r requirements-dev.txt
 pytest -q
 ```
+
+GitHub：推送至 **`main` 或 `master`** 或開 PR 時，會執行 **`.github/workflows/ci.yml`**（Ubuntu、Python 3.11、JDK 17、`pytest tests/`）。不需另起「CI 服務」。
 
 ### Requirements 檔案用途
 

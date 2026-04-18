@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -20,6 +21,7 @@ except Exception:
 from config import (
     BUCKET_NAME,
     BRONZE_TABLE_PATH,
+    GOLD_TOPIC_SNAPSHOT_PATH,
     GOLD_WORD_COUNT_PATH,
     MINIO_ENDPOINT,
     RAW_IMAGE_PREFIX,
@@ -45,6 +47,9 @@ from services.spark_service import (
     get_bronze_data,
     get_dictionary_usage_status,
     get_gold_delta_table_preview,
+    get_gold_topic_snapshot_comparison,
+    list_gold_topic_snapshots,
+    get_gold_topic_snapshot_latest_data,
     get_gold_word_frequency_data,
     get_silver_ocr_data,
     get_system_status,
@@ -53,9 +58,15 @@ from services.spark_service import (
     read_delta_table,
     run_silver_ocr_etl,
     run_gold_word_frequency_etl,
+    run_gold_topic_snapshot_rebuild_etl,
 )
 
 app = Flask(__name__)
+
+# 僅使用此目錄下單一檔名，避免 Windows 路徑別名造成「兩份 index」誤改。
+TEMPLATE_INDEX = "index.html"
+TEMPLATE_LAYERS = "layers.html"
+TEMPLATE_UPLOAD = "upload.html"
 
 _logger = logging.getLogger("car_rental_flask_spark_delta")
 if not _logger.handlers:
@@ -121,6 +132,74 @@ def _require_admin_token_if_configured():
     return None
 
 
+def _parse_request_json_object() -> Dict[str, Any]:
+    """
+    解析 JSON body。
+    若客戶端未設 Content-Type: application/json，get_json 常得到空 dict；
+    此時改讀原始字串再 json.loads（方便 curl / 某些腳本）。
+    """
+    data = request.get_json(silent=True)
+    if isinstance(data, dict) and data:
+        return data
+    raw = request.get_data(as_text=True)
+    if raw and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def _merge_missing_from_query(body: Dict[str, Any], keys: tuple[str, ...]) -> Dict[str, Any]:
+    """body 缺欄位時，從 URL 查詢字串補上（與 JSON 合併，方便 PowerShell / curl）。"""
+    out = dict(body)
+    for k in keys:
+        cur = out.get(k)
+        empty = cur is None or (isinstance(cur, str) and not str(cur).strip())
+        if not empty:
+            continue
+        q = request.args.get(k)
+        if q is not None and str(q).strip() != "":
+            out[k] = q.strip()
+    return out
+
+
+def _parse_bool_loose(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "y", "on"):
+        return True
+    if s in ("false", "0", "no", "n", "off"):
+        return False
+    return None
+
+
+def _body_get_bool(body: Dict[str, Any], key: str, default: bool) -> bool:
+    if key not in body:
+        return default
+    v = body.get(key)
+    if isinstance(v, bool):
+        return v
+    p = _parse_bool_loose(v)
+    return default if p is None else p
+
+
+def _body_get_int(body: Dict[str, Any], key: str, default: int) -> int:
+    if key not in body:
+        return default
+    v = body.get(key)
+    if isinstance(v, bool):
+        raise ValueError(f"{key} 必須是整數。")
+    if isinstance(v, int):
+        return v
+    return int(str(v).strip())
+
+
 def _get_spark_manager() -> SparkManager:
     """
     延遲初始化 Spark（避免 /health、/api/status 等不需要 Spark 的路由也強制啟動）。
@@ -143,6 +222,7 @@ def _execute_pipeline_to_gold_inner(
     write_mode: str,
     apply_noise_filter: bool,
     coalesce_partitions: int,
+    skip_gold_if_no_new_ocr: bool,
     progress: Callable[[int, int, str], None],
 ) -> Dict[str, Any]:
     started = time.perf_counter()
@@ -155,6 +235,45 @@ def _execute_pipeline_to_gold_inner(
             bronze_path=BRONZE_TABLE_PATH,
             write_mode=write_mode,
         )
+        bronze_processed_rows = int(bronze_result.get("processed_rows") or 0)
+        if skip_gold_if_no_new_ocr and bronze_processed_rows <= 0:
+            out = {
+                "status": "ok",
+                "dataset_id": dataset_id,
+                "steps": ["bronze_ocr"],
+                "raw_images_path": raw_images_path,
+                "bronze_path": BRONZE_TABLE_PATH,
+                "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+                "gold_path": GOLD_WORD_COUNT_PATH,
+                "write_mode": write_mode,
+                "apply_noise_filter": apply_noise_filter,
+                "coalesce_partitions": coalesce_partitions,
+                "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
+                "is_incremental_short_circuit": True,
+                "summary": "本次沒有新增 OCR 資料，已跳過 Silver/Gold 重算。",
+                "bronze_result": bronze_result,
+                "silver_result": {"updated_rows": 0, "skipped": True},
+                "gold_result": {
+                    "gold_output_rows": 0,
+                    "is_gold_written": False,
+                    "skipped": True,
+                    "summary": "本次沒有新增 OCR 資料，已跳過 Gold 重算。",
+                },
+            }
+            _record_etl_metric(
+                {
+                    "etl_name": "pipeline_to_gold",
+                    "dataset_id": dataset_id,
+                    "status": "ok",
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                    "bronze_processed_rows": bronze_processed_rows,
+                    "silver_updated_rows": 0,
+                    "gold_output_rows": 0,
+                    "is_gold_written": False,
+                    "is_incremental_short_circuit": True,
+                }
+            )
+            return out
         progress(2, 3, "銀層 Silver ETL…")
         silver_result = run_silver_ocr_etl(
             bronze_path=BRONZE_TABLE_PATH,
@@ -168,6 +287,9 @@ def _execute_pipeline_to_gold_inner(
             dataset_id=dataset_id,
             apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
+            silver_batch_ts=silver_result.get("silver_batch_ts"),
+            prefer_incremental=bool(silver_result.get("inserted_rows", 0) > 0),
+            force_full_recompute=bool(silver_result.get("updated_existing_rows", 0) > 0),
         )
         out = {
             "status": "ok",
@@ -180,6 +302,7 @@ def _execute_pipeline_to_gold_inner(
             "write_mode": write_mode,
             "apply_noise_filter": apply_noise_filter,
             "coalesce_partitions": coalesce_partitions,
+            "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
             "bronze_result": bronze_result,
             "silver_result": silver_result,
             "gold_result": gold_result,
@@ -196,6 +319,7 @@ def _execute_pipeline_to_gold_inner(
                 "is_gold_written": gold_result.get("is_gold_written"),
                 "topic_output_rows": gold_result.get("topic_output_rows"),
                 "topic_frequency_top": gold_result.get("topic_frequency_top"),
+                "gold_recompute_mode": gold_result.get("gold_recompute_mode"),
             }
         )
         return out
@@ -358,7 +482,7 @@ def _safe_gold_disk_preview(
 @app.get("/upload")
 def upload_page():
     """瀏覽器上傳圖片至 MinIO（表單 POST 改由前端 fetch 呼叫 /api/upload/images）。"""
-    return render_template("upload.html")
+    return render_template(TEMPLATE_UPLOAD)
 
 
 @app.get("/")
@@ -380,15 +504,22 @@ def index():
     sys_status = get_system_status()
     gold_rows, gold_error = _safe_gold_preview(limit=15, dataset_id=selected_dataset_id)
     topic_rows: List[Dict[str, Any]] = []
+    topic_compare_rows: List[Dict[str, Any]] = []
+    topic_snapshot_options: List[str] = []
+    selected_topic_snapshots = [s.strip() for s in request.args.getlist("topic_snapshot") if s and s.strip()]
     topic_hint: str | None = None
-    latest_metric_rows = read_etl_metrics(limit=20, dataset_id=selected_dataset_id or None)
-    for item in latest_metric_rows:
-        etl_name = str(item.get("etl_name") or "")
-        if etl_name in ("gold_word_frequency_etl", "pipeline_to_gold"):
-            candidate = item.get("topic_frequency_top") or []
-            if candidate:
-                topic_rows = candidate
-                break
+    try:
+        topic_snapshot_options = list_gold_topic_snapshots(dataset_id=selected_dataset_id, limit=30)
+        if selected_topic_snapshots:
+            topic_compare_rows = get_gold_topic_snapshot_comparison(
+                dataset_id=selected_dataset_id,
+                snapshots=selected_topic_snapshots,
+            )
+        topic_rows = get_gold_topic_snapshot_latest_data(limit=15, dataset_id=selected_dataset_id)
+    except Exception as e:
+        _logger.warning("topic_snapshot_preview_failed: %s", e)
+        topic_rows = []
+        topic_compare_rows = []
 
     if selected_dataset_id and not gold_error and not gold_rows:
         any_rows, any_err = _safe_gold_preview(limit=1, dataset_id=None)
@@ -399,7 +530,7 @@ def index():
             )
 
     return render_template(
-        "index.html",
+        TEMPLATE_INDEX,
         cpu_percent=sys_status.get("cpu_percent"),
         memory_percent=sys_status.get("memory_percent"),
         dataset_options=dataset_options,
@@ -407,8 +538,12 @@ def index():
         gold_rows=gold_rows,
         gold_error=gold_error,
         topic_rows=topic_rows,
+        topic_compare_rows=topic_compare_rows,
+        topic_snapshot_options=topic_snapshot_options,
+        selected_topic_snapshots=selected_topic_snapshots,
         topic_hint=topic_hint,
         gold_table_path=GOLD_WORD_COUNT_PATH,
+        topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
         silver_ocr_table_path=SILVER_OCR_TABLE_PATH,
     )
 
@@ -487,7 +622,7 @@ def layers_preview_page():
             )
 
     return render_template(
-        "layers.html",
+        TEMPLATE_LAYERS,
         dataset_options=dataset_options,
         selected_dataset_id=selected_dataset_id,
         preview_limit=preview_limit,
@@ -1135,17 +1270,32 @@ def delta_gold_word_frequency_run():
         "coalesce_partitions": 1,
         "dry_run": false
       }
+
+    亦可用查詢字串補齊欄位（與 body 合併），例如：
+    POST /delta/gold/word-frequency/run?dataset_id=drinks&dry_run=false
     """
 
     err = _require_admin_token_if_configured()
     if err:
         return err
 
-    body = request.get_json(silent=True) or {}
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        (
+            "dataset_id",
+            "silver_ocr_path",
+            "gold_path",
+            "apply_noise_filter",
+            "coalesce_partitions",
+            "dry_run",
+        ),
+    )
     if not isinstance(body, dict):
         return _json_error("body 必須是 JSON object。", 400)
 
     dataset_raw = body.get("dataset_id")
+    if isinstance(dataset_raw, str) and not dataset_raw.strip():
+        dataset_raw = None
     dataset_id: str | None = None
     if dataset_raw is not None:
         if not isinstance(dataset_raw, str):
@@ -1171,17 +1321,13 @@ def delta_gold_word_frequency_run():
     if err:
         return err
 
-    apply_noise_filter = body.get("apply_noise_filter", True)
-    if not isinstance(apply_noise_filter, bool):
-        return _json_error("apply_noise_filter 必須是布林值。", 400)
-
-    coalesce_raw = body.get("coalesce_partitions", 1)
+    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
     try:
-        coalesce_partitions = int(coalesce_raw)
+        coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
     except (TypeError, ValueError):
         return _json_error("coalesce_partitions 必須是整數。", 400)
 
-    dry_run = bool(body.get("dry_run", False))
+    dry_run = _body_get_bool(body, "dry_run", False)
     if dry_run:
         return jsonify(
             {
@@ -1250,6 +1396,100 @@ def delta_gold_word_frequency_run():
     )
 
 
+@app.post("/delta/gold/topic-snapshot/rebuild")
+def delta_gold_topic_snapshot_rebuild():
+    """
+    僅重建痛點主題快照（append 至 topic_snapshot），不寫入詞頻 Gold 表。
+    適用：手動清空 MinIO 上 topic_snapshot 目錄後，依 Silver 補寫快照。
+
+    body 或查詢參數（dataset_id 必填）:
+      { "dataset_id": "drinks", "silver_ocr_path": "s3a://.../", "apply_noise_filter": true, "dry_run": false }
+
+    查詢字串範例：POST /delta/gold/topic-snapshot/rebuild?dataset_id=drinks
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        ("dataset_id", "silver_ocr_path", "apply_noise_filter", "dry_run"),
+    )
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    if not isinstance(dataset_raw, str) or not dataset_raw.strip():
+        return _json_error(
+            "dataset_id 必填。可在 JSON body 或查詢參數提供，例如 ?dataset_id=drinks",
+            400,
+        )
+    try:
+        dataset_id = normalize_dataset_id(dataset_raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    silver_raw = body.get("silver_ocr_path")
+    silver_ocr_path = (
+        silver_raw.strip()
+        if isinstance(silver_raw, str) and silver_raw.strip()
+        else SILVER_OCR_TABLE_PATH
+    )
+    err = _validate_delta_path(silver_ocr_path)
+    if err:
+        return err
+    err = _validate_delta_path(GOLD_TOPIC_SNAPSHOT_PATH)
+    if err:
+        return err
+
+    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
+    dry_run = _body_get_bool(body, "dry_run", False)
+    if dry_run:
+        return jsonify(
+            {
+                "status": "dry_run",
+                "dataset_id": dataset_id,
+                "silver_ocr_path": silver_ocr_path,
+                "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
+                "apply_noise_filter": apply_noise_filter,
+            }
+        )
+
+    _get_spark_manager()
+    started = time.perf_counter()
+    try:
+        result = run_gold_topic_snapshot_rebuild_etl(
+            silver_ocr_path=silver_ocr_path,
+            dataset_id=dataset_id,
+            apply_noise_filter=apply_noise_filter,
+        )
+        _record_etl_metric(
+            {
+                "etl_name": "gold_topic_snapshot_rebuild",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "topic_snapshot_rows": result.get("topic_snapshot_rows"),
+            }
+        )
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "gold_topic_snapshot_rebuild",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+            }
+        )
+        _logger.exception("gold_topic_snapshot_rebuild_failed")
+        return _json_error(f"痛點快照重建失敗：{e}", 500)
+    return jsonify({"status": "ok", **result})
+
+
 @app.post("/delta/pipeline/to-gold/run")
 def delta_pipeline_to_gold_run():
     """
@@ -1261,24 +1501,41 @@ def delta_pipeline_to_gold_run():
         "write_mode": "append",
         "apply_noise_filter": true,
         "coalesce_partitions": 1,
+        "skip_gold_if_no_new_ocr": true,
         "dry_run": false,
         "async": false
       }
 
     - async: true 時立即回傳 job_id（HTTP 202），以 GET /api/jobs/<job_id> 輪詢；
       預檢（來源路徑至少有 1 張圖）仍同步執行，失敗則不回傳 job。
+
+    查詢字串可補齊 dataset_id 等欄位，例如：POST /delta/pipeline/to-gold/run?dataset_id=drinks
     """
     err = _require_admin_token_if_configured()
     if err:
         return err
 
-    body = request.get_json(silent=True) or {}
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        (
+            "dataset_id",
+            "write_mode",
+            "apply_noise_filter",
+            "coalesce_partitions",
+            "skip_gold_if_no_new_ocr",
+            "dry_run",
+            "async",
+        ),
+    )
     if not isinstance(body, dict):
         return _json_error("body 必須是 JSON object。", 400)
 
     dataset_raw = body.get("dataset_id")
     if not isinstance(dataset_raw, str) or not dataset_raw.strip():
-        return _json_error("dataset_id 必填。", 400)
+        return _json_error(
+            "dataset_id 必填。可在 JSON body 或查詢參數提供，例如 ?dataset_id=drinks",
+            400,
+        )
     try:
         dataset_id = normalize_dataset_id(dataset_raw)
     except ValueError as e:
@@ -1288,15 +1545,13 @@ def delta_pipeline_to_gold_run():
     if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append"):
         return _json_error('write_mode 必須是 "overwrite" 或 "append"。', 400)
 
-    apply_noise_filter = body.get("apply_noise_filter", True)
-    if not isinstance(apply_noise_filter, bool):
-        return _json_error("apply_noise_filter 必須是布林值。", 400)
-
-    coalesce_raw = body.get("coalesce_partitions", 1)
+    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
     try:
-        coalesce_partitions = int(coalesce_raw)
+        coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
     except (TypeError, ValueError):
         return _json_error("coalesce_partitions 必須是整數。", 400)
+
+    skip_gold_if_no_new_ocr = _body_get_bool(body, "skip_gold_if_no_new_ocr", True)
 
     raw_images_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{dataset_id}/"
     err = _validate_delta_path(raw_images_path)
@@ -1312,7 +1567,7 @@ def delta_pipeline_to_gold_run():
     if err:
         return err
 
-    dry_run = bool(body.get("dry_run", False))
+    dry_run = _body_get_bool(body, "dry_run", False)
     if dry_run:
         return jsonify(
             {
@@ -1326,6 +1581,7 @@ def delta_pipeline_to_gold_run():
                 "write_mode": write_mode,
                 "apply_noise_filter": apply_noise_filter,
                 "coalesce_partitions": coalesce_partitions,
+                "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
             }
         )
 
@@ -1343,7 +1599,7 @@ def delta_pipeline_to_gold_run():
             raw_images_path=raw_images_path,
         )
 
-    if bool(body.get("async", False)):
+    if _body_get_bool(body, "async", False):
         jid = job_registry.create("pipeline_to_gold", step_total=3)
 
         def work(progress: Callable[[int, int, str], None]) -> Dict[str, Any]:
@@ -1353,6 +1609,7 @@ def delta_pipeline_to_gold_run():
                 write_mode=write_mode,
                 apply_noise_filter=apply_noise_filter,
                 coalesce_partitions=coalesce_partitions,
+                skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
                 progress=progress,
             )
 
@@ -1376,6 +1633,7 @@ def delta_pipeline_to_gold_run():
             write_mode=write_mode,
             apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
+            skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
             progress=_noop_progress,
         )
         return jsonify(payload)

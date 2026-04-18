@@ -1,0 +1,38 @@
+# 在 push / PR 時自動跑測試（不啟動 Docker、不跑完整 Spark 管線）。
+# 專案內 tests/ 以 Flask test_client 與 mock 為主，與本機 pytest 相同。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # PySpark 需要 JVM（與本機開發一致）
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        env:
+          BUCKET_NAME: data-lake
+          ALLOWED_DELTA_PATH_PREFIXES: s3a://data-lake/
+        run: pytest tests/ -q --tb=short

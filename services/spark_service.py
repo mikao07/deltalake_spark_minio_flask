@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import logging
+from datetime import datetime
 from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List
 
@@ -35,6 +36,8 @@ from delta.tables import DeltaTable
 
 from config import (
     BRONZE_TABLE_PATH,
+    GOLD_TOPIC_SNAPSHOT_PATH,
+    GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE,
     GOLD_WORD_COUNT_PATH,
     JIEBA_USERDICT_DATASET_PATTERN,
     JIEBA_USERDICT_PATH,
@@ -316,25 +319,75 @@ def run_silver_ocr_etl(
 
     df_bronze = read_delta_table(spark, bronze)
     df_updates = build_silver_ocr_updates_from_bronze(df_bronze, dataset_id=ds)
-    update_count = int(df_updates.count())
-    if update_count == 0:
-        return {"updated_rows": 0, "dataset_id": ds, "silver_ocr_path": silver, "bronze_path": bronze}
+    update_count_raw = int(df_updates.count())
+    if update_count_raw == 0:
+        return {
+            "updated_rows": 0,
+            "inserted_rows": 0,
+            "updated_existing_rows": 0,
+            "silver_batch_ts": "",
+            "dataset_id": ds,
+            "silver_ocr_path": silver,
+            "bronze_path": bronze,
+        }
+
+    batch_ts = datetime.utcnow()
+    batch_ts_lit = lit(batch_ts)
 
     if delta_table_exists(spark, silver):
         delta_table = DeltaTable.forPath(spark, silver)
-        target_cols = set(read_delta_table(spark, silver).columns)
+        df_target = read_delta_table(spark, silver)
+        target_cols = set(df_target.columns)
+        df_target_cmp = df_target.select(
+            col("image_path").alias("_t_image_path"),
+            col("extracted_text").alias("_t_extracted_text"),
+            col("source_bucket").alias("_t_source_bucket"),
+            col("ingestion_timestamp").alias("_t_ingestion_timestamp"),
+            col("dataset_id").alias("_t_dataset_id") if "dataset_id" in target_cols else lit(None).alias("_t_dataset_id"),
+        )
+        df_cmp = df_updates.alias("u").join(
+            df_target_cmp.alias("t"),
+            col("u.image_path") == col("t._t_image_path"),
+            how="left",
+        )
+        same_dataset_expr = (
+            trim(lower(col("u.dataset_id"))) == trim(lower(col("t._t_dataset_id")))
+            if "dataset_id" in target_cols
+            else lit(True)
+        )
+        unchanged_expr = (
+            col("t._t_image_path").isNotNull()
+            & (col("u.extracted_text") == col("t._t_extracted_text"))
+            & (col("u.source_bucket") == col("t._t_source_bucket"))
+            & (col("u.latest_ingestion_timestamp") == col("t._t_ingestion_timestamp"))
+            & same_dataset_expr
+        )
+        df_changes = df_cmp.filter(~unchanged_expr).select("u.*")
+        update_count = int(df_changes.count())
+        if update_count == 0:
+            return {
+                "updated_rows": 0,
+                "inserted_rows": 0,
+                "updated_existing_rows": 0,
+                "silver_batch_ts": "",
+                "dataset_id": ds,
+                "silver_ocr_path": silver,
+                "bronze_path": bronze,
+            }
+        inserted_rows = int(df_cmp.filter(col("t._t_image_path").isNull()).count())
+        updated_existing_rows = max(0, update_count - inserted_rows)
         update_set = {
             "extracted_text": col("source.extracted_text"),
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
-            "etl_update_timestamp": current_timestamp(),
+            "etl_update_timestamp": batch_ts_lit,
         }
         insert_values = {
             "image_path": col("source.image_path"),
             "extracted_text": col("source.extracted_text"),
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
-            "etl_update_timestamp": current_timestamp(),
+            "etl_update_timestamp": batch_ts_lit,
         }
         # 舊 Silver 表可能尚未有 dataset_id，避免 MERGE 直接失敗
         if "dataset_id" in target_cols:
@@ -342,21 +395,32 @@ def run_silver_ocr_etl(
             insert_values["dataset_id"] = col("source.dataset_id")
         (
             delta_table.alias("target")
-            .merge(df_updates.alias("source"), "target.image_path = source.image_path")
+            .merge(df_changes.alias("source"), "target.image_path = source.image_path")
             .whenMatchedUpdate(set=update_set)
             .whenNotMatchedInsert(values=insert_values)
             .execute()
         )
     else:
+        inserted_rows = update_count_raw
+        updated_existing_rows = 0
+        update_count = update_count_raw
         (
             df_updates.withColumnRenamed("latest_ingestion_timestamp", "ingestion_timestamp")
-            .withColumn("etl_update_timestamp", current_timestamp())
+            .withColumn("etl_update_timestamp", batch_ts_lit)
             .write.format("delta")
             .mode("overwrite")
             .save(silver)
         )
 
-    return {"updated_rows": update_count, "dataset_id": ds, "silver_ocr_path": silver, "bronze_path": bronze}
+    return {
+        "updated_rows": update_count,
+        "inserted_rows": inserted_rows,
+        "updated_existing_rows": updated_existing_rows,
+        "silver_batch_ts": batch_ts.isoformat(),
+        "dataset_id": ds,
+        "silver_ocr_path": silver,
+        "bronze_path": bronze,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +470,7 @@ _COMMON_NOISE = _FINAL_NOISE + [
     "aer",
 ]
 _MIN_WORD_LENGTH = 2
+_TOPIC_RULE_VERSION = "v1.1"
 
 # 痛點主題規則（MVP）：可先用於熱門痛點監控，後續再抽成外部設定檔
 _PAIN_TOPIC_RULES: Dict[str, List[str]] = {
@@ -896,6 +961,277 @@ def write_gold_word_frequency_delta(
     out.write.format("delta").mode("overwrite").save(gold_path)
 
 
+def write_gold_topic_snapshot_delta(
+    df_topic_count: DataFrame,
+    *,
+    gold_topic_snapshot_path: str,
+    dataset_id: str | None = None,
+    rule_version: str = _TOPIC_RULE_VERSION,
+) -> int:
+    """
+    將痛點主題頻率以 append 方式寫入 Gold 快照表，供歷史對照。
+    """
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    out = (
+        df_topic_count.withColumn(
+            "dataset_id",
+            lit(ds).cast(StringType()) if ds else lit(None).cast(StringType()),
+        )
+        .withColumn("rule_version", lit(str(rule_version).strip() or _TOPIC_RULE_VERSION))
+        .withColumn("snapshot_at", current_timestamp())
+    )
+    out.write.format("delta").mode("append").save(gold_topic_snapshot_path)
+    if GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE:
+        spark = out.sparkSession
+        _verify_topic_snapshot_delta_readable_strict(spark, gold_topic_snapshot_path)
+    return int(out.count())
+
+
+def _verify_topic_snapshot_delta_readable_strict(spark: SparkSession, path: str) -> None:
+    """
+    寫入後驗證：以不忽略缺檔的方式讀取並 count，若 Delta 與實體檔不一致會失敗。
+    topic_snapshot 列數通常不大；若表極大請改為維護窗執行或關閉 GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE。
+    """
+    key = "spark.sql.files.ignoreMissingFiles"
+    prev = spark.conf.get(key, None)
+    try:
+        spark.conf.set(key, "false")
+        n = spark.read.format("delta").load(path).count()
+        _logger.info("topic_snapshot_verify_ok: path=%s rows=%s", path, n)
+    except Exception as e:
+        _logger.error("topic_snapshot_verify_failed: path=%s error=%s", path, e)
+        raise RuntimeError(
+            f"痛點快照表寫入後讀取驗證失敗（表可能不一致或缺檔）：{path}"
+        ) from e
+    finally:
+        if prev is not None:
+            spark.conf.set(key, prev)
+
+
+def _read_delta_ignore_missing(spark: SparkSession, path: str) -> DataFrame:
+    """
+    盡量容忍 Delta 所引用的 parquet 遺失，避免首頁預覽整段失敗。
+    """
+    spark.conf.set("spark.sql.files.ignoreMissingFiles", "true")
+    return (
+        spark.read
+        .option("ignoreMissingFiles", "true")
+        .format("delta")
+        .load(path)
+    )
+
+
+def get_gold_topic_snapshot_latest_data(
+    limit: int = 10,
+    dataset_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    讀取 Gold topic 快照表中「最新一個 snapshot_at」的主題頻率。
+    """
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_read_failed_latest: %s", e)
+        return []
+    try:
+        if ds and "dataset_id" in df.columns:
+            df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+        if "snapshot_at" not in df.columns:
+            return [row.asDict(recursive=True) for row in df.orderBy(col("frequency").desc()).limit(lim).collect()]
+        max_snapshot_at = df.agg(spark_max(col("snapshot_at")).alias("max_snapshot_at")).collect()[0]["max_snapshot_at"]
+        if max_snapshot_at is None:
+            return []
+        df_latest = df.filter(col("snapshot_at") == lit(max_snapshot_at)).orderBy(col("frequency").desc()).limit(lim)
+        return [row.asDict(recursive=True) for row in df_latest.collect()]
+    except Exception as e:
+        _logger.warning("topic_snapshot_collect_failed_latest: %s", e)
+        return []
+
+
+def list_gold_topic_snapshots(
+    *,
+    dataset_id: str | None = None,
+    limit: int = 30,
+) -> List[str]:
+    """
+    列出可供對照的 snapshot_at（ISO 字串，最新在前）。
+    """
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_read_failed_list: %s", e)
+        return []
+    try:
+        if ds and "dataset_id" in df.columns:
+            df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+        if "snapshot_at" not in df.columns:
+            return []
+        rows = (
+            df.select("snapshot_at")
+            .distinct()
+            .orderBy(col("snapshot_at").desc())
+            .limit(lim)
+            .collect()
+        )
+        out: List[str] = []
+        for r in rows:
+            v = r["snapshot_at"]
+            if v is None:
+                continue
+            out.append(v.isoformat() if hasattr(v, "isoformat") else str(v))
+        return out
+    except Exception as e:
+        _logger.warning("topic_snapshot_collect_failed_list: %s", e)
+        return []
+
+
+def get_gold_topic_snapshot_comparison(
+    *,
+    dataset_id: str | None = None,
+    snapshots: Iterable[str],
+) -> List[Dict[str, Any]]:
+    """
+    讀取指定多個快照的 topic 頻率，用於對照（每列含 snapshot_at/topic/frequency）。
+    """
+    spark = SparkManager().spark
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    keys = [str(s).strip() for s in snapshots if str(s).strip()]
+    if not keys:
+        return []
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_read_failed_compare: %s", e)
+        return []
+    try:
+        if ds and "dataset_id" in df.columns:
+            df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+        if "snapshot_at" not in df.columns:
+            return []
+        rows = (
+            df.select("snapshot_at", "topic", "frequency")
+            .collect()
+        )
+        wanted = set(keys)
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            snap = r["snapshot_at"]
+            snap_iso = snap.isoformat() if hasattr(snap, "isoformat") else str(snap)
+            if snap_iso not in wanted:
+                continue
+            out.append(
+                {
+                    "snapshot_at": snap_iso,
+                    "topic": r["topic"],
+                    "frequency": int(r["frequency"] or 0),
+                }
+            )
+        out.sort(key=lambda x: (x["snapshot_at"], -x["frequency"], x["topic"]))
+        return out
+    except Exception as e:
+        _logger.warning("topic_snapshot_collect_failed_compare: %s", e)
+        return []
+
+
+def run_gold_topic_snapshot_rebuild_etl(
+    *,
+    silver_ocr_path: str | None = None,
+    dataset_id: str | None = None,
+    apply_noise_filter: bool = True,
+) -> Dict[str, Any]:
+    """
+    僅依 Silver 重算痛點主題並 append 至 topic_snapshot（不寫入詞頻 Gold 表）。
+    適用：手動刪除 topic_snapshot 後補寫快照，或只需更新痛點快照。
+    """
+    spark = SparkManager().spark
+    silver = silver_ocr_path or SILVER_OCR_TABLE_PATH
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if not ds:
+        raise ValueError("dataset_id 必填")
+
+    active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
+    register_jieba_pyfile_if_needed(
+        spark,
+        JIEBA_ZIP_PATH,
+        active_userdict_path,
+        dataset_id=ds,
+    )
+    if active_userdict_path:
+        _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
+    else:
+        _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
+    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
+    extra_stopwords: List[str] = []
+    if active_stopwords_path:
+        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+        _logger.info(
+            "stopwords_selected: dataset_id=%s path=%s count=%s",
+            ds,
+            active_stopwords_path,
+            len(extra_stopwords),
+        )
+    else:
+        _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
+
+    df_silver = read_delta_table(spark, silver)
+    df_silver = _filter_df_by_dataset_id(df_silver, ds)
+    silver_filtered_rows = int(df_silver.count())
+
+    df_topic = build_gold_pain_topic_frequency_dataframe(
+        df_silver,
+        dataset_id_for_log=ds,
+        jieba_userdict_path=active_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords if apply_noise_filter else None,
+    )
+    topic_snapshot_rows = write_gold_topic_snapshot_delta(
+        df_topic,
+        gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
+        dataset_id=ds,
+        rule_version=_TOPIC_RULE_VERSION,
+    )
+    topic_output_rows = int(df_topic.count())
+    topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
+
+    if topic_output_rows > 0:
+        summary = f"痛點快照已寫入 {topic_snapshot_rows} 列（主題列 {topic_output_rows} 筆）。"
+    elif silver_filtered_rows > 0:
+        summary = "Silver 有資料，但未匹配到任何痛點主題。"
+    else:
+        summary = "Silver 篩選後為 0 筆，無可寫入的主題資料。"
+
+    return {
+        "dataset_id": ds,
+        "silver_filtered_rows": silver_filtered_rows,
+        "topic_output_rows": topic_output_rows,
+        "topic_snapshot_rows": topic_snapshot_rows,
+        "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
+        "topic_rule_version": _TOPIC_RULE_VERSION,
+        "topic_frequency_top": topic_frequency_top,
+        "jieba_userdict_used": bool(active_userdict_path),
+        "jieba_userdict_path": active_userdict_path or "",
+        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_path": active_stopwords_path or "",
+        "stopwords_count": len(extra_stopwords),
+        "summary": summary,
+    }
+
+
 def run_gold_word_frequency_etl(
     *,
     silver_ocr_path: str | None = None,
@@ -903,6 +1239,9 @@ def run_gold_word_frequency_etl(
     dataset_id: str | None = None,
     apply_noise_filter: bool = True,
     coalesce_partitions: int = 1,
+    silver_batch_ts: str | None = None,
+    prefer_incremental: bool = False,
+    force_full_recompute: bool = False,
 ) -> Dict[str, Any]:
     """
     讀取 Silver OCR Delta → 詞頻 → 覆寫寫入 Gold Delta（完整金層 ETL）。
@@ -939,38 +1278,106 @@ def run_gold_word_frequency_etl(
     if ds:
         df_silver = _filter_df_by_dataset_id(df_silver, ds)
     silver_filtered_rows = int(df_silver.count())
-    df_wc = build_gold_word_frequency_dataframe(
-        df_silver,
-        dataset_id_for_log=ds,
-        jieba_userdict_path=active_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords if apply_noise_filter else None,
+    incremental_mode = (
+        bool(prefer_incremental)
+        and not bool(force_full_recompute)
+        and bool(ds)
+        and bool(silver_batch_ts)
+        and delta_table_exists(spark, gold)
+        and "etl_update_timestamp" in df_silver.columns
     )
-    df_topic = build_gold_pain_topic_frequency_dataframe(
-        df_silver,
-        dataset_id_for_log=ds,
-        jieba_userdict_path=active_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords if apply_noise_filter else None,
-    )
-    gold_output_rows = int(df_wc.count())
-    topic_output_rows = int(df_topic.count())
-    topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
-    if ds:
-        df_wc = df_wc.withColumn("dataset_id", lit(ds))
-        out = df_wc if coalesce_partitions <= 0 else df_wc.coalesce(coalesce_partitions)
-        if delta_table_exists(spark, gold):
-            target_cols = set(read_delta_table(spark, gold).columns)
+    if incremental_mode:
+        df_silver_delta = df_silver.filter(col("etl_update_timestamp") == to_timestamp(lit(str(silver_batch_ts))))
+        silver_delta_rows = int(df_silver_delta.count())
+        if silver_delta_rows > 0:
+            df_wc_delta = build_gold_word_frequency_dataframe(
+                df_silver_delta,
+                dataset_id_for_log=ds,
+                jieba_userdict_path=active_userdict_path,
+                apply_noise_filter=apply_noise_filter,
+                extra_stopwords=extra_stopwords if apply_noise_filter else None,
+            )
+            df_topic = build_gold_pain_topic_frequency_dataframe(
+                df_silver_delta,
+                dataset_id_for_log=ds,
+                jieba_userdict_path=active_userdict_path,
+                apply_noise_filter=apply_noise_filter,
+                extra_stopwords=extra_stopwords if apply_noise_filter else None,
+            )
+            topic_snapshot_rows = write_gold_topic_snapshot_delta(
+                df_topic,
+                gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
+                dataset_id=ds,
+                rule_version=_TOPIC_RULE_VERSION,
+            )
+            topic_output_rows = int(df_topic.count())
+            topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
+
+            df_existing_gold = read_delta_table(spark, gold)
+            target_cols = set(df_existing_gold.columns)
+            if "dataset_id" in target_cols:
+                df_existing_gold = df_existing_gold.filter(trim(lower(col("dataset_id"))) == lit(ds))
+            df_existing_gold = df_existing_gold.select("keyword", "frequency")
+            df_wc_merged = (
+                df_existing_gold.unionByName(df_wc_delta.select("keyword", "frequency"))
+                .groupBy("keyword")
+                .agg(expr("sum(frequency) as frequency"))
+            )
+            gold_output_rows = int(df_wc_merged.count())
+            out = (
+                df_wc_merged.withColumn("dataset_id", lit(ds))
+                if ds
+                else df_wc_merged
+            )
+            out = out if coalesce_partitions <= 0 else out.coalesce(coalesce_partitions)
             if "dataset_id" in target_cols:
                 DeltaTable.forPath(spark, gold).delete(condition=f"dataset_id = '{ds}'")
                 out.write.format("delta").mode("append").save(gold)
             else:
-                # 舊 Gold 表沒有 dataset_id 欄位時，先用 overwrite 進行欄位遷移
+                out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
+            mode_used = "incremental_delta_merge"
+        else:
+            incremental_mode = False
+    if not incremental_mode:
+        df_wc = build_gold_word_frequency_dataframe(
+            df_silver,
+            dataset_id_for_log=ds,
+            jieba_userdict_path=active_userdict_path,
+            apply_noise_filter=apply_noise_filter,
+            extra_stopwords=extra_stopwords if apply_noise_filter else None,
+        )
+        df_topic = build_gold_pain_topic_frequency_dataframe(
+            df_silver,
+            dataset_id_for_log=ds,
+            jieba_userdict_path=active_userdict_path,
+            apply_noise_filter=apply_noise_filter,
+            extra_stopwords=extra_stopwords if apply_noise_filter else None,
+        )
+        topic_snapshot_rows = write_gold_topic_snapshot_delta(
+            df_topic,
+            gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
+            dataset_id=ds,
+            rule_version=_TOPIC_RULE_VERSION,
+        )
+        gold_output_rows = int(df_wc.count())
+        topic_output_rows = int(df_topic.count())
+        topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
+        if ds:
+            df_wc = df_wc.withColumn("dataset_id", lit(ds))
+            out = df_wc if coalesce_partitions <= 0 else df_wc.coalesce(coalesce_partitions)
+            if delta_table_exists(spark, gold):
+                target_cols = set(read_delta_table(spark, gold).columns)
+                if "dataset_id" in target_cols:
+                    DeltaTable.forPath(spark, gold).delete(condition=f"dataset_id = '{ds}'")
+                    out.write.format("delta").mode("append").save(gold)
+                else:
+                    # 舊 Gold 表沒有 dataset_id 欄位時，先用 overwrite 進行欄位遷移
+                    out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
+            else:
                 out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
         else:
-            out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(gold)
-    else:
-        write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
+            write_gold_word_frequency_delta(df_wc, gold, coalesce_partitions=coalesce_partitions)
+        mode_used = "full_recompute"
 
     df_gold_after = read_delta_table(spark, gold)
     gold_total_rows_after = int(df_gold_after.count())
@@ -999,8 +1406,12 @@ def run_gold_word_frequency_etl(
         "stopwords_path": active_stopwords_path or "",
         "stopwords_count": len(extra_stopwords),
         "topic_output_rows": topic_output_rows,
+        "topic_snapshot_rows": topic_snapshot_rows,
+        "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
+        "topic_rule_version": _TOPIC_RULE_VERSION,
         "topic_frequency_top": topic_frequency_top,
         "is_gold_written": gold_output_rows > 0,
+        "gold_recompute_mode": mode_used,
         "summary": summary,
     }
 

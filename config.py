@@ -53,6 +53,21 @@ GOLD_WORD_COUNT_PATH = os.getenv(
     f"s3a://{BUCKET_NAME}/gold/word_frequency/",
 )
 
+# Gold：痛點主題快照（topic / frequency）
+GOLD_TOPIC_SNAPSHOT_PATH = os.getenv(
+    "GOLD_TOPIC_SNAPSHOT_PATH",
+    f"s3a://{BUCKET_NAME}/gold/topic_snapshot/",
+)
+
+# 寫入痛點快照表後是否強制讀取驗證（不啟用 ignoreMissingFiles，避免元資料與 parquet 不一致仍回報成功）
+_GOLD_TOPIC_SNAPSHOT_VERIFY_RAW = os.getenv("GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE", "true").strip().lower()
+GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE = _GOLD_TOPIC_SNAPSHOT_VERIFY_RAW in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 # Notebook：JIEBA_ZIP_PATH（上傳至 MinIO 的 jieba.zip，供 executors addPyFile）
 JIEBA_ZIP_PATH = os.getenv(
     "JIEBA_ZIP_PATH",

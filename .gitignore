@@ -30,6 +30,9 @@ htmlcov/
 .env.*
 !.env.example
 
+# Local git commit message drafts（git commit -F ...）
+commitmsg*.txt
+
 # IDE / editor
 .idea/
 .vscode/
