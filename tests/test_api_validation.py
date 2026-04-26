@@ -158,6 +158,24 @@ def test_delta_pipeline_to_gold_run_dry_run(monkeypatch):
     assert "steps" in j
 
 
+def test_delta_topic_snapshot_delete_requires_dataset_id(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/gold/topic-snapshot/delete",
+        json={"snapshot_at": "2026-01-01T00:00:00"},
+    )
+    assert r.status_code == 400
+
+
+def test_delta_topic_snapshot_delete_requires_snapshot_at(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/gold/topic-snapshot/delete",
+        json={"dataset_id": "invoice_ocr"},
+    )
+    assert r.status_code == 400
+
+
 def test_api_jobs_unknown_returns_404(monkeypatch):
     c = _client(monkeypatch)
     r = c.get("/api/jobs/00000000-0000-0000-0000-000000000000")

@@ -73,6 +73,20 @@
             </label>
             <div class="form-text">與上一項擇一即可；一鍵已含銅層，不需再勾「只做 Bronze」。</div>
           </div>
+          <div class="form-check mb-3 ms-1 ps-2 border-start">
+            <input
+              class="form-check-input"
+              type="checkbox"
+              id="skip_gold_if_no_new_ocr_upload"
+              checked
+            />
+            <label class="form-check-label" for="skip_gold_if_no_new_ocr_upload">
+              無新 OCR 時跳過銀層／金層（預設開啟）
+            </label>
+            <div class="form-text">
+              關閉後，即使本次 Bronze 沒有新增筆數仍會跑 Silver／金層（例如只改停用詞或自訂辭典後要重算）。下方「手動一鍵」有相同選項，會互相同步。
+            </div>
+          </div>
           <div class="mb-3">
             <label class="form-label">同名物件已存在時（MinIO）</label>
             <select class="form-select" id="on_duplicate" name="on_duplicate">
@@ -199,6 +213,22 @@
             </div>
             <div class="col-12 col-md-2 d-grid">
               <button type="button" class="btn btn-outline-primary" id="btn-run-ocr">執行 OCR</button>
+            </div>
+            <div class="col-12 mt-2">
+              <div class="form-check">
+                <input
+                  class="form-check-input"
+                  type="checkbox"
+                  id="skip_gold_if_no_new_ocr_manual"
+                  checked
+                />
+                <label class="form-check-label" for="skip_gold_if_no_new_ocr_manual">
+                  無新 OCR 時跳過銀層／金層（預設開啟）
+                </label>
+                <div class="form-text mb-0">
+                  關閉＝強制重跑 Silver／金層（與上方上傳區選項同步）。
+                </div>
+              </div>
             </div>
             <div class="col-12 col-md-12 d-grid mt-2">
               <button type="button" class="btn btn-primary" id="btn-run-pipeline-gold">
@@ -400,7 +430,13 @@
             ocrNote.classList.remove("d-none");
             ocrNote.className = "small text-muted mt-2 mb-0";
             ocrNote.textContent = "一鍵金層執行中（分三階段），請看下方進度。";
-            const pipeResult = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, uploadProg);
+            const pipeResult = await runPipelineToGoldWithProgress(
+              datasetId,
+              writeMode,
+              headers,
+              uploadProg,
+              getSkipGoldIfNoNewOcr()
+            );
             if (pipeResult.ok) {
               const gr =
                 pipeResult.result &&
@@ -568,11 +604,35 @@
         return o;
       }
 
+      function syncSkipGoldIfNoNewOcrCheckboxes() {
+        var u = document.getElementById("skip_gold_if_no_new_ocr_upload");
+        var m = document.getElementById("skip_gold_if_no_new_ocr_manual");
+        if (!u || !m) return;
+        u.addEventListener("change", function () {
+          m.checked = u.checked;
+        });
+        m.addEventListener("change", function () {
+          u.checked = m.checked;
+        });
+      }
+      syncSkipGoldIfNoNewOcrCheckboxes();
+
+      function getSkipGoldIfNoNewOcr() {
+        var m = document.getElementById("skip_gold_if_no_new_ocr_manual");
+        if (m) return m.checked;
+        var u = document.getElementById("skip_gold_if_no_new_ocr_upload");
+        return u ? u.checked : true;
+      }
+
       /**
        * 後端一鍵 pipeline（async），以 job 輪詢進度，避免長時間佔用單一 HTTP。
        * 回傳 { ok, error?, step?, result? }
+       * @param skipGoldIfNoNewOcr 若為 true（預設），與後端預設相同：本次 Bronze 無新增時跳過銀／金層。
        */
-      async function runPipelineToGoldWithProgress(datasetId, writeMode, headers, progressUi) {
+      async function runPipelineToGoldWithProgress(datasetId, writeMode, headers, progressUi, skipGoldIfNoNewOcr) {
+        if (typeof skipGoldIfNoNewOcr === "undefined") {
+          skipGoldIfNoNewOcr = true;
+        }
         const h = Object.assign({ "Content-Type": "application/json" }, headers);
         const pollH = authHeadersForJobPoll(headers);
 
@@ -589,6 +649,7 @@
             coalesce_partitions: 1,
             dry_run: false,
             async: true,
+            skip_gold_if_no_new_ocr: skipGoldIfNoNewOcr,
           }),
         });
         const submitTxt = await submitRes.text();
@@ -922,7 +983,13 @@
         note.textContent = "一鍵金層執行中，請看上方進度條與步驟說明。";
         btnPipe.disabled = true;
         try {
-          const result = await runPipelineToGoldWithProgress(datasetId, writeMode, headers, manualProg);
+          const result = await runPipelineToGoldWithProgress(
+            datasetId,
+            writeMode,
+            headers,
+            manualProg,
+            getSkipGoldIfNoNewOcr()
+          );
           if (!result.ok) {
             note.className = "small text-danger mt-2 mb-0";
             const stepPart = result.step > 0 ? "（第 " + result.step + " 步）" : "";

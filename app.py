@@ -35,6 +35,7 @@ from services.minio_upload import (
     normalize_dataset_id,
     upload_file_bytes,
 )
+from services.readiness import build_ready_payload, resolve_include_spark
 from services.async_jobs import job_registry, job_to_public_dict
 from services.etl_metrics import append_etl_metric, read_etl_metrics
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
@@ -59,6 +60,7 @@ from services.spark_service import (
     run_silver_ocr_etl,
     run_gold_word_frequency_etl,
     run_gold_topic_snapshot_rebuild_etl,
+    delete_gold_topic_snapshot_rows,
 )
 
 app = Flask(__name__)
@@ -426,6 +428,21 @@ def _handle_unexpected_error(e: Exception):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """
+    依賴就緒檢查（JSON）。預設只驗證 MinIO；Spark 需 ?spark=true 或 READY_CHECK_INCLUDE_SPARK。
+    失敗時 HTTP 503，成功 200。（與輕量 GET /health 分離，避免探針每秒打重檢查。）
+    """
+    include_spark = resolve_include_spark(request.args.get("spark"))
+    overall, body = build_ready_payload(
+        include_spark=include_spark,
+        get_spark=lambda: _get_spark_manager().spark,
+    )
+    code = 200 if overall == "ok" else 503
+    return jsonify(body), code
 
 
 def _safe_bronze_preview(
@@ -1488,6 +1505,84 @@ def delta_gold_topic_snapshot_rebuild():
         _logger.exception("gold_topic_snapshot_rebuild_failed")
         return _json_error(f"痛點快照重建失敗：{e}", 500)
     return jsonify({"status": "ok", **result})
+
+
+@app.post("/delta/gold/topic-snapshot/delete")
+def delta_gold_topic_snapshot_delete():
+    """
+    依 dataset_id + snapshot_at 刪除痛點快照列（Delta DELETE，請勿在 MinIO 手動刪 parquet）。
+
+    body 或查詢參數:
+      { "dataset_id": "drinks", "snapshot_at": "2026-04-17T12:33:00.123456", "dry_run": false }
+
+    snapshot_at 請使用首頁／layers 對照或 list_gold_topic_snapshots 回傳的 ISO 字串。
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        ("dataset_id", "snapshot_at", "dry_run"),
+    )
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    if not isinstance(dataset_raw, str) or not dataset_raw.strip():
+        return _json_error(
+            "dataset_id 必填。可在 JSON body 或查詢參數提供，例如 ?dataset_id=drinks",
+            400,
+        )
+    try:
+        dataset_id = normalize_dataset_id(dataset_raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    snap_raw = body.get("snapshot_at")
+    if not isinstance(snap_raw, str) or not str(snap_raw).strip():
+        return _json_error("snapshot_at 必填（ISO 時間字串）。", 400)
+
+    err = _validate_delta_path(GOLD_TOPIC_SNAPSHOT_PATH)
+    if err:
+        return err
+
+    dry_run = _body_get_bool(body, "dry_run", False)
+
+    _get_spark_manager()
+    started = time.perf_counter()
+    try:
+        result = delete_gold_topic_snapshot_rows(
+            dataset_id=dataset_id,
+            snapshot_at_iso=str(snap_raw).strip(),
+            dry_run=dry_run,
+        )
+        _record_etl_metric(
+            {
+                "etl_name": "gold_topic_snapshot_delete",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "deleted_rows": result.get("deleted_rows"),
+                "dry_run": dry_run,
+            }
+        )
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "gold_topic_snapshot_delete",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+            }
+        )
+        _logger.exception("gold_topic_snapshot_delete_failed")
+        return _json_error(f"痛點快照刪除失敗：{e}", 500)
+    code = 404 if result.get("status") == "not_found" else 200
+    return jsonify(result), code
 
 
 @app.post("/delta/pipeline/to-gold/run")

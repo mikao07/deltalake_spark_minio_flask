@@ -6,7 +6,7 @@ import threading
 import logging
 from datetime import datetime
 from urllib.parse import urlparse
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import psutil
 from pyspark import SparkFiles
@@ -1095,6 +1095,152 @@ def list_gold_topic_snapshots(
     except Exception as e:
         _logger.warning("topic_snapshot_collect_failed_list: %s", e)
         return []
+
+
+def _topic_snapshot_iso_from_cell(v: Any) -> str:
+    if v is None:
+        return ""
+    if hasattr(v, "isoformat"):
+        return str(v.isoformat())
+    return str(v)
+
+
+def _parse_user_snapshot_at_iso(user_iso: str) -> Optional[datetime]:
+    s = (user_iso or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _resolve_topic_snapshot_timestamp(
+    df: DataFrame,
+    ds: str,
+    user_iso: str,
+) -> Any:
+    """
+    由使用者提供的 ISO 字串（與 list_gold_topic_snapshots 回傳格式相容）對應到表內實際 snapshot_at 值。
+    """
+    df_f = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    rows = df_f.select("snapshot_at").distinct().collect()
+    user_stripped = user_iso.strip()
+    for r in rows:
+        v = r["snapshot_at"]
+        if v is None:
+            continue
+        if _topic_snapshot_iso_from_cell(v) == user_stripped:
+            return v
+    udt = _parse_user_snapshot_at_iso(user_stripped)
+    if udt is None:
+        return None
+    u_naive = udt.replace(tzinfo=None) if udt.tzinfo else udt
+    for r in rows:
+        v = r["snapshot_at"]
+        if v is None:
+            continue
+        if not isinstance(v, datetime):
+            continue
+        v_naive = v.replace(tzinfo=None) if v.tzinfo else v
+        if abs((v_naive - u_naive).total_seconds()) < 1.0:
+            return v
+    return None
+
+
+def delete_gold_topic_snapshot_rows(
+    *,
+    dataset_id: str,
+    snapshot_at_iso: str,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    依 dataset_id + snapshot_at 刪除痛點快照列（Delta DELETE，勿手動刪 MinIO 檔案）。
+    snapshot_at_iso 請使用 list_gold_topic_snapshots 或首頁對照所顯示的 ISO 字串。
+    """
+    spark = SparkManager().spark
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if not ds:
+        raise ValueError("dataset_id 必填")
+    raw_iso = (snapshot_at_iso or "").strip()
+    if not raw_iso:
+        raise ValueError("snapshot_at 必填（請使用列表 API 回傳的 ISO 時間字串）")
+
+    if not delta_table_exists(spark, path):
+        return {
+            "status": "noop",
+            "deleted_rows": 0,
+            "message": "痛點快照表不存在",
+            "dataset_id": ds,
+            "topic_snapshot_path": path,
+        }
+
+    df = read_delta_table(spark, path)
+    if "dataset_id" not in df.columns or "snapshot_at" not in df.columns:
+        raise ValueError("痛點快照表缺少 dataset_id 或 snapshot_at 欄位")
+
+    target_ts = _resolve_topic_snapshot_timestamp(df, ds, raw_iso)
+    if target_ts is None:
+        return {
+            "status": "not_found",
+            "deleted_rows": 0,
+            "message": "找不到符合的 snapshot_at（請使用列表 API 或首頁對照所顯示的 ISO 字串）",
+            "dataset_id": ds,
+            "topic_snapshot_path": path,
+        }
+
+    match_df = df.filter(trim(lower(col("dataset_id"))) == lit(ds)).filter(col("snapshot_at") == lit(target_ts))
+    to_delete = int(match_df.count())
+    resolved_iso = _topic_snapshot_iso_from_cell(target_ts)
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "deleted_rows": to_delete,
+            "dataset_id": ds,
+            "snapshot_at": resolved_iso,
+            "topic_snapshot_path": path,
+        }
+
+    if to_delete == 0:
+        return {
+            "status": "ok",
+            "deleted_rows": 0,
+            "message": "無列可刪",
+            "dataset_id": ds,
+            "snapshot_at": resolved_iso,
+            "topic_snapshot_path": path,
+        }
+
+    ds_esc = ds.replace("'", "''")
+    if isinstance(target_ts, datetime):
+        ts_sql = target_ts.strftime("%Y-%m-%d %H:%M:%S.%f")
+    else:
+        ts_sql = str(target_ts)
+    condition = (
+        f"trim(lower(cast(dataset_id as string))) = lower('{ds_esc}') "
+        f"AND snapshot_at = cast('{ts_sql}' as timestamp)"
+    )
+    DeltaTable.forPath(spark, path).delete(condition)
+    _logger.info(
+        "topic_snapshot_deleted: dataset_id=%s snapshot_at=%s rows=%s path=%s",
+        ds,
+        resolved_iso,
+        to_delete,
+        path,
+    )
+
+    return {
+        "status": "ok",
+        "deleted_rows": to_delete,
+        "dataset_id": ds,
+        "snapshot_at": resolved_iso,
+        "topic_snapshot_path": path,
+        "message": f"已刪除 {to_delete} 列",
+    }
 
 
 def get_gold_topic_snapshot_comparison(

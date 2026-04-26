@@ -53,6 +53,62 @@
         </div>
       </form>
 
+      <div class="card shadow-sm mb-4 border-start border-4 border-warning">
+        <div class="card-body py-3">
+          <h2 class="h6 mb-2">刪除痛點快照（Delta 刪列）</h2>
+          <p class="small text-muted mb-3">
+            刪除<strong>一個</strong> <code>snapshot_at</code> 批次（該 dataset 下該時間點的主題列）。需後端已設定之
+            <code>X-Admin-Token</code>。請勿在 MinIO 手動刪 parquet。
+          </p>
+          {% if selected_dataset_id %}
+            <div class="row g-2 align-items-end">
+              <div class="col-12 col-md-3">
+                <label class="form-label mb-1 small" for="topic-snap-del-token">管理 Token</label>
+                <input
+                  type="password"
+                  class="form-control form-control-sm"
+                  id="topic-snap-del-token"
+                  autocomplete="off"
+                  placeholder="與 ADMIN_TOKEN 相同"
+                />
+              </div>
+              <div class="col-12 col-md-5">
+                <label class="form-label mb-1 small" for="topic-snap-del-select">要刪除的快照時間（snapshot_at）</label>
+                <select class="form-select form-select-sm" id="topic-snap-del-select" {% if not topic_snapshot_options %}disabled{% endif %}>
+                  <option value="">— 請選擇 —</option>
+                  {% for snap in topic_snapshot_options %}
+                    <option value="{{ snap }}">{{ snap }}</option>
+                  {% endfor %}
+                </select>
+                {% if not topic_snapshot_options %}
+                  <div class="form-text">此 dataset 尚無快照，無法刪除。</div>
+                {% endif %}
+              </div>
+              <div class="col-12 col-md-4 d-flex flex-wrap gap-2 align-items-center">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="topic-snap-del-btn-dry" {% if not topic_snapshot_options %}disabled{% endif %}>
+                  試算（dry run）
+                </button>
+                <button type="button" class="btn btn-sm btn-danger" id="topic-snap-del-btn-go" {% if not topic_snapshot_options %}disabled{% endif %}>
+                  確認刪除
+                </button>
+              </div>
+            </div>
+            <p class="small text-secondary mb-0 mt-2">
+              套用 dataset：<code id="topic-snap-del-dataset">{{ selected_dataset_id }}</code>（與上方篩選相同）
+            </p>
+            <pre
+              class="small bg-white border rounded p-2 mt-2 mb-0 d-none text-break"
+              id="topic-snap-del-result"
+              style="max-height: 200px; overflow: auto"
+            ></pre>
+          {% else %}
+            <p class="small text-warning mb-0">
+              請先在上方選擇 <strong>dataset_id</strong>（勿選「全部資料」）並按「切換圖表」，此區會列出可刪除的快照時間。
+            </p>
+          {% endif %}
+        </div>
+      </div>
+
       <div class="row g-3 mb-4">
         <div class="col-12 col-md-6">
           <div class="card shadow-sm h-100">
@@ -413,6 +469,67 @@
               },
             });
           }
+        })();
+      </script>
+    {% endif %}
+    {% if selected_dataset_id %}
+      <script>
+        (function () {
+          var ds = {{ selected_dataset_id|tojson }};
+          var sel = document.getElementById("topic-snap-del-select");
+          var tok = document.getElementById("topic-snap-del-token");
+          var out = document.getElementById("topic-snap-del-result");
+          var btnDry = document.getElementById("topic-snap-del-btn-dry");
+          var btnGo = document.getElementById("topic-snap-del-btn-go");
+          if (!sel || !out) return;
+
+          function showResult(text) {
+            out.classList.remove("d-none");
+            out.textContent = text;
+          }
+
+          function run(dry) {
+            var snap = (sel.value || "").trim();
+            if (!snap) {
+              alert("請選擇要刪除的 snapshot_at。");
+              return;
+            }
+            var headers = { "Content-Type": "application/json" };
+            if (tok && tok.value.trim()) headers["X-Admin-Token"] = tok.value.trim();
+            fetch("/delta/gold/topic-snapshot/delete", {
+              method: "POST",
+              headers: headers,
+              body: JSON.stringify({ dataset_id: ds, snapshot_at: snap, dry_run: dry }),
+            })
+              .then(function (r) {
+                return r.text().then(function (t) {
+                  return { ok: r.ok, status: r.status, t: t };
+                });
+              })
+              .then(function (x) {
+                var j;
+                try {
+                  j = JSON.parse(x.t);
+                } catch (e) {
+                  showResult(x.t || String(x.status));
+                  return;
+                }
+                showResult(JSON.stringify(j, null, 2));
+                if (x.status === 401) {
+                  alert("需要正確的 X-Admin-Token（與環境變數 ADMIN_TOKEN 相同）。");
+                }
+              })
+              .catch(function (e) {
+                showResult(String(e));
+              });
+          }
+
+          if (btnDry) btnDry.addEventListener("click", function () { run(true); });
+          if (btnGo)
+            btnGo.addEventListener("click", function () {
+              if (!confirm("確定要刪除此快照批次？此操作無法還原。")) return;
+              run(false);
+            });
         })();
       </script>
     {% endif %}

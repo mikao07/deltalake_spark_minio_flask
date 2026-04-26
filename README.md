@@ -21,11 +21,12 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **Bronze**：`raw/images/{dataset_id}/` 影像 → OCR（Tesseract）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入；讀檔時限圖片副檔名與檔頭（非圖片不進 OCR）。
 - **Silver**：OCR 文字去重、MERGE 至 `SILVER_OCR_TABLE_PATH`。
 - **Gold**：Jieba 分詞、自訂辭典／停用詞（可依 `dataset_id` 綁定路徑）、詞頻表；**痛點主題**（規則式）寫入 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表（可對照多個 `snapshot_at`）。
-- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。
+- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**上傳頁** `/upload` 有同名勾選（預設開啟），與 API 欄位對應；上傳區與「手動一鍵」兩處會互相同步。
 
 ### 功能（API 摘要）
 
-- **健康檢查**：`GET /health`
+- **健康檢查（輕量，存活探針）**：`GET /health`
+- **就緒／依賴檢查（JSON，MinIO；可選 Spark）**：`GET /ready`（可選查詢 `spark=true`；或環境變數 `READY_CHECK_INCLUDE_SPARK`；失敗時 HTTP 503）
 - **系統狀態**：`GET /api/status`
 - **Delta 預覽**：`POST /delta/read`（路徑須符合 `ALLOWED_DELTA_PATH_PREFIXES`）
 - **Delta Upsert**：`POST /delta/upsert`（需 `ADMIN_TOKEN` 時帶 `X-Admin-Token`）
@@ -34,7 +35,8 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **Gold 詞頻預覽**：`GET /api/gold/word-frequency`
 - **金層詞頻 ETL**（Silver→Gold）：`POST /delta/gold/word-frequency/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
 - **痛點快照僅重建**（不寫詞頻表）：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
-- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`
+- **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）
+- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見上傳頁說明）
 - **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
 - **Silver OCR ETL**：`POST /delta/silver/ocr/run`
 - **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`；`MAX_UPLOAD_MB` 限制大小）
@@ -91,7 +93,10 @@ python .\app.py
 ```
 
 預設：`http://127.0.0.1:5000`  
+首頁 Dashboard：`http://127.0.0.1:5000/`（選定 `dataset_id` 後可使用 **刪除痛點快照** 區塊，呼叫 `POST /delta/gold/topic-snapshot/delete`）  
 上傳頁：`http://127.0.0.1:5000/upload`
+
+**上傳頁（一鍵金層）**：勾選「上傳後一鍵跑到金層」或按「一鍵跑到金層」時，可一併使用 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合只更新停用詞或自訂辭典路徑後要重算詞頻。行為等同 API 的 `skip_gold_if_no_new_ocr`：`true` ＝無新 OCR 時略過後段，`false` ＝仍跑完整管線。
 
 ---
 
