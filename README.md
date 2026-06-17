@@ -19,8 +19,9 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 ### 資料管線（摘要）
 
 - **Bronze**：`raw/images/{dataset_id}/` 影像 → OCR（Tesseract）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入；讀檔時限圖片副檔名與檔頭（非圖片不進 OCR）。
-- **Silver**：OCR 文字去重、MERGE 至 `SILVER_OCR_TABLE_PATH`。
-- **Gold**：Jieba 分詞、自訂辭典／停用詞（可依 `dataset_id` 綁定路徑）、詞頻表；**痛點主題**（規則式）寫入 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表（可對照多個 `snapshot_at`）。
+- **Silver**：OCR 文字去重、MERGE 至 `SILVER_OCR_TABLE_PATH`；**Jieba 分詞 + 內建停用詞**（了、是、這等）產出 `tokens` 欄位，無需人工維護辭典檔。
+- **Gold**：優先讀取銀層 `tokens` 做詞頻與痛點主題；舊銀層表無 `tokens` 時退回金層 Jieba。可選自訂辭典／外部停用詞（依 `dataset_id` 路徑）；**痛點主題**寫入 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表。
+- **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
 - **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**上傳頁** `/upload` 有同名勾選（預設開啟），與 API 欄位對應；上傳區與「手動一鍵」兩處會互相同步。
 
 ### 功能（API 摘要）
@@ -33,6 +34,8 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **僅保留最新批次**：`POST /delta/cleanup-latest-only`（同上）
 - **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`
 - **Gold 詞頻預覽**：`GET /api/gold/word-frequency`
+- **TF-IDF 痛點候選（Phase A）**：`GET /api/gold/tfidf-keywords`
+- **PMI 片語候選（Phase B）**：`GET /api/gold/phrase-candidates`
 - **金層詞頻 ETL**（Silver→Gold）：`POST /delta/gold/word-frequency/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
 - **痛點快照僅重建**（不寫詞頻表）：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
 - **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）

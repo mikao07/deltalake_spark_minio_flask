@@ -15,27 +15,34 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col,
     collect_set,
+    concat,
     count,
+    countDistinct,
     current_timestamp,
     explode,
     expr,
     length,
     lit,
+    log as spark_log,
     lower,
     max as spark_max,
     regexp_extract,
     regexp_replace,
     row_number,
+    size,
+    sum as spark_sum,
     trim,
     to_timestamp,
     udf,
 )
-from pyspark.sql.types import ArrayType, StringType
+from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
 from config import (
     BRONZE_TABLE_PATH,
+    GOLD_TFIDF_KEYWORDS_PATH,
+    GOLD_PHRASE_CANDIDATES_PATH,
     GOLD_TOPIC_SNAPSHOT_PATH,
     GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE,
     GOLD_WORD_COUNT_PATH,
@@ -53,6 +60,7 @@ from config import (
     S3A_PATH_STYLE_ACCESS,
     SILVER_OCR_TABLE_PATH,
 )
+from services.text_tokens import BUILTIN_STOPWORDS
 
 _logger = logging.getLogger(__name__)
 
@@ -267,6 +275,9 @@ def _extract_dataset_id_col(df: DataFrame) -> DataFrame:
     return df.withColumn("dataset_id", regexp_extract(col("image_path"), r"/raw/images/([^/]+)/", 1))
 
 
+_silver_tokens_udf_cache: dict[str, Any] = {}
+
+
 def build_silver_ocr_updates_from_bronze(
     df_bronze: DataFrame,
     *,
@@ -275,6 +286,7 @@ def build_silver_ocr_updates_from_bronze(
     """
     Bronze OCR -> Silver 更新集（去重、清洗）。
     清洗僅做 trim：勿使用 Java \\W 剝除首尾，否則中文正文會被當成「非文字」而整段清空。
+    分詞與停用詞在 enrich_silver_dataframe_with_tokens 產出 tokens 欄位。
     """
     ds = _normalize_dataset_id_or_none(dataset_id)
     df = df_bronze.filter(col("extracted_text").isNotNull())
@@ -303,6 +315,96 @@ def build_silver_ocr_updates_from_bronze(
     return df
 
 
+def _make_silver_tokens_udf(
+    jieba_userdict_path: str | None = None,
+    extra_stopwords: Iterable[str] | None = None,
+    dataset_id_for_log: str | None = None,
+):
+    userdict_basename = ""
+    if jieba_userdict_path and str(jieba_userdict_path).strip():
+        userdict_basename = os.path.basename(str(jieba_userdict_path).strip())
+    extra_list = sorted(
+        {str(w).strip().lower() for w in (extra_stopwords or []) if str(w).strip()}
+    )
+
+    def tokens_from_text(text):
+        if not hasattr(tokens_from_text, "_jieba_initialized"):
+            tokens_from_text._jieba_initialized = False
+            tokens_from_text._userdict_loaded = False
+            tokens_from_text._userdict_error_logged = False
+
+        try:
+            import jieba
+            from services.text_tokens import segment_text_to_tokens
+
+            if not tokens_from_text._jieba_initialized:
+                jieba.initialize()
+                tokens_from_text._jieba_initialized = True
+
+            userdict_local = None
+            if userdict_basename and not tokens_from_text._userdict_loaded:
+                try:
+                    userdict_local = SparkFiles.get(userdict_basename)
+                    jieba.load_userdict(userdict_local)
+                    tokens_from_text._userdict_loaded = True
+                except Exception as e:
+                    if not tokens_from_text._userdict_error_logged:
+                        _logger.warning(
+                            "silver_tokens_userdict_load_failed_once: dataset_id=%s path=%s error=%s",
+                            dataset_id_for_log,
+                            jieba_userdict_path,
+                            e,
+                        )
+                        tokens_from_text._userdict_error_logged = True
+
+            return segment_text_to_tokens(
+                text,
+                userdict_local_path=None,
+                extra_stopwords=extra_list,
+                apply_noise_filter=True,
+            )
+        except Exception as e:
+            _logger.warning("silver_tokens_udf_failed_once: %s", e)
+            return []
+
+    return udf(tokens_from_text, ArrayType(StringType()))
+
+
+def _get_silver_tokens_udf(
+    jieba_userdict_path: str | None = None,
+    extra_stopwords: Iterable[str] | None = None,
+    dataset_id_for_log: str | None = None,
+):
+    extra_key = ",".join(sorted({str(w).strip().lower() for w in (extra_stopwords or []) if str(w).strip()}))
+    cache_key = f"{str(jieba_userdict_path or '').strip()}|{extra_key}|{str(dataset_id_for_log or '').strip()}"
+    existing = _silver_tokens_udf_cache.get(cache_key)
+    if existing is not None:
+        return existing
+    created = _make_silver_tokens_udf(
+        jieba_userdict_path if str(jieba_userdict_path or "").strip() else None,
+        extra_stopwords=extra_stopwords,
+        dataset_id_for_log=dataset_id_for_log,
+    )
+    _silver_tokens_udf_cache[cache_key] = created
+    return created
+
+
+def enrich_silver_dataframe_with_tokens(
+    df: DataFrame,
+    *,
+    jieba_userdict_path: str | None = None,
+    extra_stopwords: Iterable[str] | None = None,
+    dataset_id_for_log: str | None = None,
+) -> DataFrame:
+    """Silver：Jieba 分詞 + 內建／外部停用詞，寫入 tokens 陣列欄位。"""
+    tokens_udf = _get_silver_tokens_udf(
+        jieba_userdict_path,
+        extra_stopwords=extra_stopwords,
+        dataset_id_for_log=dataset_id_for_log,
+    )
+    return df.withColumn("tokens", tokens_udf(col("extracted_text")))
+
+
 def run_silver_ocr_etl(
     *,
     bronze_path: str | None = None,
@@ -310,7 +412,7 @@ def run_silver_ocr_etl(
     dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Bronze OCR -> Silver OCR（去重/清洗/MERGE）.
+    Bronze OCR -> Silver OCR（去重、清洗、分詞 tokens、MERGE）。
     """
     spark = SparkManager().spark
     bronze = bronze_path or BRONZE_TABLE_PATH
@@ -319,6 +421,26 @@ def run_silver_ocr_etl(
 
     df_bronze = read_delta_table(spark, bronze)
     df_updates = build_silver_ocr_updates_from_bronze(df_bronze, dataset_id=ds)
+
+    active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
+    register_jieba_pyfile_if_needed(
+        spark,
+        JIEBA_ZIP_PATH,
+        active_userdict_path,
+        dataset_id=ds,
+    )
+    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
+    extra_stopwords: List[str] = []
+    if active_stopwords_path:
+        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+
+    df_updates = enrich_silver_dataframe_with_tokens(
+        df_updates,
+        jieba_userdict_path=active_userdict_path,
+        extra_stopwords=extra_stopwords,
+        dataset_id_for_log=ds,
+    )
+
     update_count_raw = int(df_updates.count())
     if update_count_raw == 0:
         return {
@@ -329,6 +451,8 @@ def run_silver_ocr_etl(
             "dataset_id": ds,
             "silver_ocr_path": silver,
             "bronze_path": bronze,
+            "tokens_column_written": True,
+            "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         }
 
     batch_ts = datetime.utcnow()
@@ -344,6 +468,9 @@ def run_silver_ocr_etl(
             col("source_bucket").alias("_t_source_bucket"),
             col("ingestion_timestamp").alias("_t_ingestion_timestamp"),
             col("dataset_id").alias("_t_dataset_id") if "dataset_id" in target_cols else lit(None).alias("_t_dataset_id"),
+            col("tokens").alias("_t_tokens")
+            if "tokens" in target_cols
+            else lit(None).cast(ArrayType(StringType())).alias("_t_tokens"),
         )
         df_cmp = df_updates.alias("u").join(
             df_target_cmp.alias("t"),
@@ -362,6 +489,12 @@ def run_silver_ocr_etl(
             & (col("u.latest_ingestion_timestamp") == col("t._t_ingestion_timestamp"))
             & same_dataset_expr
         )
+        if "tokens" in target_cols:
+            tokens_stale = col("t._t_tokens").isNull() | (size(col("t._t_tokens")) == 0)
+            unchanged_expr = unchanged_expr & (~tokens_stale)
+        else:
+            # 舊 Silver 表尚無 tokens 欄位：本次 MERGE 需寫入分詞結果
+            unchanged_expr = lit(False)
         df_changes = df_cmp.filter(~unchanged_expr).select("u.*")
         update_count = int(df_changes.count())
         if update_count == 0:
@@ -381,6 +514,7 @@ def run_silver_ocr_etl(
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
             "etl_update_timestamp": batch_ts_lit,
+            "tokens": col("source.tokens"),
         }
         insert_values = {
             "image_path": col("source.image_path"),
@@ -388,6 +522,7 @@ def run_silver_ocr_etl(
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
             "etl_update_timestamp": batch_ts_lit,
+            "tokens": col("source.tokens"),
         }
         # 舊 Silver 表可能尚未有 dataset_id，避免 MERGE 直接失敗
         if "dataset_id" in target_cols:
@@ -420,55 +555,25 @@ def run_silver_ocr_etl(
         "dataset_id": ds,
         "silver_ocr_path": silver,
         "bronze_path": bronze,
+        "tokens_column_written": True,
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
+        "jieba_userdict_used": bool(active_userdict_path),
+        "jieba_userdict_path": active_userdict_path or "",
+        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_path": active_stopwords_path or "",
+        "stopwords_count": len(extra_stopwords),
     }
 
 
 # ---------------------------------------------------------------------------
-# Gold 層：Silver OCR → Jieba 分詞 → 詞頻 → Delta（對齊 MinIO_DeltaLake_Spark_1.1.ipynb）
+# Gold 層：優先讀銀層 tokens → 詞頻／痛點主題；無 tokens 時退回 Jieba 分詞
 # ---------------------------------------------------------------------------
 _jieba_pyfile_registered: str | None = None
 _jieba_userdict_registered: str | None = None
 _jieba_segment_udf_cache: dict[str, Any] = {}
 
-# Notebook「淨化後詞頻」步驟的雜訊與長度規則
-_FINAL_NOISE = [
-    "個",
-    "月",
-    "前",
-    "是",
-    "的",
-    "跟",
-    "到",
-    "會",
-    "有",
-    "很",
-    "和",
-    "也",
-    "先生",
-    "這",
-    "們",
-    "並",
-]
-_COMMON_NOISE = _FINAL_NOISE + [
-    "：",
-    "，",
-    "。",
-    "、",
-    "(",
-    ")",
-    "-",
-    "+",
-    "img",
-    "png",
-    "html",
-    "the",
-    "a",
-    "b",
-    "c",
-    "x",
-    "ok",
-    "aer",
-]
+# 與 services.text_tokens.BUILTIN_STOPWORDS 對齊（金層 fallback 分詞時使用）
+_COMMON_NOISE = sorted(BUILTIN_STOPWORDS)
 _MIN_WORD_LENGTH = 2
 _TOPIC_RULE_VERSION = "v1.1"
 
@@ -671,6 +776,8 @@ def get_dictionary_usage_status(
         "stopwords_used": bool(stopwords_path),
         "stopwords_path": stopwords_path or "",
         "stopwords_count": stopwords_count,
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
+        "silver_tokenization": "jieba_with_builtin_stopwords",
     }
 
 
@@ -786,6 +893,24 @@ def _build_filtered_keyword_exploded_dataframe(
     apply_noise_filter: bool = True,
     extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
+    """
+    產出 (image_path, keyword) 列：優先使用銀層 tokens；舊表無 tokens 時退回金層 Jieba 分詞。
+    """
+    if "tokens" in df_silver_ocr.columns:
+        df_keywords_exploded = (
+            df_silver_ocr.select("image_path", explode(col("tokens")).alias("keyword"))
+            .filter(col("keyword").isNotNull() & (col("keyword") != ""))
+        )
+        if not apply_noise_filter:
+            return df_keywords_exploded
+        noise_terms = sorted(set(_COMMON_NOISE) | set(extra_stopwords or []))
+        return df_keywords_exploded.filter(
+            (length(col("keyword")) >= _MIN_WORD_LENGTH)
+            & (~col("keyword").rlike("^[0-9]+$"))
+            & (~col("keyword").rlike("^[a-z]{1,2}$"))
+            & (~col("keyword").isin(noise_terms))
+        )
+
     df_keywords = df_silver_ocr.withColumn(
         "cleaned_text",
         lower(regexp_replace(col("extracted_text"), r"[^\p{L}\p{N}\s_]", "")),
@@ -838,6 +963,223 @@ def build_gold_word_frequency_dataframe(
         .agg(count("*").alias("frequency"))
         .orderBy(col("frequency").desc())
     )
+
+
+_BIGRAM_PAIR_SCHEMA = ArrayType(
+    StructType(
+        [
+            StructField("word1", StringType(), False),
+            StructField("word2", StringType(), False),
+        ]
+    )
+)
+
+
+def _bigrams_from_token_list(tokens) -> List[Dict[str, str]]:
+    if not tokens:
+        return []
+    safe = [str(t).strip().lower() for t in tokens if str(t).strip()]
+    return [{"word1": safe[i], "word2": safe[i + 1]} for i in range(len(safe) - 1)]
+
+
+_bigram_from_tokens_udf = udf(_bigrams_from_token_list, _BIGRAM_PAIR_SCHEMA)
+
+
+def build_gold_tfidf_keywords_dataframe(df_exploded: DataFrame) -> DataFrame:
+    """
+    Phase A：由 (image_path, keyword) 計算語料級 TF-IDF，找出具區分力的痛點候選詞。
+    """
+    empty_schema = (
+        "keyword STRING, total_tf LONG, doc_frequency LONG, corpus_doc_count LONG, "
+        "idf DOUBLE, tfidf_score DOUBLE"
+    )
+    spark = df_exploded.sparkSession
+    if df_exploded.limit(1).count() == 0:
+        return spark.createDataFrame([], empty_schema)
+
+    corpus_doc_count = int(df_exploded.select("image_path").distinct().count())
+    if corpus_doc_count <= 0:
+        return spark.createDataFrame([], empty_schema)
+
+    df_tf = df_exploded.groupBy("image_path", "keyword").agg(count("*").alias("tf"))
+    df_stats = df_tf.groupBy("keyword").agg(
+        spark_sum("tf").alias("total_tf"),
+        countDistinct("image_path").alias("doc_frequency"),
+    )
+    n_lit = lit(float(corpus_doc_count))
+    return (
+        df_stats.withColumn("corpus_doc_count", lit(corpus_doc_count))
+        .withColumn("idf", spark_log((n_lit + lit(1.0)) / (col("doc_frequency").cast("double") + lit(1.0))))
+        .withColumn("tfidf_score", col("total_tf").cast("double") * col("idf"))
+        .orderBy(col("tfidf_score").desc(), col("total_tf").desc())
+    )
+
+
+def build_gold_phrase_candidates_dataframe(
+    df_silver: DataFrame,
+    *,
+    min_bigram_count: int = 2,
+) -> DataFrame:
+    """
+    Phase B：由銀層 tokens 相鄰 bigram 計算 PMI，發現應視為片語的候選（如「珍珠 奶茶」）。
+    """
+    spark = df_silver.sparkSession
+    empty_schema = (
+        "word1 STRING, word2 STRING, phrase STRING, bigram_count LONG, "
+        "pmi_score DOUBLE, total_bigrams LONG"
+    )
+    if "tokens" not in df_silver.columns:
+        _logger.warning("phrase_pmi_skipped: silver_missing_tokens_column")
+        return spark.createDataFrame([], empty_schema)
+
+    df_pairs = (
+        df_silver.filter(col("tokens").isNotNull() & (size(col("tokens")) >= lit(2)))
+        .select(explode(_bigram_from_tokens_udf(col("tokens"))).alias("pair"))
+        .select(col("pair.word1").alias("word1"), col("pair.word2").alias("word2"))
+        .filter(col("word1") != "")
+        .filter(col("word2") != "")
+    )
+    if not df_pairs.limit(1).count():
+        return spark.createDataFrame([], empty_schema)
+
+    df_counts = df_pairs.groupBy("word1", "word2").agg(count("*").alias("bigram_count"))
+    total_row = df_counts.agg(spark_sum("bigram_count").alias("total")).collect()
+    total_bigrams = int(total_row[0]["total"] or 0) if total_row else 0
+    if total_bigrams <= 0:
+        return spark.createDataFrame([], empty_schema)
+
+    w1 = df_counts.groupBy("word1").agg(spark_sum("bigram_count").alias("w1_count"))
+    w2 = df_counts.groupBy("word2").agg(spark_sum("bigram_count").alias("w2_count"))
+    joined = (
+        df_counts.join(w1, "word1")
+        .join(w2, "word2")
+        .withColumn("total_bigrams", lit(total_bigrams))
+        .filter(col("bigram_count") >= lit(max(1, int(min_bigram_count))))
+    )
+    total_lit = col("total_bigrams").cast("double")
+    p_xy = col("bigram_count").cast("double") / total_lit
+    p_x = col("w1_count").cast("double") / total_lit
+    p_y = col("w2_count").cast("double") / total_lit
+    return (
+        joined.withColumn("phrase", concat(col("word1"), lit(" "), col("word2")))
+        .withColumn("pmi_score", spark_log(p_xy / (p_x * p_y)))
+        .select("word1", "word2", "phrase", "bigram_count", "pmi_score", "total_bigrams")
+        .orderBy(col("pmi_score").desc(), col("bigram_count").desc())
+    )
+
+
+def _write_gold_dataset_scoped_table(
+    spark: SparkSession,
+    df: DataFrame,
+    path: str,
+    dataset_id: str | None,
+    *,
+    coalesce_partitions: int = 1,
+) -> int:
+    """依 dataset_id 刪除舊列後 append；無 dataset_id 時整表 overwrite。"""
+    out = df.withColumn("analyzed_at", current_timestamp())
+    if dataset_id:
+        out = out.withColumn("dataset_id", lit(dataset_id))
+    out = out if coalesce_partitions <= 0 else out.coalesce(coalesce_partitions)
+    row_count = int(out.count())
+    if row_count <= 0:
+        return 0
+    if dataset_id and delta_table_exists(spark, path):
+        DeltaTable.forPath(spark, path).delete(condition=f"dataset_id = '{dataset_id}'")
+        out.write.format("delta").mode("append").save(path)
+    elif dataset_id:
+        out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(path)
+    else:
+        out.write.format("delta").option("overwriteSchema", "true").mode("overwrite").save(path)
+    return row_count
+
+
+def run_gold_corpus_analytics_etl(
+    df_silver: DataFrame,
+    *,
+    dataset_id: str | None = None,
+    jieba_userdict_path: str | None = None,
+    apply_noise_filter: bool = True,
+    extra_stopwords: Iterable[str] | None = None,
+    coalesce_partitions: int = 1,
+    min_bigram_count: int = 2,
+    tfidf_path: str | None = None,
+    phrase_path: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Phase A（TF-IDF）+ Phase B（PMI 片語）並寫入 Gold Delta。
+    """
+    spark = df_silver.sparkSession
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    tfidf_out = tfidf_path or GOLD_TFIDF_KEYWORDS_PATH
+    phrase_out = phrase_path or GOLD_PHRASE_CANDIDATES_PATH
+
+    df_exploded = _build_filtered_keyword_exploded_dataframe(
+        df_silver,
+        dataset_id_for_log=ds,
+        jieba_userdict_path=jieba_userdict_path,
+        apply_noise_filter=apply_noise_filter,
+        extra_stopwords=extra_stopwords,
+    )
+    df_tfidf = build_gold_tfidf_keywords_dataframe(df_exploded)
+    df_phrases = build_gold_phrase_candidates_dataframe(df_silver, min_bigram_count=min_bigram_count)
+
+    tfidf_rows = _write_gold_dataset_scoped_table(
+        spark, df_tfidf, tfidf_out, ds, coalesce_partitions=coalesce_partitions
+    )
+    phrase_rows = _write_gold_dataset_scoped_table(
+        spark, df_phrases, phrase_out, ds, coalesce_partitions=coalesce_partitions
+    )
+    tfidf_top = [row.asDict() for row in df_tfidf.limit(10).collect()]
+    phrase_top = [row.asDict() for row in df_phrases.limit(10).collect()]
+
+    return {
+        "tfidf_output_rows": tfidf_rows,
+        "phrase_candidate_rows": phrase_rows,
+        "tfidf_path": tfidf_out,
+        "phrase_candidates_path": phrase_out,
+        "tfidf_top": tfidf_top,
+        "phrase_top": phrase_top,
+        "corpus_doc_count": int(df_silver.select("image_path").distinct().count()) if df_silver.head(1) else 0,
+    }
+
+
+def get_gold_tfidf_keywords_data(
+    limit: int = 15,
+    dataset_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = GOLD_TFIDF_KEYWORDS_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    df = read_delta_table(spark, path)
+    if ds and "dataset_id" in df.columns:
+        df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    return [
+        row.asDict(recursive=True)
+        for row in df.orderBy(col("tfidf_score").desc_nulls_last()).limit(lim).collect()
+    ]
+
+
+def get_gold_phrase_candidates_data(
+    limit: int = 15,
+    dataset_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = GOLD_PHRASE_CANDIDATES_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    df = read_delta_table(spark, path)
+    if ds and "dataset_id" in df.columns:
+        df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    return [
+        row.asDict(recursive=True)
+        for row in df.orderBy(col("pmi_score").desc_nulls_last()).limit(lim).collect()
+    ]
 
 
 def _make_topic_label_udf():
@@ -1541,6 +1883,29 @@ def run_gold_word_frequency_etl(
     else:
         summary = "金層流程有執行，但 Silver 篩選後為 0 筆，所以沒有可寫入的金層資料。"
 
+    corpus_analytics: Dict[str, Any] = {
+        "tfidf_output_rows": 0,
+        "phrase_candidate_rows": 0,
+        "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+        "phrase_candidates_path": GOLD_PHRASE_CANDIDATES_PATH,
+        "tfidf_top": [],
+        "phrase_top": [],
+        "corpus_doc_count": 0,
+    }
+    if silver_filtered_rows > 0:
+        try:
+            corpus_analytics = run_gold_corpus_analytics_etl(
+                df_silver,
+                dataset_id=ds,
+                jieba_userdict_path=active_userdict_path,
+                apply_noise_filter=apply_noise_filter,
+                extra_stopwords=extra_stopwords if apply_noise_filter else None,
+                coalesce_partitions=coalesce_partitions,
+            )
+        except Exception as e:
+            _logger.exception("gold_corpus_analytics_failed")
+            corpus_analytics["error"] = str(e)
+
     return {
         "silver_filtered_rows": silver_filtered_rows,
         "gold_output_rows": gold_output_rows,
@@ -1551,6 +1916,12 @@ def run_gold_word_frequency_etl(
         "stopwords_used": bool(active_stopwords_path),
         "stopwords_path": active_stopwords_path or "",
         "stopwords_count": len(extra_stopwords),
+        "silver_tokens_source": (
+            "silver_tokens_column"
+            if "tokens" in df_silver.columns
+            else "gold_jieba_fallback"
+        ),
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "topic_output_rows": topic_output_rows,
         "topic_snapshot_rows": topic_snapshot_rows,
         "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
@@ -1559,6 +1930,7 @@ def run_gold_word_frequency_etl(
         "is_gold_written": gold_output_rows > 0,
         "gold_recompute_mode": mode_used,
         "summary": summary,
+        **corpus_analytics,
     }
 
 

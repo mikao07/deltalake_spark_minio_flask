@@ -59,6 +59,18 @@ GOLD_TOPIC_SNAPSHOT_PATH = os.getenv(
     f"s3a://{BUCKET_NAME}/gold/topic_snapshot/",
 )
 
+# Gold：TF-IDF 痛點候選詞（Phase A）
+GOLD_TFIDF_KEYWORDS_PATH = os.getenv(
+    "GOLD_TFIDF_KEYWORDS_PATH",
+    f"s3a://{BUCKET_NAME}/gold/tfidf_keywords/",
+)
+
+# Gold：PMI 片語候選（Phase B）
+GOLD_PHRASE_CANDIDATES_PATH = os.getenv(
+    "GOLD_PHRASE_CANDIDATES_PATH",
+    f"s3a://{BUCKET_NAME}/gold/phrase_candidates/",
+)
+
 # 寫入痛點快照表後是否強制讀取驗證（不啟用 ignoreMissingFiles，避免元資料與 parquet 不一致仍回報成功）
 _GOLD_TOPIC_SNAPSHOT_VERIFY_RAW = os.getenv("GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE", "true").strip().lower()
 GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE = _GOLD_TOPIC_SNAPSHOT_VERIFY_RAW in (

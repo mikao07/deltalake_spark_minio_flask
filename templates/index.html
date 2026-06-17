@@ -194,6 +194,94 @@
       <div class="card shadow-sm mt-4">
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+            <h2 class="h5 mb-0">痛點候選詞 TF-IDF（Phase A）</h2>
+            <span class="text-secondary small text-break">路徑：{{ tfidf_table_path }}</span>
+          </div>
+          <p class="small text-muted mb-3">
+            依<strong>區分力</strong>排序（非單純高頻）：只在少數評論中突出的詞，較像痛點信號。
+            隨金層 ETL 一併寫入；亦可 <code>GET /api/gold/tfidf-keywords</code> 查詢。
+          </p>
+          {% if tfidf_error %}
+            <div class="alert alert-warning py-2 small mb-2">無法讀取 TF-IDF：{{ tfidf_error }}</div>
+          {% endif %}
+          {% if tfidf_rows and tfidf_rows|length > 0 %}
+            <div class="position-relative mb-4 mx-n1 px-1" style="height: 420px; max-height: 60vh;">
+              <canvas id="tfidfChart" aria-label="TF-IDF 痛點候選詞"></canvas>
+            </div>
+            <div class="table-responsive">
+              <table class="table table-striped table-hover table-sm align-middle">
+                <thead class="table-light">
+                  <tr>
+                    <th scope="col">keyword</th>
+                    <th scope="col">tfidf_score</th>
+                    <th scope="col">total_tf</th>
+                    <th scope="col">doc_frequency</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in tfidf_rows %}
+                    <tr>
+                      <td>{{ row.get("keyword") }}</td>
+                      <td>{{ "%.4f"|format(row.get("tfidf_score")|float) if row.get("tfidf_score") is not none else "-" }}</td>
+                      <td>{{ row.get("total_tf") }}</td>
+                      <td>{{ row.get("doc_frequency") }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% elif not tfidf_error %}
+            <div class="text-muted">尚無 TF-IDF 資料（請先跑金層 ETL，且銀層需有 tokens）。</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="card shadow-sm mt-4">
+        <div class="card-body">
+          <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+            <h2 class="h5 mb-0">片語候選 PMI（Phase B）</h2>
+            <span class="text-secondary small text-break">路徑：{{ phrase_table_path }}</span>
+          </div>
+          <p class="small text-muted mb-3">
+            從銀層 <code>tokens</code> 相鄰二元組計算 PMI，找出應視為<strong>一整個片語</strong>的候選（如「珍珠 奶茶」）。
+            查詢：<code>GET /api/gold/phrase-candidates</code>。
+          </p>
+          {% if phrase_error %}
+            <div class="alert alert-warning py-2 small mb-2">無法讀取片語候選：{{ phrase_error }}</div>
+          {% endif %}
+          {% if phrase_rows and phrase_rows|length > 0 %}
+            <div class="position-relative mb-4 mx-n1 px-1" style="height: 420px; max-height: 60vh;">
+              <canvas id="phrasePmiChart" aria-label="PMI 片語候選"></canvas>
+            </div>
+            <div class="table-responsive">
+              <table class="table table-striped table-hover table-sm align-middle">
+                <thead class="table-light">
+                  <tr>
+                    <th scope="col">phrase</th>
+                    <th scope="col">pmi_score</th>
+                    <th scope="col">bigram_count</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in phrase_rows %}
+                    <tr>
+                      <td>{{ row.get("phrase") }}</td>
+                      <td>{{ "%.4f"|format(row.get("pmi_score")|float) if row.get("pmi_score") is not none else "-" }}</td>
+                      <td>{{ row.get("bigram_count") }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% elif not phrase_error %}
+            <div class="text-muted">尚無 PMI 片語資料（需銀層 tokens 至少 2 個詞）。</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="card shadow-sm mt-4">
+        <div class="card-body">
+          <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
             <h2 class="h5 mb-0">痛點主題分類（topic / frequency）</h2>
             <span class="text-secondary small">
               來源：Gold topic 快照表 <code>{{ topic_snapshot_path }}</code>
@@ -271,9 +359,11 @@
       </div>
     </div>
 
-    {% if gold_rows and gold_rows|length > 0 or topic_rows and topic_rows|length > 0 or topic_compare_rows and topic_compare_rows|length > 0 %}
+    {% if gold_rows and gold_rows|length > 0 or tfidf_rows and tfidf_rows|length > 0 or phrase_rows and phrase_rows|length > 0 or topic_rows and topic_rows|length > 0 or topic_compare_rows and topic_compare_rows|length > 0 %}
       <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" crossorigin="anonymous"></script>
       <script id="gold-chart-data" type="application/json">{{ gold_rows | tojson if gold_rows and gold_rows|length > 0 else [] }}</script>
+      <script id="tfidf-chart-data" type="application/json">{{ tfidf_rows | tojson if tfidf_rows and tfidf_rows|length > 0 else [] }}</script>
+      <script id="phrase-chart-data" type="application/json">{{ phrase_rows | tojson if phrase_rows and phrase_rows|length > 0 else [] }}</script>
       <script id="topic-chart-data" type="application/json">{{ topic_rows | tojson if topic_rows and topic_rows|length > 0 else [] }}</script>
       <script id="topic-compare-chart-data" type="application/json">{{ topic_compare_rows | tojson if topic_compare_rows and topic_compare_rows|length > 0 else [] }}</script>
       <script>
@@ -348,6 +438,88 @@
                     },
                     grid: { display: false },
                   },
+                },
+              },
+            });
+          }
+
+          const tfidfEl = document.getElementById("tfidf-chart-data");
+          const tfidfRows = JSON.parse((tfidfEl && tfidfEl.textContent) || "[]");
+          const tfidfLabels = tfidfRows.map(function (r) { return String(r.keyword ?? ""); }).reverse();
+          const tfidfValues = tfidfRows.map(function (r) { return parseFloat(r.tfidf_score) || 0; }).reverse();
+          const tfidfCanvas = document.getElementById("tfidfChart");
+          if (tfidfCanvas && typeof Chart !== "undefined" && tfidfLabels.length > 0) {
+            new Chart(tfidfCanvas.getContext("2d"), {
+              type: "bar",
+              data: {
+                labels: tfidfLabels,
+                datasets: [{
+                  label: "tfidf_score",
+                  data: tfidfValues,
+                  backgroundColor: "rgba(255, 193, 7, 0.65)",
+                  borderColor: "rgba(255, 193, 7, 1)",
+                  borderWidth: 1,
+                  borderRadius: 4,
+                  maxBarThickness: 22,
+                }],
+              },
+              options: {
+                indexAxis: "y",
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                  legend: { display: false },
+                  title: {
+                    display: true,
+                    text: "TF-IDF 痛點候選詞（區分力）",
+                    color: tickColor.trim() || "#6c757d",
+                    font: { size: 14, weight: "600" },
+                  },
+                },
+                scales: {
+                  x: { beginAtZero: true, ticks: { color: tickColor.trim() }, grid: { color: gridColor } },
+                  y: { ticks: { color: tickColor.trim(), autoSkip: false, font: { size: 11 } }, grid: { display: false } },
+                },
+              },
+            });
+          }
+
+          const phraseEl = document.getElementById("phrase-chart-data");
+          const phraseRows = JSON.parse((phraseEl && phraseEl.textContent) || "[]");
+          const phraseLabels = phraseRows.map(function (r) { return String(r.phrase ?? ""); }).reverse();
+          const phraseValues = phraseRows.map(function (r) { return parseFloat(r.pmi_score) || 0; }).reverse();
+          const phraseCanvas = document.getElementById("phrasePmiChart");
+          if (phraseCanvas && typeof Chart !== "undefined" && phraseLabels.length > 0) {
+            new Chart(phraseCanvas.getContext("2d"), {
+              type: "bar",
+              data: {
+                labels: phraseLabels,
+                datasets: [{
+                  label: "pmi_score",
+                  data: phraseValues,
+                  backgroundColor: "rgba(25, 135, 84, 0.65)",
+                  borderColor: "rgba(25, 135, 84, 1)",
+                  borderWidth: 1,
+                  borderRadius: 4,
+                  maxBarThickness: 22,
+                }],
+              },
+              options: {
+                indexAxis: "y",
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                  legend: { display: false },
+                  title: {
+                    display: true,
+                    text: "PMI 片語候選",
+                    color: tickColor.trim() || "#6c757d",
+                    font: { size: 14, weight: "600" },
+                  },
+                },
+                scales: {
+                  x: { beginAtZero: true, ticks: { color: tickColor.trim() }, grid: { color: gridColor } },
+                  y: { ticks: { color: tickColor.trim(), autoSkip: false, font: { size: 11 } }, grid: { display: false } },
                 },
               },
             });

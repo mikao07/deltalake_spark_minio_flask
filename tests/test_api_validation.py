@@ -283,4 +283,3 @@ def test_health_storage_ok_with_mock(monkeypatch):
     assert j["status"] in ("ok", "degraded")
     assert "minio_sdk" in j
     assert "spark_binaryfile" in j
-

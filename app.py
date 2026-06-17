@@ -22,6 +22,8 @@ from config import (
     BUCKET_NAME,
     BRONZE_TABLE_PATH,
     GOLD_TOPIC_SNAPSHOT_PATH,
+    GOLD_TFIDF_KEYWORDS_PATH,
+    GOLD_PHRASE_CANDIDATES_PATH,
     GOLD_WORD_COUNT_PATH,
     MINIO_ENDPOINT,
     RAW_IMAGE_PREFIX,
@@ -52,6 +54,8 @@ from services.spark_service import (
     list_gold_topic_snapshots,
     get_gold_topic_snapshot_latest_data,
     get_gold_word_frequency_data,
+    get_gold_tfidf_keywords_data,
+    get_gold_phrase_candidates_data,
     get_silver_ocr_data,
     get_system_status,
     merge_upsert_by_key,
@@ -59,6 +63,7 @@ from services.spark_service import (
     read_delta_table,
     run_silver_ocr_etl,
     run_gold_word_frequency_etl,
+    run_gold_corpus_analytics_etl,
     run_gold_topic_snapshot_rebuild_etl,
     delete_gold_topic_snapshot_rows,
 )
@@ -466,6 +471,22 @@ def _safe_gold_preview(limit: int = 15, dataset_id: str | None = None):
         return [], str(e)
 
 
+def _safe_tfidf_preview(limit: int = 15, dataset_id: str | None = None):
+    try:
+        return get_gold_tfidf_keywords_data(limit=limit, dataset_id=dataset_id), None
+    except Exception as e:
+        _logger.warning("tfidf_preview_failed: %s", e)
+        return [], str(e)
+
+
+def _safe_phrase_preview(limit: int = 15, dataset_id: str | None = None):
+    try:
+        return get_gold_phrase_candidates_data(limit=limit, dataset_id=dataset_id), None
+    except Exception as e:
+        _logger.warning("phrase_preview_failed: %s", e)
+        return [], str(e)
+
+
 def _safe_silver_preview(
     limit: int = 30,
     dataset_id: str | None = None,
@@ -520,6 +541,8 @@ def index():
 
     sys_status = get_system_status()
     gold_rows, gold_error = _safe_gold_preview(limit=15, dataset_id=selected_dataset_id)
+    tfidf_rows, tfidf_error = _safe_tfidf_preview(limit=15, dataset_id=selected_dataset_id)
+    phrase_rows, phrase_error = _safe_phrase_preview(limit=15, dataset_id=selected_dataset_id)
     topic_rows: List[Dict[str, Any]] = []
     topic_compare_rows: List[Dict[str, Any]] = []
     topic_snapshot_options: List[str] = []
@@ -554,12 +577,18 @@ def index():
         selected_dataset_id=selected_dataset_id,
         gold_rows=gold_rows,
         gold_error=gold_error,
+        tfidf_rows=tfidf_rows,
+        tfidf_error=tfidf_error,
+        phrase_rows=phrase_rows,
+        phrase_error=phrase_error,
         topic_rows=topic_rows,
         topic_compare_rows=topic_compare_rows,
         topic_snapshot_options=topic_snapshot_options,
         selected_topic_snapshots=selected_topic_snapshots,
         topic_hint=topic_hint,
         gold_table_path=GOLD_WORD_COUNT_PATH,
+        tfidf_table_path=GOLD_TFIDF_KEYWORDS_PATH,
+        phrase_table_path=GOLD_PHRASE_CANDIDATES_PATH,
         topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
         silver_ocr_table_path=SILVER_OCR_TABLE_PATH,
     )
@@ -622,6 +651,8 @@ def layers_preview_page():
             "stopwords_used": False,
             "stopwords_path": "",
             "stopwords_count": 0,
+            "builtin_stopwords_count": 0,
+            "silver_tokenization": "jieba_with_builtin_stopwords",
             "error": str(e),
         }
 
@@ -937,6 +968,64 @@ def api_gold_word_frequency():
     return jsonify(
         {
             "path": GOLD_WORD_COUNT_PATH,
+            "dataset_id": dataset_id,
+            "rows": rows,
+            "count": len(rows),
+        }
+    )
+
+
+@app.get("/api/gold/tfidf-keywords")
+def api_gold_tfidf_keywords():
+    """
+    Phase A：讀取 TF-IDF 痛點候選詞（依 tfidf_score 降序）。
+    query: limit（預設 20，最大 200）、dataset_id（可選）
+    """
+
+    raw = request.args.get("limit", "20")
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 200))
+
+    dataset_id, err = _parse_optional_dataset_id()
+    if err:
+        return err
+
+    rows = get_gold_tfidf_keywords_data(limit=limit, dataset_id=dataset_id)
+    return jsonify(
+        {
+            "path": GOLD_TFIDF_KEYWORDS_PATH,
+            "dataset_id": dataset_id,
+            "rows": rows,
+            "count": len(rows),
+        }
+    )
+
+
+@app.get("/api/gold/phrase-candidates")
+def api_gold_phrase_candidates():
+    """
+    Phase B：讀取 PMI 片語候選（依 pmi_score 降序）。
+    query: limit（預設 20，最大 200）、dataset_id（可選）
+    """
+
+    raw = request.args.get("limit", "20")
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 200))
+
+    dataset_id, err = _parse_optional_dataset_id()
+    if err:
+        return err
+
+    rows = get_gold_phrase_candidates_data(limit=limit, dataset_id=dataset_id)
+    return jsonify(
+        {
+            "path": GOLD_PHRASE_CANDIDATES_PATH,
             "dataset_id": dataset_id,
             "rows": rows,
             "count": len(rows),
