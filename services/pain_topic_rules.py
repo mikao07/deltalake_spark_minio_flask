@@ -2,6 +2,7 @@
 痛點主題規則（規則式分類 MVP）。
 
 以銀層 tokens 為輸入，輸出商業主題標籤（等待時間、服務態度…）。
+支援模糊匹配以容忍 OCR 錯字（PAIN_FUZZY_* 環境變數）。
 """
 
 from __future__ import annotations
@@ -9,7 +10,16 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Sequence
 
-TOPIC_RULE_VERSION = "v1.2-drinks"
+from services.text_similarity import (
+    fuzzy_phrase_hit,
+    fuzzy_word_hit,
+    pain_fuzzy_anchor_ratio,
+    pain_fuzzy_enabled,
+    pain_fuzzy_min_chars,
+    pain_fuzzy_min_ratio,
+)
+
+TOPIC_RULE_VERSION = "v1.3-drinks-fuzzy"
 
 # 明確負面／抱怨片語（不含「親切、貼心」等正面詞）
 PAIN_TOPIC_RULES: Dict[str, List[str]] = {
@@ -155,11 +165,53 @@ PAIN_TOPIC_POLARITY_RULES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _contains_hint(word_set: set[str], joined_text: str, joined_no_space: str, hint: str) -> bool:
+def _contains_hint(
+    word_set: set[str],
+    joined_text: str,
+    joined_no_space: str,
+    hint: str,
+    *,
+    allow_fuzzy: bool = False,
+    fuzzy_ratio: float | None = None,
+) -> bool:
     h = str(hint).strip().lower()
     if not h:
         return False
-    return h in word_set or h in joined_text or h in joined_no_space
+    if h in word_set or h in joined_text or h in joined_no_space:
+        return True
+    if not allow_fuzzy or not pain_fuzzy_enabled():
+        return False
+    min_chars = pain_fuzzy_min_chars()
+    if len(h) < min_chars:
+        return False
+    ratio = pain_fuzzy_min_ratio() if fuzzy_ratio is None else fuzzy_ratio
+    for w in word_set:
+        if len(w) >= min_chars and fuzzy_word_hit(w, h, min_ratio=ratio):
+            return True
+    return fuzzy_phrase_hit(joined_no_space, h, min_chars=min_chars, min_ratio=ratio)
+
+
+def _word_matches_candidates(
+    word: str,
+    candidates: List[str],
+    *,
+    allow_fuzzy: bool,
+    fuzzy_ratio: float | None = None,
+) -> bool:
+    w = str(word).strip().lower()
+    if not w:
+        return False
+    for c in candidates:
+        c0 = str(c).strip().lower()
+        if not c0:
+            continue
+        if w == c0 or c0 in w or w in c0:
+            return True
+        if allow_fuzzy and pain_fuzzy_enabled():
+            min_chars = pain_fuzzy_min_chars()
+            if len(c0) >= min_chars and fuzzy_word_hit(w, c0, min_ratio=fuzzy_ratio):
+                return True
+    return False
 
 
 def _is_near_by_word_gap(
@@ -167,8 +219,19 @@ def _is_near_by_word_gap(
     anchors: List[str],
     negatives: List[str],
     max_gap: int,
+    *,
+    anchor_fuzzy_ratio: float | None = None,
 ) -> bool:
-    anchor_idx = [i for i, w in enumerate(words) if w in anchors]
+    anchor_idx = [
+        i
+        for i, w in enumerate(words)
+        if _word_matches_candidates(
+            w,
+            anchors,
+            allow_fuzzy=True,
+            fuzzy_ratio=anchor_fuzzy_ratio,
+        )
+    ]
     neg_idx = [i for i, w in enumerate(words) if w in negatives]
     if not anchor_idx or not neg_idx:
         return False
@@ -209,19 +272,39 @@ def label_pain_topics(words: Sequence[str] | None) -> List[str]:
     joined_text = " ".join(safe_words)
     joined_no_space = "".join(safe_words)
     hit_topics: List[str] = []
+    anchor_ratio = pain_fuzzy_anchor_ratio()
 
     for topic, cfg in PAIN_TOPIC_POLARITY_RULES.items():
         anchors = [str(x).strip().lower() for x in cfg.get("anchors", []) if str(x).strip()]
         negatives = [str(x).strip().lower() for x in cfg.get("negatives", []) if str(x).strip()]
         if not anchors or not negatives:
             continue
-        has_anchor = any(_contains_hint(word_set, joined_text, joined_no_space, a) for a in anchors)
-        has_negative = any(_contains_hint(word_set, joined_text, joined_no_space, n) for n in negatives)
+        has_anchor = any(
+            _contains_hint(
+                word_set,
+                joined_text,
+                joined_no_space,
+                a,
+                allow_fuzzy=True,
+                fuzzy_ratio=anchor_ratio,
+            )
+            for a in anchors
+        )
+        has_negative = any(
+            _contains_hint(word_set, joined_text, joined_no_space, n, allow_fuzzy=False)
+            for n in negatives
+        )
         if not (has_anchor and has_negative):
             continue
         max_word_gap = int(cfg.get("max_word_gap", 3))
         max_char_gap = int(cfg.get("max_char_gap", 8))
-        if _is_near_by_word_gap(safe_words, anchors, negatives, max_word_gap) or _is_near_by_char_gap(
+        if _is_near_by_word_gap(
+            safe_words,
+            anchors,
+            negatives,
+            max_word_gap,
+            anchor_fuzzy_ratio=anchor_ratio,
+        ) or _is_near_by_char_gap(
             joined_no_space,
             anchors,
             negatives,
@@ -233,7 +316,13 @@ def label_pain_topics(words: Sequence[str] | None) -> List[str]:
         if topic in hit_topics:
             continue
         for hint in hints:
-            if _contains_hint(word_set, joined_text, joined_no_space, str(hint)):
+            if _contains_hint(
+                word_set,
+                joined_text,
+                joined_no_space,
+                str(hint),
+                allow_fuzzy=True,
+            ):
                 hit_topics.append(topic)
                 break
 

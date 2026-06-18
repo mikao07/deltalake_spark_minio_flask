@@ -12,3 +12,6 @@ delta-spark==3.0.0
 # Gold 層 Jieba 分詞（與 Notebook；executors 亦可改用 JIEBA_ZIP_PATH + addPyFile）
 jieba==0.42.1
 
+# Bronze OCR：二值化前處理、痛點模糊匹配
+opencv-python-headless==4.10.0.84
+rapidfuzz==3.9.7

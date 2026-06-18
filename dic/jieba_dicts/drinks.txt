@@ -1,0 +1,26 @@
+服務態度 10 n
+店員態度 10 n
+出餐速度 10 n
+等待時間 10 n
+電子發票 10 n
+行動支付 10 n
+50嵐 100 nz
+五十嵐 100 nz
+清心 100 nz
+可不可 100 nz
+迷客夏 100 nz
+一芳 100 nz
+CoCo 100 nz
+Line Pay 100 nz
+LinePay 100 nz
+Uber Eats 100 nz
+foodpanda 100 nz
+微冰 50 n
+微糖 50 n
+一分糖 50 n
+半糖 50 n
+全糖 50 n
+少冰 50 n
+去冰 50 n
+波霸 50 n
+珍珠奶茶 50 n

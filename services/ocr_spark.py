@@ -8,6 +8,7 @@ Bronze 層 OCR 攝入（對齊 MinIO_DeltaLake_Spark_1.1.ipynb）：
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -16,7 +17,11 @@ from pyspark.sql.functions import col, current_timestamp, length, lit, lower, re
 from pyspark.sql.types import StringType
 from minio.error import S3Error
 
-from config import BUCKET_NAME, RAW_IMAGE_PREFIX
+from config import BUCKET_NAME, OCR_USER_WORDS_PATH, RAW_IMAGE_PREFIX
+from services.domain_lexicons import (
+    materialize_merged_ocr_user_words_file,
+    resolve_local_ocr_user_words_path,
+)
 from services.minio_upload import ensure_bucket, get_minio_client
 
 _SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
@@ -66,12 +71,65 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name, "").strip()
+    return raw or default
+
+
+def _apply_binarization(gray_img):
+    """灰階 PIL Image → 二值化（OCR_BINARIZE=otsu|adaptive；off 則原樣回傳）。"""
+    mode = _env_str("OCR_BINARIZE", "off").lower()
+    if mode in ("off", "none", ""):
+        return gray_img
+
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return gray_img
+
+    arr = np.array(gray_img)
+    if mode == "otsu":
+        _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    elif mode == "adaptive":
+        block = max(3, _env_int("OCR_BINARIZE_BLOCK_SIZE", 31))
+        if block % 2 == 0:
+            block += 1
+        c = _env_int("OCR_BINARIZE_C", 10)
+        binary = cv2.adaptiveThreshold(
+            arr,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            block,
+            c,
+        )
+    else:
+        return gray_img
+
+    invert = _env_str("OCR_BINARIZE_INVERT", "auto").lower()
+    if invert == "auto":
+        if float(np.mean(binary)) < 127.0:
+            binary = cv2.bitwise_not(binary)
+    elif invert in ("1", "true", "yes", "on"):
+        binary = cv2.bitwise_not(binary)
+
+    morph = _env_str("OCR_BINARIZE_MORPH", "off").lower()
+    if morph == "open":
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    return Image.fromarray(binary)
+
+
 def preprocess_image_for_ocr(img):
     """
     Bronze OCR 前處理（可由 .env 調校）：
     - OCR_SCALE_MIN_SIDE：短邊低於此值時等比放大（0=不放大）
     - OCR_CONTRAST：對比度倍率（灰階後）
     - OCR_SHARPNESS：銳利度倍率（1.0=不變）
+    - OCR_BINARIZE：off | otsu | adaptive（彩色 UI 截圖建議 otsu）
     """
     from PIL import Image, ImageEnhance
 
@@ -94,7 +152,119 @@ def preprocess_image_for_ocr(img):
     if sharpness != 1.0:
         img = ImageEnhance.Sharpness(img).enhance(sharpness)
 
-    return img
+    return _apply_binarization(img)
+
+
+_ocr_user_words_registered: str | None = None
+_ocr_user_words_worker_path: str | None = None
+
+
+def register_ocr_user_words_if_needed(
+    spark: SparkSession,
+    *,
+    ocr_user_words_path: str | None = None,
+    dataset_id: str | None = None,
+) -> str | None:
+    """
+    於 driver 合併內建／檔案 OCR 詞彙，addFile 分發給 executors。
+    回傳 driver 端暫存路徑（供本機單執行緒測試）；Spark UDF 會從 SparkFiles 讀取。
+    """
+    global _ocr_user_words_registered
+
+    extra_paths: list[str] = []
+    env_path = str(ocr_user_words_path or OCR_USER_WORDS_PATH or "").strip()
+    if env_path:
+        resolved = _resolve_readable_words_path(spark, env_path)
+        if resolved:
+            extra_paths.append(resolved)
+
+    pattern = os.getenv("OCR_USER_WORDS_DATASET_PATTERN", "").strip()
+    ds = str(dataset_id or "").strip().lower()
+    if ds and pattern:
+        try:
+            candidate = pattern.format(dataset_id=ds).strip()
+            if candidate:
+                resolved = _resolve_readable_words_path(spark, candidate)
+                if resolved:
+                    extra_paths.append(resolved)
+        except Exception:
+            pass
+
+    local_path = resolve_local_ocr_user_words_path(ds) if ds else None
+    if local_path:
+        extra_paths.append(local_path)
+
+    merged_path = materialize_merged_ocr_user_words_file(
+        extra_paths=extra_paths,
+        dataset_ids=[ds] if ds else None,
+    )
+    if not merged_path:
+        return None
+
+    if _ocr_user_words_registered != merged_path:
+        spark.sparkContext.addFile(merged_path)
+        _ocr_user_words_registered = merged_path
+    return merged_path
+
+
+def _resolve_readable_words_path(spark: SparkSession, path: str) -> str | None:
+    """將本機或 s3a:// 詞彙檔轉成 driver 可讀的暫存路徑。"""
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    if os.path.isfile(raw):
+        return raw
+    if not raw.startswith("s3a://"):
+        return None
+    try:
+        import tempfile
+
+        lines = spark.read.text(raw).collect()
+        fd, out_path = tempfile.mkstemp(suffix="_ocr_user_words_s3a.txt", prefix="ocr_words_")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for row in lines:
+                w = str(row[0]).strip()
+                if not w or w.startswith("#"):
+                    continue
+                fh.write(f"{w}\n")
+        return out_path
+    except Exception:
+        return None
+
+
+def _resolve_ocr_user_words_path_for_worker() -> str:
+    """於 OCR UDF 內取得 --user-words 路徑（含內建詞 fallback）。"""
+    global _ocr_user_words_worker_path
+    if _ocr_user_words_worker_path is not None:
+        return _ocr_user_words_worker_path
+
+    basename = os.path.basename(_ocr_user_words_registered or "")
+    if basename:
+        try:
+            from pyspark import SparkFiles
+
+            local = SparkFiles.get(basename)
+            if local and os.path.isfile(local):
+                _ocr_user_words_worker_path = local
+                return local
+        except Exception:
+            pass
+
+    if _ocr_user_words_registered and os.path.isfile(_ocr_user_words_registered):
+        _ocr_user_words_worker_path = _ocr_user_words_registered
+        return _ocr_user_words_registered
+
+    fallback = materialize_merged_ocr_user_words_file()
+    _ocr_user_words_worker_path = fallback or ""
+    return _ocr_user_words_worker_path
+
+
+def _build_tesseract_config(psm: str) -> str:
+    config = f"--psm {psm}"
+    words_path = _resolve_ocr_user_words_path_for_worker()
+    if words_path:
+        config += f' --user-words "{words_path}"'
+    return config
 
 
 def _ocr_binary_to_text(image_content) -> Optional[str]:
@@ -129,7 +299,8 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
         img = Image.open(buf)
         img = preprocess_image_for_ocr(img)
 
-        text = pytesseract.image_to_string(img, lang=ocr_lang, config=f"--psm {ocr_psm}")
+        tesseract_config = _build_tesseract_config(ocr_psm)
+        text = pytesseract.image_to_string(img, lang=ocr_lang, config=tesseract_config)
         result = text.strip() or "OCR_EMPTY_RESULT"
         return result
 
@@ -153,7 +324,10 @@ def _get_ocr_signature() -> str:
     scale = str(max(0, _env_int("OCR_SCALE_MIN_SIDE", 0)))
     contrast = str(_env_float("OCR_CONTRAST", 1.5))
     sharp = str(_env_float("OCR_SHARPNESS", 1.0))
-    return f"tesseract|lang={lang}|psm={psm}|pre={pre}|scale={scale}|ctr={contrast}|shp={sharp}"
+    binarize = _env_str("OCR_BINARIZE", "off").lower() or "off"
+    return (
+        f"tesseract|lang={lang}|psm={psm}|pre={pre}|scale={scale}|ctr={contrast}|shp={sharp}|bin={binarize}"
+    )
 
 
 def _extract_bucket_and_prefix(raw_images_path: str) -> tuple[str, str]:
@@ -243,6 +417,7 @@ def run_bronze_ocr_ingest(
     raw_images_path: str,
     bronze_path: str,
     write_mode: str = "overwrite",
+    dataset_id: str | None = None,
 ) -> dict:
     """
     從 raw_images_path（s3a://.../ 目錄，內含圖檔）讀取 binaryFile，執行 OCR 後寫入 bronze_path。
@@ -252,6 +427,14 @@ def run_bronze_ocr_ingest(
 
     if write_mode not in ("overwrite", "append"):
         raise ValueError('write_mode 必須是 \"overwrite\" 或 \"append\"。')
+
+    inferred_ds = str(dataset_id or "").strip()
+    if not inferred_ds:
+        m = re.search(r"/raw/images/([^/]+)/?", raw_images_path.replace("\\", "/"))
+        if m:
+            inferred_ds = m.group(1).strip()
+
+    register_ocr_user_words_if_needed(spark, dataset_id=inferred_ds or None)
 
     df_paths = _build_df_paths(spark, raw_images_path)
     sig = _get_ocr_signature()

@@ -39,3 +39,21 @@ def test_label_invoice_topic():
 def test_label_checkout_topic():
     topics = label_pain_topics(["結帳", "line", "pay", "問題"])
     assert "結帳支付" in topics
+
+
+def test_label_service_attitude_fuzzy_ocr_typo(monkeypatch):
+    monkeypatch.setenv("PAIN_FUZZY_ENABLED", "true")
+    topics = label_pain_topics(["店員", "服務態渡", "不耐煩"])
+    assert "服務態度" in topics
+
+
+def test_label_wait_topic_fuzzy_typo(monkeypatch):
+    monkeypatch.setenv("PAIN_FUZZY_ENABLED", "true")
+    topics = label_pain_topics(["出餐漫"])
+    assert "等待時間" in topics
+
+
+def test_fuzzy_disabled_exact_only(monkeypatch):
+    monkeypatch.setenv("PAIN_FUZZY_ENABLED", "false")
+    topics = label_pain_topics(["出餐漫"])
+    assert "等待時間" not in topics

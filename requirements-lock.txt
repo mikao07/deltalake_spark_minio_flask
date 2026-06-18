@@ -8,3 +8,5 @@ pytesseract==0.3.10
 pyspark==3.5.0
 delta-spark==3.0.0
 jieba==0.42.1
+opencv-python-headless==4.10.0.84
+rapidfuzz==3.9.7

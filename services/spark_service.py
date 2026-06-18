@@ -61,6 +61,7 @@ from config import (
     SILVER_OCR_TABLE_PATH,
 )
 from services.domain_lexicons import get_builtin_domain_stopwords, merge_stopword_lists
+from services.domain_lexicons import resolve_local_jieba_userdict_path
 from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
 from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
 
@@ -730,6 +731,15 @@ def _resolve_existing_jieba_userdict_path(
             ds,
             fallback,
         )
+
+    local_path = resolve_local_jieba_userdict_path(ds)
+    if local_path:
+        _logger.info(
+            "jieba_userdict_local_used: dataset_id=%s path=%s",
+            ds,
+            local_path,
+        )
+        return local_path
 
     return None
 

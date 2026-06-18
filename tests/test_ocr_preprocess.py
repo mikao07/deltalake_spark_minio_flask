@@ -19,6 +19,19 @@ def test_preprocess_no_scale_when_disabled(monkeypatch):
     monkeypatch.setenv("OCR_SCALE_MIN_SIDE", "0")
     monkeypatch.setenv("OCR_CONTRAST", "1.0")
     monkeypatch.setenv("OCR_SHARPNESS", "1.0")
+    monkeypatch.setenv("OCR_BINARIZE", "off")
     img = Image.new("RGB", (100, 50), color=(200, 200, 200))
     out = preprocess_image_for_ocr(img)
     assert out.size == (100, 50)
+
+
+def test_preprocess_otsu_binarize(monkeypatch):
+    monkeypatch.setenv("OCR_SCALE_MIN_SIDE", "0")
+    monkeypatch.setenv("OCR_CONTRAST", "1.0")
+    monkeypatch.setenv("OCR_SHARPNESS", "1.0")
+    monkeypatch.setenv("OCR_BINARIZE", "otsu")
+    img = Image.new("L", (80, 40), color=180)
+    out = preprocess_image_for_ocr(img)
+    assert out.mode == "L"
+    pixels = set(out.getdata())
+    assert pixels.issubset({0, 255})

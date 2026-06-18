@@ -1,0 +1,32 @@
+# Tesseract user-words（drinks）；# 開頭為註解
+50嵐
+五十嵐
+清心
+可不可
+迷客夏
+一芳
+CoCo
+清心福全
+茶湯會
+大苑子
+麻古
+珍煮丹
+波霸
+珍珠
+微冰
+微糖
+一分糖
+半糖
+全糖
+少冰
+去冰
+正常冰
+LinePay
+Line Pay
+UberEats
+foodpanda
+載具
+發票
+電子發票
+服務態度
+店員態度

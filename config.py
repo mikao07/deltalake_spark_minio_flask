@@ -86,9 +86,9 @@ JIEBA_ZIP_PATH = os.getenv(
     "",
 )
 
-# 可選：Jieba 自訂字典（支援本機路徑或 s3a://；Spark executors 會以 addFile 分發）
+# Jieba 自訂字典（支援本機路徑或 s3a://；Spark executors 會以 addFile 分發）
 JIEBA_USERDICT_PATH = os.getenv("JIEBA_USERDICT_PATH", "")
-# 可選：依 dataset_id 綁定字典路徑模板，例：s3a://bucket/jieba_dicts/{dataset_id}.txt
+# 可選：依 dataset_id 綁定字典路徑模板，例：s3a://bucket/dic/jieba_dicts/{dataset_id}.txt
 JIEBA_USERDICT_DATASET_PATTERN = os.getenv("JIEBA_USERDICT_DATASET_PATTERN", "")
 
 # 可選：停用詞表（每行一詞；# 開頭為註解；與 jieba 詞典分開）
@@ -109,6 +109,17 @@ TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 OCR_SCALE_MIN_SIDE = os.getenv("OCR_SCALE_MIN_SIDE", "0")
 OCR_CONTRAST = os.getenv("OCR_CONTRAST", "1.5")
 OCR_SHARPNESS = os.getenv("OCR_SHARPNESS", "1.0")
+OCR_BINARIZE = os.getenv("OCR_BINARIZE", "off")
+OCR_PREPROCESS_VERSION = os.getenv("OCR_PREPROCESS_VERSION", "v1")
+# Tesseract user-words（本機路徑或 s3a://；Bronze OCR 前 addFile 分發）
+OCR_USER_WORDS_PATH = os.getenv("OCR_USER_WORDS_PATH", "")
+OCR_USER_WORDS_DATASET_PATTERN = os.getenv("OCR_USER_WORDS_DATASET_PATTERN", "")
+
+# 痛點主題模糊匹配（Gold label_pain_topics）
+PAIN_FUZZY_ENABLED = os.getenv("PAIN_FUZZY_ENABLED", "true")
+PAIN_FUZZY_MIN_RATIO = os.getenv("PAIN_FUZZY_MIN_RATIO", "0.78")
+PAIN_FUZZY_ANCHOR_RATIO = os.getenv("PAIN_FUZZY_ANCHOR_RATIO", "0.88")
+PAIN_FUZZY_MIN_CHARS = os.getenv("PAIN_FUZZY_MIN_CHARS", "3")
 
 # 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
 UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()

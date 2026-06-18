@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY app.py config.py ./
 COPY services ./services
 COPY templates ./templates
+COPY dic ./dic
 
 EXPOSE 5000
 
