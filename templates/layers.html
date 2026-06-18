@@ -26,14 +26,18 @@
     <div class="container py-4" style="max-width: 1200px">
       <nav class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
         <div>
-          <a href="{{ url_for('index') }}" class="small">← 返回 Dashboard</a>
+          <a href="{{ url_for('index') }}" class="small">← Dashboard</a>
           <h1 class="h4 mt-2 mb-0">資料層預覽（除錯用）</h1>
           <p class="small text-muted mb-0">
-            與首頁分離，避免版面過擠。可對照：銅層 OCR 原始列 → 銀層清洗後 → 金層詞頻（落盤 vs
-            首頁即時計算）。
+            三層表格對照；日常 ETL 請用
+            <a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">管線分頁</a>。
           </p>
         </div>
-        <a class="btn btn-outline-primary btn-sm" href="{{ url_for('upload_page') }}">上傳／ETL</a>
+        <div class="btn-group btn-group-sm">
+          <a class="btn btn-outline-primary" href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">銅</a>
+          <a class="btn btn-outline-primary" href="{{ url_for('pipeline_silver_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_silver_page') }}">銀</a>
+          <a class="btn btn-outline-primary" href="{{ url_for('pipeline_gold_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_gold_page') }}">金</a>
+        </div>
       </nav>
 
       <form method="get" class="card shadow-sm mb-4">
@@ -227,7 +231,7 @@
                     <tr>
                       {% for k, v in row.items() %}
                         <td class="small text-break">
-                          {% if v is none %}-{% elif k == 'extracted_text' %}{% set s = v | string %}{{ s[:500] }}{% if
+                          {% if v is none %}-{% elif k in ['extracted_text', 'cleaned_text', 'tokens'] %}{% set s = v | string %}{{ s[:500] }}{% if
                           s|length > 500 %}…{% endif %}{% else %}{{ v }}{% endif %}
                         </td>
                       {% endfor %}

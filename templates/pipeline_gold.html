@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>金層 Gold - OCR數據分析系統</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      .table-scroll {
+        max-height: 360px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container py-4" style="max-width: 960px">
+      {% include 'includes/pipeline_nav.html' %}
+
+      <h1 class="h4 mb-2">金層 Gold：詞頻、TF-IDF、PMI 與痛點</h1>
+      <p class="text-muted small mb-3">
+        從 Silver 讀取 tokens → 詞頻／語料分析 → 寫入 Gold 表。圖表與痛點快照請至
+        <a href="{{ url_for('index', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('index') }}">Dashboard</a>。
+        <strong>write_mode</strong> 僅在<a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">銅層頁</a>設定；一鍵管線在此固定使用 Bronze append。
+      </p>
+      <div class="alert alert-info small py-2 mb-4">
+        <strong>建議下一步：</strong> ETL 完成後 →
+        <a href="{{ url_for('index', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('index') }}"
+          >Dashboard 查看詞頻、TF-IDF、PMI、痛點</a
+        >
+      </div>
+
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h6 mb-3">管理 Token（可選，以下按鈕共用）</h2>
+          <input
+            class="form-control form-control-sm mb-3"
+            type="password"
+            id="admin_token"
+            placeholder="若設定了 ADMIN_TOKEN"
+            autocomplete="off"
+          />
+
+          <h2 class="h6 mb-2">僅金層詞頻 ETL</h2>
+          <p class="small text-muted">假設 Silver 已就緒；會一併跑 TF-IDF／PMI 語料分析。</p>
+          <button type="button" class="btn btn-outline-primary btn-sm" id="btn-run-gold-only">執行 Gold 詞頻 ETL</button>
+          <p class="small text-muted mt-2 mb-4" id="gold-only-note"></p>
+
+          <hr />
+
+          <h2 class="h6 mb-2">一鍵管線（Bronze → Silver → Gold）</h2>
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="skip_gold_if_no_new_ocr" checked />
+            <label class="form-check-label" for="skip_gold_if_no_new_ocr">
+              無新 OCR 時跳過銀層／金層（預設開啟）
+            </label>
+            <div class="form-text">
+              改停用詞或辭典後要重算時，請<strong>關閉</strong>此選項再執行。
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" id="btn-run-pipeline-gold">
+            一鍵跑到金層
+          </button>
+          <div id="pipeline-progress-wrap" class="d-none mt-3">
+            <div class="progress" style="height: 8px">
+              <div
+                id="pipeline-progress-bar"
+                class="progress-bar bg-primary"
+                role="progressbar"
+                style="width: 0%"
+              ></div>
+            </div>
+            <p class="small text-secondary mt-2 mb-0" id="pipeline-progress-text"></p>
+          </div>
+          <p class="small text-muted mt-2 mb-0" id="pipeline-note"></p>
+
+          {% if latest_gold_metric %}
+            <div class="alert alert-light border small py-2 mt-3 mb-0">
+              <strong>最近一次 Gold ETL：</strong>
+              status={{ latest_gold_metric.status }} · gold_output_rows={{ latest_gold_metric.gold_output_rows if latest_gold_metric.gold_output_rows is not none else '—' }}
+            </div>
+          {% endif %}
+        </div>
+      </div>
+
+      <section class="card shadow-sm">
+        <div class="card-header py-2"><strong>Gold 落盤預覽（最多 {{ preview_limit }} 列）</strong></div>
+        <div class="card-body">
+          <p class="small text-muted mb-2">{{ gold_path }}</p>
+          {% if gold_disk_error %}
+            <div class="alert alert-warning py-2 small mb-0">讀取失敗：{{ gold_disk_error }}</div>
+          {% elif gold_disk_rows and gold_disk_rows|length > 0 %}
+            <div class="table-scroll border rounded">
+              <table class="table table-sm table-striped mb-0">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    {% for k in gold_disk_rows[0].keys() %}
+                      <th class="small">{{ k }}</th>
+                    {% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in gold_disk_rows %}
+                    <tr>
+                      {% for v in row.values() %}
+                        <td class="small text-break">{% if v is none %}-{% else %}{{ v }}{% endif %}</td>
+                      {% endfor %}
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="text-muted small mb-0">無資料（請先執行金層 ETL）。</p>
+            {% if gold_disk_hint %}
+              <div class="alert alert-info small py-2 mb-0 mt-2">{{ gold_disk_hint }}</div>
+            {% endif %}
+          {% endif %}
+        </div>
+      </section>
+    </div>
+
+    <script id="pipeline-gold-dataset-data" type="application/json">{{ (selected_dataset_id or '') | tojson }}</script>
+    <script>
+      const PIPELINE_DATASET_ID = JSON.parse(
+        document.getElementById("pipeline-gold-dataset-data").textContent || '""'
+      );
+
+      function adminHeadersOnly() {
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = {};
+        if (tok) headers["X-Admin-Token"] = tok;
+        return headers;
+      }
+
+      function adminHeadersJson() {
+        const h = adminHeadersOnly();
+        h["Content-Type"] = "application/json";
+        return h;
+      }
+
+      function createPipelineProgressUi(wrapId, barId, textId) {
+        const wrap = document.getElementById(wrapId);
+        const bar = document.getElementById(barId);
+        const text = document.getElementById(textId);
+        return {
+          show: function () {
+            wrap.classList.remove("d-none");
+            bar.classList.add("progress-bar-striped", "progress-bar-animated");
+          },
+          set: function (step, total, label, pct) {
+            const p = Math.max(0, Math.min(100, pct));
+            bar.style.width = p + "%";
+            text.textContent = "步驟 " + step + "/" + total + "：" + label;
+          },
+          done: function () {
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+          },
+        };
+      }
+
+      function authHeadersForJobPoll(baseHeaders) {
+        const o = {};
+        if (baseHeaders && baseHeaders["X-Admin-Token"]) o["X-Admin-Token"] = baseHeaders["X-Admin-Token"];
+        return o;
+      }
+
+      async function runPipelineToGoldWithProgress(datasetId, headers, progressUi, skipGoldIfNoNewOcr) {
+        const h = Object.assign({ "Content-Type": "application/json" }, headers);
+        const pollH = authHeadersForJobPoll(headers);
+        progressUi.show();
+        progressUi.set(0, 3, "送出背景任務…", 5);
+
+        const submitRes = await fetch("/delta/pipeline/to-gold/run", {
+          method: "POST",
+          headers: h,
+          body: JSON.stringify({
+            dataset_id: datasetId,
+            write_mode: "append",
+            apply_noise_filter: true,
+            coalesce_partitions: 1,
+            dry_run: false,
+            async: true,
+            skip_gold_if_no_new_ocr: skipGoldIfNoNewOcr,
+          }),
+        });
+        const submitTxt = await submitRes.text();
+        let submitData = {};
+        try {
+          submitData = JSON.parse(submitTxt);
+        } catch (_) {}
+        if (!submitRes.ok || submitData.status !== "accepted" || !submitData.job_id) {
+          progressUi.done();
+          return {
+            ok: false,
+            step: 0,
+            error: (submitData && submitData.error) || submitTxt || "無法建立背景任務",
+          };
+        }
+
+        const jobId = submitData.job_id;
+        const deadline = Date.now() + 45 * 60 * 1000;
+        while (Date.now() < deadline) {
+          await new Promise(function (r) {
+            setTimeout(r, 900);
+          });
+          const stRes = await fetch("/api/jobs/" + encodeURIComponent(jobId), { headers: pollH });
+          const stTxt = await stRes.text();
+          let st = {};
+          try {
+            st = JSON.parse(stTxt);
+          } catch (_) {}
+          if (!stRes.ok) {
+            progressUi.done();
+            return { ok: false, step: 0, error: (st && st.error) || stTxt || "查詢任務失敗" };
+          }
+          const total = st.step_total || 3;
+          const step = typeof st.step === "number" ? st.step : 0;
+          const pct =
+            st.status === "queued"
+              ? 5
+              : total > 0
+                ? Math.min(99, Math.round((Math.max(step, 1) / total) * 100))
+                : 5;
+          if (st.status === "succeeded") {
+            progressUi.set(total, total, "全部完成", 100);
+            progressUi.done();
+            return { ok: true, result: st.result };
+          }
+          if (st.status === "failed") {
+            progressUi.done();
+            return { ok: false, step: step || 0, error: st.error || st.message || "任務失敗" };
+          }
+          progressUi.set(step || 0, total, st.message || "執行中…", pct);
+        }
+        progressUi.done();
+        return { ok: false, step: 0, error: "等待逾時（任務可能仍在背景執行）。" };
+      }
+
+      document.getElementById("btn-run-gold-only").addEventListener("click", async function () {
+        const note = document.getElementById("gold-only-note");
+        if (!PIPELINE_DATASET_ID) {
+          note.className = "small text-danger";
+          note.textContent = "請先在上方選擇 dataset_id。";
+          return;
+        }
+        note.className = "small text-muted";
+        note.textContent = "Gold ETL 執行中…";
+        try {
+          const res = await fetch("/delta/gold/word-frequency/run", {
+            method: "POST",
+            headers: adminHeadersJson(),
+            body: JSON.stringify({ dataset_id: PIPELINE_DATASET_ID, dry_run: false }),
+          });
+          const txt = await res.text();
+          let data = {};
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            note.className = "small text-danger";
+            note.textContent = "失敗：" + ((data && data.error) || txt);
+            return;
+          }
+          const gr = data.gold_result || data;
+          const out = gr && typeof gr.gold_output_rows === "number" ? gr.gold_output_rows : "—";
+          note.className = "small text-success";
+          note.textContent = "Gold ETL 成功，gold_output_rows=" + out + "。請至 Dashboard 看圖表。";
+        } catch (err) {
+          note.className = "small text-danger";
+          note.textContent = "失敗：" + String(err);
+        }
+      });
+
+      document.getElementById("btn-run-pipeline-gold").addEventListener("click", async function () {
+        const note = document.getElementById("pipeline-note");
+        const btn = document.getElementById("btn-run-pipeline-gold");
+        if (!PIPELINE_DATASET_ID) {
+          note.className = "small text-danger";
+          note.textContent = "請先在上方選擇 dataset_id。";
+          return;
+        }
+        const skip = document.getElementById("skip_gold_if_no_new_ocr").checked;
+        const prog = createPipelineProgressUi(
+          "pipeline-progress-wrap",
+          "pipeline-progress-bar",
+          "pipeline-progress-text"
+        );
+        note.className = "small text-muted";
+        note.textContent = "一鍵管線執行中…";
+        btn.disabled = true;
+        try {
+          const result = await runPipelineToGoldWithProgress(
+            PIPELINE_DATASET_ID,
+            adminHeadersOnly(),
+            prog,
+            skip
+          );
+          if (!result.ok) {
+            note.className = "small text-danger";
+            note.textContent = "失敗：" + (result.error || "未知錯誤");
+            return;
+          }
+          note.className = "small text-success";
+          note.textContent = "一鍵 ETL 成功。請重新整理預覽或至 Dashboard 看圖表。";
+        } catch (err) {
+          prog.done();
+          note.className = "small text-danger";
+          note.textContent = "失敗：" + String(err);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

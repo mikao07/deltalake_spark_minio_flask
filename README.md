@@ -12,17 +12,17 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 | `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
 | `services/ocr_spark.py` | Bronze OCR：binaryFile → Tesseract → Delta |
 | `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
-| `templates/` | `index.html`、`upload.html`、`layers.html`（首頁以詞頻與痛點主題快照為主） |
+| `templates/` | `index.html`（Dashboard）、`pipeline_bronze|silver|gold.html`（管線分頁）、`layers.html`（除錯預覽） |
 | `tests/` | `pytest`：API 驗證、MinIO 檔名邏輯（可不透過真 Spark/MinIO） |
 | `.github/workflows/ci.yml` | Push／PR 至 `main`/`master` 時自動執行 `pytest`（GitHub Actions） |
 
 ### 資料管線（摘要）
 
-- **Bronze**：`raw/images/{dataset_id}/` 影像 → OCR（Tesseract）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入；讀檔時限圖片副檔名與檔頭（非圖片不進 OCR）。
-- **Silver**：OCR 文字去重、MERGE 至 `SILVER_OCR_TABLE_PATH`；**Jieba 分詞 + 內建停用詞**（了、是、這等）產出 `tokens` 欄位，無需人工維護辭典檔。
-- **Gold**：優先讀取銀層 `tokens` 做詞頻與痛點主題；舊銀層表無 `tokens` 時退回金層 Jieba。可選自訂辭典／外部停用詞（依 `dataset_id` 路徑）；**痛點主題**寫入 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照表。
+- **Bronze**：`raw/images/{dataset_id}/` 影像 → OCR（Tesseract，預設 **`OCR_PSM=11`**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入；讀檔時限圖片副檔名與檔頭（非圖片不進 OCR）。OCR 參數見 **OCR 調校**。
+- **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 去標點與正規化空白；**Jieba 分詞 + 內建停用詞** 產出 `tokens` 欄位，MERGE 至 `SILVER_OCR_TABLE_PATH`。金層僅消費 `tokens`，不再清洗原文。
+- **Gold**：優先讀取銀層 `tokens` 做詞頻與痛點主題；**`dataset_id=drinks` 會套用內建領域停用詞**（好喝、珍珠等），亦可上傳 `dic/stop_words/drinks.txt` 至 MinIO 擴充。痛點主題規則見 `services/pain_topic_rules.py`（v1.2-drinks：服務態度、出錯重做、載具發票、結帳支付等）。
 - **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
-- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**上傳頁** `/upload` 有同名勾選（預設開啟），與 API 欄位對應；上傳區與「手動一鍵」兩處會互相同步。
+- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**金層頁** `/pipeline/gold` 有同名勾選（預設開啟）；**銅層頁**上傳表單亦有一鍵選項。
 
 ### 功能（API 摘要）
 
@@ -39,7 +39,7 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **金層詞頻 ETL**（Silver→Gold）：`POST /delta/gold/word-frequency/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
 - **痛點快照僅重建**（不寫詞頻表）：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
 - **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）
-- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見上傳頁說明）
+- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見金層管線頁說明）
 - **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
 - **Silver OCR ETL**：`POST /delta/silver/ocr/run`
 - **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`；`MAX_UPLOAD_MB` 限制大小）
@@ -65,7 +65,55 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **Python**：本機開發建議 **3.12**（與 `Dockerfile` 一致）；`requirements.txt` 為 PySpark 3.5 / Delta 3.0 系）
 - **Java**：Spark 需要 JVM（容器內為 **JDK 17**）
 - **MinIO 或 S3 相容儲存**：本機、遠端或容器內皆可，由 `MINIO_ENDPOINT` 等設定
-- **OCR**：需 [Tesseract](https://github.com/tesseract-ocr/tesseract) 與語言包（繁中、英文）。Windows 可設定 `TESSERACT_CMD` 指向 `tesseract.exe`；**Docker 映像（slim / ubuntu）已含 Tesseract 語言包**
+- **OCR**：需 [Tesseract](https://github.com/tesseract-ocr/tesseract) 與語言包（繁中、英文）。Windows 可設定 `TESSERACT_CMD` 指向 `tesseract.exe`；**Docker 映像（slim / ubuntu）已含 Tesseract 語言包**。預設 **`OCR_PSM=11`**（稀疏文字，適合評論截圖）；詳見下方 **OCR 調校**。
+
+### OCR 調校（Bronze / Tesseract）
+
+銅層 OCR 由 `services/ocr_spark.py` 執行：讀取 MinIO 影像 → **可調前處理**（放大、灰階、對比度、銳利度）→ **Tesseract** → 寫入 Bronze Delta。下列環境變數可在 **`.env`** 設定（亦見 `.env.example`）：
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `OCR_LANG` | `chi_tra+eng` | Tesseract 語言包；純中文評論可試 `chi_tra` |
+| `OCR_PSM` | `11` | Page Segmentation Mode；**11**＝稀疏文字；**6**＝單一文字區塊（長段落可 A/B） |
+| `OCR_SCALE_MIN_SIDE` | `0` | 短邊低於此像素時等比放大；手機截圖建議 **1400～1800** |
+| `OCR_CONTRAST` | `1.5` | 灰階後對比度倍率；可試 **1.8～2.0** |
+| `OCR_SHARPNESS` | `1.0` | 銳利度倍率；可試 **1.1～1.3** |
+| `TESSERACT_CMD` | （空） | Windows 本機可指向 `tesseract.exe` 完整路徑 |
+| `OCR_PREPROCESS_VERSION` | `v1` | 前處理版本標記，會寫入 Bronze 的 `ocr_signature`（調參後請 bump） |
+| `OCR_SIGNATURE` | （空） | 自訂簽章；未設時由 lang / psm / pre / scale 等自動組成 |
+
+**調校順序建議**（由低成本到高成本）：
+
+1. **前處理**：`OCR_SCALE_MIN_SIDE` + `OCR_CONTRAST`（多數截圖錯字先試這個）
+2. **PSM / 語言**：`OCR_PSM=6` 與 `11` 對照；純中文可改 `OCR_LANG=chi_tra`
+3. **重跑 Bronze**（`write_mode=overwrite`）→ Silver → Gold
+4. 仍不足再評估 **PaddleOCR** 或品牌 **user-words**
+
+`.env` 範例（評論截圖起點）：
+
+```env
+OCR_LANG=chi_tra
+OCR_PSM=11
+OCR_SCALE_MIN_SIDE=1600
+OCR_CONTRAST=1.8
+OCR_SHARPNESS=1.2
+OCR_PREPROCESS_VERSION=v2
+```
+
+**變更 OCR 設定後**，需讓銅層重新辨識影像：
+
+1. **重建 Docker**（若用容器）：`docker compose up --build -d`
+2. 至 **`/pipeline/bronze`** 執行 Bronze OCR；`write_mode` 建議 **`overwrite`**（全量重掃），或 **`append`**（僅處理 `ocr_signature` 變更後尚未處理的圖）
+3. 再執行 **Silver ETL** → **Gold ETL**
+
+本機可先對單張圖試 PSM（需已安裝 Tesseract）：
+
+```powershell
+tesseract 你的截圖.png stdout -l chi_tra --psm 11
+tesseract 你的截圖.png stdout -l chi_tra --psm 6
+```
+
+若 PSM 調整後仍常出現形近字錯誤（例如「囂張」→「靈張」），可再評估：上傳較清晰原圖、加強影像前處理（放大短邊），或改用 PaddleOCR 等引擎。
 
 ### 快速開始（Windows / PowerShell）
 
@@ -97,9 +145,19 @@ python .\app.py
 
 預設：`http://127.0.0.1:5000`  
 首頁 Dashboard：`http://127.0.0.1:5000/`（選定 `dataset_id` 後可使用 **刪除痛點快照** 區塊，呼叫 `POST /delta/gold/topic-snapshot/delete`）  
-上傳頁：`http://127.0.0.1:5000/upload`
+**資料管線（分頁）**：
 
-**上傳頁（一鍵金層）**：勾選「上傳後一鍵跑到金層」或按「一鍵跑到金層」時，可一併使用 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合只更新停用詞或自訂辭典路徑後要重算詞頻。行為等同 API 的 `skip_gold_if_no_new_ocr`：`true` ＝無新 OCR 時略過後段，`false` ＝仍跑完整管線。
+| URL | 用途 |
+|-----|------|
+| `/pipeline/bronze` | 上傳、Bronze OCR、`write_mode`、Bronze 預覽 |
+| `/pipeline/silver` | Silver ETL、分詞／停用詞狀態、銀層預覽 |
+| `/pipeline/gold` | Gold ETL、一鍵管線、金層預覽 |
+| `/layers` | 三層表格除錯（進階） |
+| `/upload` | 相容舊連結，302 導向 `/pipeline/bronze` |
+
+頂部導覽列可帶 `?dataset_id=` 跨頁共用同一分類。
+
+**金層頁（一鍵管線）**：可勾選 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合只更新停用詞或自訂辭典路徑後要重算詞頻。行為等同 API 的 `skip_gold_if_no_new_ocr`：`true` ＝無新 OCR 時略過後段，`false` ＝仍跑完整管線。`write_mode`（append／overwrite）**僅在銅層頁**設定。
 
 ---
 

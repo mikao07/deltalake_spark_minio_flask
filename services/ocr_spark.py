@@ -46,6 +46,57 @@ def _looks_like_image_bytes(data: bytes) -> bool:
     )
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def preprocess_image_for_ocr(img):
+    """
+    Bronze OCR 前處理（可由 .env 調校）：
+    - OCR_SCALE_MIN_SIDE：短邊低於此值時等比放大（0=不放大）
+    - OCR_CONTRAST：對比度倍率（灰階後）
+    - OCR_SHARPNESS：銳利度倍率（1.0=不變）
+    """
+    from PIL import Image, ImageEnhance
+
+    scale_min = max(0, _env_int("OCR_SCALE_MIN_SIDE", 0))
+    if scale_min > 0:
+        w, h = img.size
+        short = min(w, h)
+        if 0 < short < scale_min:
+            factor = scale_min / short
+            new_size = (max(1, int(w * factor)), max(1, int(h * factor)))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    img = img.convert("L")
+
+    contrast = _env_float("OCR_CONTRAST", 1.5)
+    if contrast != 1.0:
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+
+    sharpness = _env_float("OCR_SHARPNESS", 1.0)
+    if sharpness != 1.0:
+        img = ImageEnhance.Sharpness(img).enhance(sharpness)
+
+    return img
+
+
 def _ocr_binary_to_text(image_content) -> Optional[str]:
     """
     將影像二進位內容轉成文字（於 Spark Python UDF 內執行，需在 worker 上能呼叫 tesseract）。
@@ -54,13 +105,14 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
         import pytesseract
         from io import BytesIO
 
-        from PIL import Image, ImageEnhance
+        from PIL import Image
 
         cmd = os.getenv("TESSERACT_CMD", "").strip()
         if cmd:
             pytesseract.pytesseract.tesseract_cmd = cmd
 
         ocr_lang = os.getenv("OCR_LANG", "chi_tra+eng")
+        ocr_psm = os.getenv("OCR_PSM", "11").strip() or "11"
 
         if image_content is None:
             return None
@@ -75,11 +127,9 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
         buf = BytesIO(data)
         buf.seek(0)
         img = Image.open(buf)
-        img = img.convert("L")
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.5)
+        img = preprocess_image_for_ocr(img)
 
-        text = pytesseract.image_to_string(img, lang=ocr_lang, config="--psm 6")
+        text = pytesseract.image_to_string(img, lang=ocr_lang, config=f"--psm {ocr_psm}")
         result = text.strip() or "OCR_EMPTY_RESULT"
         return result
 
@@ -98,9 +148,12 @@ def _get_ocr_signature() -> str:
     if sig:
         return sig
     lang = os.getenv("OCR_LANG", "chi_tra+eng").strip() or "chi_tra+eng"
-    psm = os.getenv("OCR_PSM", "6").strip() or "6"
+    psm = os.getenv("OCR_PSM", "11").strip() or "11"
     pre = os.getenv("OCR_PREPROCESS_VERSION", "v1").strip() or "v1"
-    return f"tesseract|lang={lang}|psm={psm}|pre={pre}"
+    scale = str(max(0, _env_int("OCR_SCALE_MIN_SIDE", 0)))
+    contrast = str(_env_float("OCR_CONTRAST", 1.5))
+    sharp = str(_env_float("OCR_SHARPNESS", 1.0))
+    return f"tesseract|lang={lang}|psm={psm}|pre={pre}|scale={scale}|ctr={contrast}|shp={sharp}"
 
 
 def _extract_bucket_and_prefix(raw_images_path: str) -> tuple[str, str]:

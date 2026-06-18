@@ -1,0 +1,59 @@
+{# 管線共用導覽：Dashboard + 銅／銀／金 + 除錯預覽 #}
+{% macro pipeline_url(endpoint) -%}
+  {%- if selected_dataset_id -%}
+    {{ url_for(endpoint, dataset_id=selected_dataset_id) }}
+  {%- else -%}
+    {{ url_for(endpoint) }}
+  {%- endif -%}
+{%- endmacro %}
+
+<nav class="mb-4">
+  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+    <div class="d-flex flex-wrap align-items-center gap-2">
+      <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('index') }}">Dashboard</a>
+      <div class="btn-group btn-group-sm" role="group" aria-label="資料管線">
+        <a
+          class="btn {% if pipeline_step == 'bronze' %}btn-primary{% else %}btn-outline-primary{% endif %}"
+          href="{{ pipeline_url('pipeline_bronze_page') }}"
+          >銅層 Bronze</a
+        >
+        <a
+          class="btn {% if pipeline_step == 'silver' %}btn-primary{% else %}btn-outline-primary{% endif %}"
+          href="{{ pipeline_url('pipeline_silver_page') }}"
+          >銀層 Silver</a
+        >
+        <a
+          class="btn {% if pipeline_step == 'gold' %}btn-primary{% else %}btn-outline-primary{% endif %}"
+          href="{{ pipeline_url('pipeline_gold_page') }}"
+          >金層 Gold</a
+        >
+      </div>
+      <a class="btn btn-outline-secondary btn-sm" href="{{ pipeline_url('layers_preview_page') }}"
+        >資料層除錯</a
+      >
+    </div>
+    {% if selected_dataset_id %}
+      <span class="small text-muted"
+        >目前 dataset：<code>{{ selected_dataset_id }}</code></span
+      >
+    {% endif %}
+  </div>
+  <form method="get" class="card shadow-sm">
+    <div class="card-body py-2">
+      <div class="row g-2 align-items-end">
+        <div class="col-12 col-md-8">
+          <label class="form-label small mb-1">dataset_id（管線各層共用）</label>
+          <select class="form-select form-select-sm" name="dataset_id">
+            <option value="" {% if not selected_dataset_id %}selected{% endif %}>— 請選擇 —</option>
+            {% for ds in dataset_options %}
+              <option value="{{ ds }}" {% if selected_dataset_id == ds %}selected{% endif %}>{{ ds }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-12 col-md-4 d-grid">
+          <button type="submit" class="btn btn-sm btn-primary">套用 dataset</button>
+        </div>
+      </div>
+    </div>
+  </form>
+</nav>

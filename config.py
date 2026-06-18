@@ -103,7 +103,12 @@ RAW_IMAGES_PATH = os.getenv("RAW_IMAGES_PATH", f"s3a://{BUCKET_NAME}/{RAW_IMAGE_
 
 # OCR（Tesseract / pytesseract）：語言包需已安裝於系統；Windows 可設 TESSERACT_CMD 指向 tesseract.exe
 OCR_LANG = os.getenv("OCR_LANG", "chi_tra+eng")
+OCR_PSM = os.getenv("OCR_PSM", "11")
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
+# 前處理：短邊放大（0=不放大）、對比度、銳利度
+OCR_SCALE_MIN_SIDE = os.getenv("OCR_SCALE_MIN_SIDE", "0")
+OCR_CONTRAST = os.getenv("OCR_CONTRAST", "1.5")
+OCR_SHARPNESS = os.getenv("OCR_SHARPNESS", "1.0")
 
 # 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
 UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()

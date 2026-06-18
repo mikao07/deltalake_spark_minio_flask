@@ -14,10 +14,12 @@
       <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
         <h1 class="h3 mb-0">系統監控與資料湖預覽</h1>
         <div class="d-flex flex-wrap gap-2">
-          <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('layers_preview_page') }}"
-            >資料層預覽（銅／銀／金）</a
+          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}"
+            >資料管線（銅／銀／金）</a
           >
-          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('upload_page') }}">上傳圖片至 MinIO</a>
+          <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('layers_preview_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('layers_preview_page') }}"
+            >資料層除錯</a
+          >
         </div>
       </div>
       <form method="get" class="card shadow-sm mb-4">
@@ -645,9 +647,11 @@
       </script>
     {% endif %}
     {% if selected_dataset_id %}
+      <script id="topic-snap-del-dataset-data" type="application/json">{{ selected_dataset_id|tojson }}</script>
       <script>
         (function () {
-          var ds = {{ selected_dataset_id|tojson }};
+          var dsEl = document.getElementById("topic-snap-del-dataset-data");
+          var ds = dsEl ? JSON.parse(dsEl.textContent || '""') : "";
           var sel = document.getElementById("topic-snap-del-select");
           var tok = document.getElementById("topic-snap-del-token");
           var out = document.getElementById("topic-snap-del-result");

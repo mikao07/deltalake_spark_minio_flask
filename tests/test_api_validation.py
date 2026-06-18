@@ -27,10 +27,12 @@ def test_health_ok(monkeypatch):
 
 def test_upload_page_ok(monkeypatch):
     c = _client(monkeypatch)
-    r = c.get("/upload")
+    r = c.get("/upload", follow_redirects=True)
     assert r.status_code == 200
     assert b"upload-form" in r.data
     assert b"result-table" in r.data
+    r2 = c.get("/pipeline/bronze")
+    assert r2.status_code == 200
 
 
 def test_delta_read_requires_table_path(monkeypatch):

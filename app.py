@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 from werkzeug.exceptions import HTTPException
 
 # 本機用 `python app.py` 啟動時，Python 不會自動載入 `.env`（Docker Compose 才會）。
@@ -73,7 +73,9 @@ app = Flask(__name__)
 # 僅使用此目錄下單一檔名，避免 Windows 路徑別名造成「兩份 index」誤改。
 TEMPLATE_INDEX = "index.html"
 TEMPLATE_LAYERS = "layers.html"
-TEMPLATE_UPLOAD = "upload.html"
+TEMPLATE_PIPELINE_BRONZE = "pipeline_bronze.html"
+TEMPLATE_PIPELINE_SILVER = "pipeline_silver.html"
+TEMPLATE_PIPELINE_GOLD = "pipeline_gold.html"
 
 _logger = logging.getLogger("car_rental_flask_spark_delta")
 if not _logger.handlers:
@@ -517,10 +519,123 @@ def _safe_gold_disk_preview(
         return [], str(e)
 
 
+def _parse_pipeline_dataset_context(step: str) -> Dict[str, Any]:
+    """管線分頁共用：dataset 選項與目前 pipeline_step。"""
+    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    selected_dataset_id: str | None = None
+    if dataset_raw:
+        try:
+            selected_dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError:
+            selected_dataset_id = None
+
+    dataset_options: list[str] = []
+    try:
+        dataset_options = list_dataset_ids()
+    except Exception as e:
+        _logger.warning("list_dataset_ids_for_pipeline_failed: %s", e)
+
+    return {
+        "pipeline_step": step,
+        "dataset_options": dataset_options,
+        "selected_dataset_id": selected_dataset_id,
+    }
+
+
+def _latest_etl_metric_for(etl_name: str, dataset_id: str | None) -> Dict[str, Any] | None:
+    rows = read_etl_metrics(limit=20, dataset_id=dataset_id or None)
+    for row in rows:
+        if row.get("etl_name") == etl_name:
+            return row
+    return None
+
+
 @app.get("/upload")
 def upload_page():
-    """瀏覽器上傳圖片至 MinIO（表單 POST 改由前端 fetch 呼叫 /api/upload/images）。"""
-    return render_template(TEMPLATE_UPLOAD)
+    """相容舊連結：導向銅層管線頁。"""
+    qs = request.query_string.decode()
+    target = url_for("pipeline_bronze_page")
+    if qs:
+        return redirect(f"{target}?{qs}")
+    return redirect(target)
+
+
+@app.get("/pipeline/bronze")
+def pipeline_bronze_page():
+    ctx = _parse_pipeline_dataset_context("bronze")
+    bronze_rows, bronze_error = _safe_bronze_preview(
+        limit=10,
+        dataset_id=ctx.get("selected_dataset_id"),
+        newest_first=True,
+    )
+    return render_template(
+        TEMPLATE_PIPELINE_BRONZE,
+        bronze_path=BRONZE_TABLE_PATH,
+        bronze_rows=bronze_rows,
+        bronze_error=bronze_error,
+        **ctx,
+    )
+
+
+@app.get("/pipeline/silver")
+def pipeline_silver_page():
+    ctx = _parse_pipeline_dataset_context("silver")
+    selected = ctx.get("selected_dataset_id")
+    preview_limit = 15
+    silver_rows, silver_error = _safe_silver_preview(
+        limit=preview_limit,
+        dataset_id=selected,
+        newest_first=True,
+    )
+    bronze_rows, _ = _safe_bronze_preview(limit=1, dataset_id=selected, newest_first=True)
+    dictionary_status: Dict[str, Any] = {}
+    try:
+        dictionary_status = get_dictionary_usage_status(_get_spark_manager().spark, selected)
+    except Exception as e:
+        _logger.warning("dictionary_status_check_failed: %s", e)
+        dictionary_status = {
+            "dataset_id": selected,
+            "jieba_userdict_used": False,
+            "stopwords_used": False,
+            "builtin_stopwords_count": 0,
+            "error": str(e),
+        }
+    return render_template(
+        TEMPLATE_PIPELINE_SILVER,
+        silver_path=SILVER_OCR_TABLE_PATH,
+        silver_rows=silver_rows,
+        silver_error=silver_error,
+        preview_limit=preview_limit,
+        bronze_has_rows=bool(bronze_rows) if selected else None,
+        dictionary_status=dictionary_status,
+        latest_silver_metric=_latest_etl_metric_for("silver_ocr_etl", selected),
+        **ctx,
+    )
+
+
+@app.get("/pipeline/gold")
+def pipeline_gold_page():
+    ctx = _parse_pipeline_dataset_context("gold")
+    selected = ctx.get("selected_dataset_id")
+    preview_limit = 15
+    gold_disk_rows, gold_disk_error = _safe_gold_disk_preview(
+        limit=preview_limit,
+        dataset_id=selected,
+        newest_first=True,
+    )
+    gold_disk_hint = None
+    if not gold_disk_error and not gold_disk_rows and selected:
+        gold_disk_hint = "已選 dataset 但 Gold 表無對應列；請確認已執行金層 ETL 且 dataset_id 欄位一致。"
+    return render_template(
+        TEMPLATE_PIPELINE_GOLD,
+        gold_path=GOLD_WORD_COUNT_PATH,
+        gold_disk_rows=gold_disk_rows,
+        gold_disk_error=gold_disk_error,
+        gold_disk_hint=gold_disk_hint,
+        preview_limit=preview_limit,
+        latest_gold_metric=_latest_etl_metric_for("gold_word_frequency_etl", selected),
+        **ctx,
+    )
 
 
 @app.get("/")

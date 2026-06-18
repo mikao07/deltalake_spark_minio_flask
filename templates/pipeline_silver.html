@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>銀層 Silver - OCR數據分析系統</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      .table-scroll {
+        max-height: 420px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container py-4" style="max-width: 960px">
+      {% include 'includes/pipeline_nav.html' %}
+
+      <h1 class="h4 mb-2">銀層 Silver：清洗、分詞與 MERGE</h1>
+      <p class="text-muted small mb-3">
+        從 Bronze OCR 讀取 → <code>cleaned_text</code>（去標點）→ Jieba 分詞 <code>tokens</code> → MERGE 至
+        <code>{{ silver_path }}</code>。預覽時 <code>extracted_text</code> 為 OCR 原文；分析請看 <code>cleaned_text</code> / <code>tokens</code>。
+      </p>
+      <div class="alert alert-info small py-2 mb-4">
+        <strong>建議下一步：</strong>
+        {% if selected_dataset_id and silver_rows and silver_rows|length > 0 %}
+          銀層已有資料 →
+          <a href="{{ url_for('pipeline_gold_page', dataset_id=selected_dataset_id) }}">金層 Gold ETL</a>
+        {% elif selected_dataset_id %}
+          請先確認銅層 OCR 已完成 →
+          <a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) }}">返回銅層</a>
+        {% else %}
+          請在上方選擇 <code>dataset_id</code> 後執行 Silver ETL。
+        {% endif %}
+      </div>
+
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h2 class="h6 mb-3">執行 Silver ETL</h2>
+          <div class="mb-3">
+            <label class="form-label">管理 Token（可選）</label>
+            <input
+              class="form-control form-control-sm"
+              type="password"
+              id="admin_token"
+              placeholder="若設定了 ADMIN_TOKEN"
+              autocomplete="off"
+            />
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-run-silver">執行 Silver OCR ETL</button>
+          <p class="small text-muted mt-2 mb-0" id="silver-etl-note"></p>
+          {% if latest_silver_metric %}
+            <div class="alert alert-light border small py-2 mt-3 mb-0">
+              <strong>最近一次 Silver ETL：</strong>
+              status={{ latest_silver_metric.status }} · duration={{ latest_silver_metric.duration_ms or '—' }} ms
+              {% if latest_silver_metric.error %}<br />錯誤：{{ latest_silver_metric.error }}{% endif %}
+            </div>
+          {% endif %}
+        </div>
+      </div>
+
+      <section class="card shadow-sm mb-4">
+        <div class="card-header py-2"><strong>分詞與辭典狀態</strong></div>
+        <div class="card-body small">
+          {% if dictionary_status.error %}
+            <div class="alert alert-warning py-2 mb-2">檢查失敗：{{ dictionary_status.error }}</div>
+          {% endif %}
+          <div class="mb-2">
+            <strong>銀層自動分詞：</strong>
+            <span class="text-success">Jieba + 內建停用詞</span>
+            <span class="text-muted ms-1">（{{ dictionary_status.builtin_stopwords_count or '—' }} 個）</span>
+          </div>
+          <div class="mb-1">
+            <strong>Jieba 自訂辭典（可選）：</strong>
+            {% if dictionary_status.jieba_userdict_used %}
+              <span class="text-success">已套用</span>
+              <code class="ms-1">{{ dictionary_status.jieba_userdict_path }}</code>
+            {% else %}
+              <span class="text-muted">未設定</span>
+            {% endif %}
+          </div>
+          <div>
+            <strong>外部停用詞（可選）：</strong>
+            {% if dictionary_status.stopwords_used %}
+              <span class="text-success">已套用</span>
+              <code class="ms-1">{{ dictionary_status.stopwords_path }}</code>
+              <span class="text-muted ms-1">({{ dictionary_status.stopwords_count }} 詞)</span>
+            {% else %}
+              <span class="text-muted">未設定（僅內建停用詞）</span>
+            {% endif %}
+          </div>
+        </div>
+      </section>
+
+      <section class="card shadow-sm">
+        <div class="card-header py-2"><strong>Silver 預覽（最多 {{ preview_limit }} 列）</strong></div>
+        <div class="card-body">
+          <p class="small text-muted mb-2">{{ silver_path }}</p>
+          {% if bronze_has_rows is not none %}
+            <p class="small mb-2">
+              銅層（同 dataset）：{% if bronze_has_rows %}有資料{% else %}<span class="text-warning">尚無列</span>{% endif %}
+            </p>
+          {% endif %}
+          {% if silver_error %}
+            <div class="alert alert-warning py-2 small mb-0">讀取失敗：{{ silver_error }}</div>
+          {% elif silver_rows and silver_rows|length > 0 %}
+            <div class="table-scroll border rounded">
+              <table class="table table-sm table-striped mb-0 align-middle">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    {% for k in silver_rows[0].keys() %}
+                      <th class="small">{{ k }}</th>
+                    {% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in silver_rows %}
+                    <tr>
+                      {% for k, v in row.items() %}
+                        <td class="small text-break">
+                          {% if v is none %}-{% elif k in ['extracted_text', 'cleaned_text', 'tokens'] %}{% set s = v | string %}{{ s[:300] }}{% if s|length > 300 %}…{% endif %}{% else %}{{ v }}{% endif %}
+                        </td>
+                      {% endfor %}
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="text-muted small mb-0">無資料（請先跑銅層 OCR 再執行 Silver ETL）。</p>
+          {% endif %}
+        </div>
+      </section>
+    </div>
+
+    <script id="pipeline-silver-dataset-data" type="application/json">{{ (selected_dataset_id or '') | tojson }}</script>
+    <script>
+      const PIPELINE_DATASET_ID = JSON.parse(
+        document.getElementById("pipeline-silver-dataset-data").textContent || '""'
+      );
+
+      function adminHeadersJson() {
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = { "Content-Type": "application/json" };
+        if (tok) headers["X-Admin-Token"] = tok;
+        return headers;
+      }
+
+      document.getElementById("btn-run-silver").addEventListener("click", async function () {
+        const note = document.getElementById("silver-etl-note");
+        const datasetId = PIPELINE_DATASET_ID;
+        if (!datasetId) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "請先在上方導覽選擇 dataset_id。";
+          return;
+        }
+        note.className = "small text-muted mt-2 mb-0";
+        note.textContent = "Silver ETL 執行中（可能較久）…";
+        try {
+          const res = await fetch("/delta/silver/ocr/run", {
+            method: "POST",
+            headers: adminHeadersJson(),
+            body: JSON.stringify({ dataset_id: datasetId, dry_run: false }),
+          });
+          const txt = await res.text();
+          let data = {};
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            note.className = "small text-danger mt-2 mb-0";
+            note.textContent = "Silver ETL 失敗：" + ((data && data.error) || txt || res.statusText);
+            return;
+          }
+          note.className = "small text-success mt-2 mb-0";
+          const rows =
+            data.updated_rows !== undefined && data.updated_rows !== null ? data.updated_rows : "—";
+          note.textContent =
+            "Silver ETL 成功：dataset_id=" + datasetId + "，updated_rows=" + rows + "。可重新整理頁面看預覽。";
+        } catch (err) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "Silver ETL 失敗：" + String(err);
+        }
+      });
+    </script>
+  </body>
+</html>

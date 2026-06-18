@@ -1,7 +1,10 @@
 """
-銀層分詞與內建停用詞（純 Python，可單元測試、供 Spark UDF 呼叫）。
+銀層文字清洗、分詞與內建停用詞（純 Python，可單元測試、供 Spark UDF 呼叫）。
 
-Bronze 保留 OCR 原文；Silver 以 Jieba 分詞並剔除贅詞，產出 tokens 陣列供金層聚合。
+分層職責：
+- Bronze：保留 OCR 原文（extracted_text）
+- Silver：cleaned_text（去標點、正規化空白）→ tokens（Jieba + 停用詞）
+- Gold：僅消費銀層 tokens，不再清洗原文
 """
 
 from __future__ import annotations
@@ -133,6 +136,8 @@ BUILTIN_STOPWORDS: frozenset[str] = frozenset(w.lower() for w in _BUILTIN_STOPWO
 
 _MIN_WORD_LENGTH = 2
 
+# 與 spark_service._silver_cleaned_text_expr 的 Spark 正則對齊（\p{L}\p{N} + 底線 + 空白）
+SILVER_CLEAN_TEXT_SPARK_PATTERN = r"[^\p{L}\p{N}\s_]"
 _CLEAN_TEXT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 
 
@@ -187,11 +192,17 @@ def segment_text_to_tokens(
     userdict_local_path: str | None = None,
     extra_stopwords: Iterable[str] | None = None,
     apply_noise_filter: bool = True,
+    already_cleaned: bool = False,
 ) -> List[str]:
     """
-    清洗 → Jieba 分詞 → 停用詞過濾。供 Spark Python UDF 在 executor 上呼叫。
+    清洗（可選）→ Jieba 分詞 → 停用詞過濾。供 Spark Python UDF 在 executor 上呼叫。
+    銀層應先寫入 cleaned_text，再以 already_cleaned=True 分詞，避免重複清洗。
     """
-    cleaned = clean_text_for_segmentation(text)
+    if already_cleaned:
+        cleaned = str(text).strip().lower() if text is not None else ""
+        cleaned = " ".join(cleaned.split())
+    else:
+        cleaned = clean_text_for_segmentation(text)
     if not cleaned:
         return []
 

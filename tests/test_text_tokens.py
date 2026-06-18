@@ -18,6 +18,15 @@ def test_clean_text_for_segmentation_strips_punctuation():
     assert clean_text_for_segmentation("  珍珠奶茶，很好喝！  ") == "珍珠奶茶 很好喝"
 
 
+def test_segment_text_to_tokens_already_cleaned_skips_restrip():
+    from services.text_tokens import segment_text_to_tokens
+
+    raw = "珍珠奶茶 很好喝"
+    assert segment_text_to_tokens(raw, already_cleaned=True, apply_noise_filter=False) == segment_text_to_tokens(
+        "珍珠奶茶，很好喝！", already_cleaned=False, apply_noise_filter=False
+    )
+
+
 def test_filter_segmented_tokens_removes_stopwords():
     words = ["珍珠", "奶茶", "很", "好喝", "了", "是", "這"]
     out = filter_segmented_tokens(words)

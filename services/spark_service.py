@@ -60,7 +60,9 @@ from config import (
     S3A_PATH_STYLE_ACCESS,
     SILVER_OCR_TABLE_PATH,
 )
-from services.text_tokens import BUILTIN_STOPWORDS
+from services.domain_lexicons import get_builtin_domain_stopwords, merge_stopword_lists
+from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
+from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -192,6 +194,23 @@ def delta_table_exists(spark: SparkSession, table_path: str) -> bool:
         return bool(DeltaTable.isDeltaTable(spark, table_path))
 
 
+def _ensure_delta_columns(
+    spark: SparkSession,
+    table_path: str,
+    columns: dict[str, str],
+    *,
+    existing_cols: set[str] | None = None,
+) -> set[str]:
+    """既有 Delta 表補齊缺少欄位（schema evolution），回傳更新後欄位集合。"""
+    cols = set(existing_cols) if existing_cols is not None else set(read_delta_table(spark, table_path).columns)
+    for name, dtype in columns.items():
+        if name in cols:
+            continue
+        spark.sql(f"ALTER TABLE delta.`{table_path}` ADD COLUMNS ({name} {dtype})")
+        cols.add(name)
+    return cols
+
+
 def _hadoop_path_exists(spark: SparkSession, path: str) -> bool:
     """使用 Hadoop FileSystem 檢查路徑是否存在（支援 s3a:// 與本機路徑）。"""
     if not path or not str(path).strip():
@@ -278,15 +297,31 @@ def _extract_dataset_id_col(df: DataFrame) -> DataFrame:
 _silver_tokens_udf_cache: dict[str, Any] = {}
 
 
+def _silver_cleaned_text_expr(source_col: str = "extracted_text"):
+    """
+    銀層正式清洗：去標點、壓縮空白、轉小寫。
+    與 text_tokens.clean_text_for_segmentation 語意對齊（見 SILVER_CLEAN_TEXT_SPARK_PATTERN）。
+    """
+    src = trim(col(source_col))
+    return lower(
+        trim(
+            regexp_replace(
+                regexp_replace(src, SILVER_CLEAN_TEXT_SPARK_PATTERN, " "),
+                r"\s+",
+                " ",
+            )
+        )
+    )
+
+
 def build_silver_ocr_updates_from_bronze(
     df_bronze: DataFrame,
     *,
     dataset_id: str | None = None,
 ) -> DataFrame:
     """
-    Bronze OCR -> Silver 更新集（去重、清洗）。
-    清洗僅做 trim：勿使用 Java \\W 剝除首尾，否則中文正文會被當成「非文字」而整段清空。
-    分詞與停用詞在 enrich_silver_dataframe_with_tokens 產出 tokens 欄位。
+    Bronze OCR -> Silver 更新集（去重、保留原文）。
+    標點清理與分詞在 enrich_silver_dataframe_with_tokens 產出 cleaned_text / tokens。
     """
     ds = _normalize_dataset_id_or_none(dataset_id)
     df = df_bronze.filter(col("extracted_text").isNotNull())
@@ -306,8 +341,7 @@ def build_silver_ocr_updates_from_bronze(
         )
     )
 
-    # 注意：Spark/Java 預設的 \W「非文字」不含 CJK，会把整段中文當成 \W 從首尾剝掉，導致銀層 extracted_text 變空。
-    # 這裡只削掉首尾「空白」，不再用 [\s\W_]+（與 Notebook 舊式 regex 在中文語料下行為不同，但可避免誤刪正文）。
+    # Bronze 原文僅 trim；勿用 Java \W 剝首尾（會誤刪 CJK 正文）。
     df = df.withColumn("extracted_text", trim(col("extracted_text")))
     df = _extract_dataset_id_col(df)
     if ds:
@@ -362,6 +396,7 @@ def _make_silver_tokens_udf(
                 userdict_local_path=None,
                 extra_stopwords=extra_list,
                 apply_noise_filter=True,
+                already_cleaned=True,
             )
         except Exception as e:
             _logger.warning("silver_tokens_udf_failed_once: %s", e)
@@ -396,13 +431,16 @@ def enrich_silver_dataframe_with_tokens(
     extra_stopwords: Iterable[str] | None = None,
     dataset_id_for_log: str | None = None,
 ) -> DataFrame:
-    """Silver：Jieba 分詞 + 內建／外部停用詞，寫入 tokens 陣列欄位。"""
+    """Silver：cleaned_text（去標點）→ Jieba 分詞 + 停用詞 → tokens。"""
     tokens_udf = _get_silver_tokens_udf(
         jieba_userdict_path,
         extra_stopwords=extra_stopwords,
         dataset_id_for_log=dataset_id_for_log,
     )
-    return df.withColumn("tokens", tokens_udf(col("extracted_text")))
+    return (
+        df.withColumn("cleaned_text", _silver_cleaned_text_expr())
+        .withColumn("tokens", tokens_udf(col("cleaned_text")))
+    )
 
 
 def run_silver_ocr_etl(
@@ -412,7 +450,7 @@ def run_silver_ocr_etl(
     dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Bronze OCR -> Silver OCR（去重、清洗、分詞 tokens、MERGE）。
+    Bronze OCR -> Silver OCR（去重、cleaned_text、分詞 tokens、MERGE）。
     """
     spark = SparkManager().spark
     bronze = bronze_path or BRONZE_TABLE_PATH
@@ -429,10 +467,7 @@ def run_silver_ocr_etl(
         active_userdict_path,
         dataset_id=ds,
     )
-    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
-    extra_stopwords: List[str] = []
-    if active_stopwords_path:
-        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+    extra_stopwords, active_stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
 
     df_updates = enrich_silver_dataframe_with_tokens(
         df_updates,
@@ -452,6 +487,7 @@ def run_silver_ocr_etl(
             "silver_ocr_path": silver,
             "bronze_path": bronze,
             "tokens_column_written": True,
+            "cleaned_text_column_written": True,
             "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         }
 
@@ -459,7 +495,18 @@ def run_silver_ocr_etl(
     batch_ts_lit = lit(batch_ts)
 
     if delta_table_exists(spark, silver):
+        # 先補 schema，再建立 DeltaTable（否則 MERGE 仍用舊欄位清單）
+        _ensure_delta_columns(
+            spark,
+            silver,
+            {
+                "cleaned_text": "STRING",
+                "tokens": "ARRAY<STRING>",
+                "dataset_id": "STRING",
+            },
+        )
         delta_table = DeltaTable.forPath(spark, silver)
+        # ALTER 後必須重讀，否則 df_target 仍為舊 schema（無 dataset_id / tokens / cleaned_text）
         df_target = read_delta_table(spark, silver)
         target_cols = set(df_target.columns)
         df_target_cmp = df_target.select(
@@ -468,6 +515,9 @@ def run_silver_ocr_etl(
             col("source_bucket").alias("_t_source_bucket"),
             col("ingestion_timestamp").alias("_t_ingestion_timestamp"),
             col("dataset_id").alias("_t_dataset_id") if "dataset_id" in target_cols else lit(None).alias("_t_dataset_id"),
+            col("cleaned_text").alias("_t_cleaned_text")
+            if "cleaned_text" in target_cols
+            else lit(None).cast(StringType()).alias("_t_cleaned_text"),
             col("tokens").alias("_t_tokens")
             if "tokens" in target_cols
             else lit(None).cast(ArrayType(StringType())).alias("_t_tokens"),
@@ -485,10 +535,14 @@ def run_silver_ocr_etl(
         unchanged_expr = (
             col("t._t_image_path").isNotNull()
             & (col("u.extracted_text") == col("t._t_extracted_text"))
+            & (col("u.cleaned_text") == col("t._t_cleaned_text"))
             & (col("u.source_bucket") == col("t._t_source_bucket"))
             & (col("u.latest_ingestion_timestamp") == col("t._t_ingestion_timestamp"))
             & same_dataset_expr
         )
+        if "cleaned_text" in target_cols:
+            cleaned_stale = col("t._t_cleaned_text").isNull() | (length(trim(col("t._t_cleaned_text"))) == 0)
+            unchanged_expr = unchanged_expr & (~cleaned_stale)
         if "tokens" in target_cols:
             tokens_stale = col("t._t_tokens").isNull() | (size(col("t._t_tokens")) == 0)
             unchanged_expr = unchanged_expr & (~tokens_stale)
@@ -524,6 +578,14 @@ def run_silver_ocr_etl(
             "etl_update_timestamp": batch_ts_lit,
             "tokens": col("source.tokens"),
         }
+        if "cleaned_text" in target_cols:
+            update_set["cleaned_text"] = col("source.cleaned_text")
+            insert_values["cleaned_text"] = col("source.cleaned_text")
+        else:
+            _logger.warning(
+                "silver_merge_missing_cleaned_text_column: path=%s — 略過寫入 cleaned_text",
+                silver,
+            )
         # 舊 Silver 表可能尚未有 dataset_id，避免 MERGE 直接失敗
         if "dataset_id" in target_cols:
             update_set["dataset_id"] = col("source.dataset_id")
@@ -556,12 +618,15 @@ def run_silver_ocr_etl(
         "silver_ocr_path": silver,
         "bronze_path": bronze,
         "tokens_column_written": True,
+        "cleaned_text_column_written": True,
         "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "jieba_userdict_used": bool(active_userdict_path),
         "jieba_userdict_path": active_userdict_path or "",
-        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_used": bool(extra_stopwords),
         "stopwords_path": active_stopwords_path or "",
         "stopwords_count": len(extra_stopwords),
+        "domain_stopwords_count": domain_stopwords_count,
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
     }
 
 
@@ -575,39 +640,26 @@ _jieba_segment_udf_cache: dict[str, Any] = {}
 # 與 services.text_tokens.BUILTIN_STOPWORDS 對齊（金層 fallback 分詞時使用）
 _COMMON_NOISE = sorted(BUILTIN_STOPWORDS)
 _MIN_WORD_LENGTH = 2
-_TOPIC_RULE_VERSION = "v1.1"
+_TOPIC_RULE_VERSION = TOPIC_RULE_VERSION
 
-# 痛點主題規則（MVP）：可先用於熱門痛點監控，後續再抽成外部設定檔
-_PAIN_TOPIC_RULES: Dict[str, List[str]] = {
-    "等待時間": ["等很久", "等超久", "久等", "排隊", "等待", "慢", "太久", "時間管理"],
-    "服務態度": ["態度差", "不耐煩", "兇", "服務差", "白眼", "口氣差", "親切", "貼心", "爛", "教育訓練"],
-    "出錯重做": ["做錯", "弄錯", "漏單", "少做", "重做", "做錯了", "漏掉", "沒做", "點錯", "做不出來", "忘記"],
-    "品質口感": ["太甜", "太淡", "沒味道", "難喝", "走味", "稀", "不新鮮", "口感", "硬", "不好喝"],
-    "安全衛生": ["不安全", "危險", "衛生", "髒", "地板黏", "蟲", "異物"],
-    "載具發票":["載具","發票","收據","小票"],
-}
 
-# 進階規則：片語 + 極性詞 + 距離容忍（優先判斷）
-_PAIN_TOPIC_POLARITY_RULES: Dict[str, Dict[str, Any]] = {
-    "服務態度": {
-        "anchors": ["服務態度", "態度", "店員", "服務人員", "員工", "無視"],
-        "negatives": ["差", "不好", "爛", "糟", "差勁", "不耐煩", "兇", "口氣差", "白眼", ""],
-        "max_word_gap": 3,
-        "max_char_gap": 8,
-    },
-    "等待時間": {
-        "anchors": ["等", "等待", "排隊", "出餐", "速度", "等候"],
-        "negatives": ["久", "慢", "太久", "很久", "超久", "超慢", "過久"],
-        "max_word_gap": 3,
-        "max_char_gap": 8,
-    },
-       "品質口感": {
-        "anchors": ["珍珠", ],
-        "negatives": ["硬", "超硬"],
-        "max_word_gap": 3,
-        "max_char_gap": 8,
-    },
-}
+def _collect_extra_stopwords(spark: SparkSession, dataset_id: str | None) -> tuple[List[str], str | None, int]:
+    """
+    合併 MinIO 停用詞檔與 dataset 內建領域詞表。
+    回傳 (merged_list, resolved_path_or_none, builtin_count)。
+    """
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = _resolve_existing_stopwords_path(spark, ds)
+    from_file = _load_stopwords_from_path(spark, path) if path else []
+    builtin = get_builtin_domain_stopwords(ds)
+    merged = merge_stopword_lists(from_file, builtin)
+    if builtin and not path:
+        _logger.info(
+            "stopwords_builtin_used: dataset_id=%s count=%s (MinIO 檔未找到，使用內建領域詞表)",
+            ds,
+            len(builtin),
+        )
+    return merged, path, len(builtin)
 
 
 def _normalize_dataset_id_or_none(dataset_id: str | None) -> str | None:
@@ -765,18 +817,17 @@ def get_dictionary_usage_status(
     """
     ds = _normalize_dataset_id_or_none(dataset_id)
     userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
-    stopwords_path = _resolve_existing_stopwords_path(spark, ds)
-    stopwords_count = 0
-    if stopwords_path:
-        stopwords_count = len(_load_stopwords_from_path(spark, stopwords_path))
+    extra_stopwords, stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
     return {
         "dataset_id": ds,
         "jieba_userdict_used": bool(userdict_path),
         "jieba_userdict_path": userdict_path or "",
-        "stopwords_used": bool(stopwords_path),
+        "stopwords_used": bool(extra_stopwords),
         "stopwords_path": stopwords_path or "",
-        "stopwords_count": stopwords_count,
+        "stopwords_count": len(extra_stopwords),
+        "domain_stopwords_count": domain_stopwords_count,
         "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
+        "topic_rule_version": _TOPIC_RULE_VERSION,
         "silver_tokenization": "jieba_with_builtin_stopwords",
     }
 
@@ -894,39 +945,27 @@ def _build_filtered_keyword_exploded_dataframe(
     extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
     """
-    產出 (image_path, keyword) 列：優先使用銀層 tokens；舊表無 tokens 時退回金層 Jieba 分詞。
+    產出 (image_path, keyword) 列：僅使用銀層 tokens。
+    標點清理與分詞應在 Silver 完成；金層不再對 extracted_text 做清洗或 Jieba。
     """
-    if "tokens" in df_silver_ocr.columns:
-        df_keywords_exploded = (
-            df_silver_ocr.select("image_path", explode(col("tokens")).alias("keyword"))
-            .filter(col("keyword").isNotNull() & (col("keyword") != ""))
+    if "tokens" not in df_silver_ocr.columns:
+        _logger.warning(
+            "gold_keywords_missing_silver_tokens: dataset_id=%s — 請重跑 Silver ETL 以產出 cleaned_text / tokens",
+            dataset_id_for_log,
         )
-        if not apply_noise_filter:
-            return df_keywords_exploded
-        noise_terms = sorted(set(_COMMON_NOISE) | set(extra_stopwords or []))
-        return df_keywords_exploded.filter(
-            (length(col("keyword")) >= _MIN_WORD_LENGTH)
-            & (~col("keyword").rlike("^[0-9]+$"))
-            & (~col("keyword").rlike("^[a-z]{1,2}$"))
-            & (~col("keyword").isin(noise_terms))
+        return (
+            df_silver_ocr.select(
+                lit(None).cast(StringType()).alias("image_path"),
+                lit(None).cast(StringType()).alias("keyword"),
+            ).filter(lit(False))
         )
 
-    df_keywords = df_silver_ocr.withColumn(
-        "cleaned_text",
-        lower(regexp_replace(col("extracted_text"), r"[^\p{L}\p{N}\s_]", "")),
-    )
-    segment_udf = _get_jieba_segment_udf(
-        jieba_userdict_path,
-        dataset_id_for_log=dataset_id_for_log,
-    )
-    df_diagnose = df_keywords.withColumn("word_array", segment_udf(col("cleaned_text")))
     df_keywords_exploded = (
-        df_diagnose.select("image_path", explode(col("word_array")).alias("keyword"))
-        .filter(col("keyword") != "")
+        df_silver_ocr.select("image_path", explode(col("tokens")).alias("keyword"))
+        .filter(col("keyword").isNotNull() & (col("keyword") != ""))
     )
     if not apply_noise_filter:
         return df_keywords_exploded
-
     noise_terms = sorted(set(_COMMON_NOISE) | set(extra_stopwords or []))
     return df_keywords_exploded.filter(
         (length(col("keyword")) >= _MIN_WORD_LENGTH)
@@ -945,7 +984,7 @@ def build_gold_word_frequency_dataframe(
     extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
     """
-    從 Silver OCR 表（需含 extracted_text；Notebook 另用到 image_path）產生 keyword / frequency 聚合。
+    從 Silver OCR 表（需含 tokens；清洗在銀層完成）產生 keyword / frequency 聚合。
     apply_noise_filter=True 時採用 Notebook 第二段淨化規則（長度、純數字、**極短英文**、雜訊詞）。
     extra_stopwords 為外部停用詞表（與內建 _COMMON_NOISE 合併）。
     英文僅剔除 1～2 個字母（舊版曾剔除 1～4 字，會把 good/food/like 等大量評論常用詞清掉，導致詞頻幾乎為空）。
@@ -1183,77 +1222,8 @@ def get_gold_phrase_candidates_data(
 
 
 def _make_topic_label_udf():
-    def _contains_hint(word_set, joined_text, joined_no_space, hint: str) -> bool:
-        h = str(hint).strip().lower()
-        if not h:
-            return False
-        return h in word_set or h in joined_text or h in joined_no_space
-
-    def _is_near_by_word_gap(words: List[str], anchors: List[str], negatives: List[str], max_gap: int) -> bool:
-        anchor_idx = [i for i, w in enumerate(words) if w in anchors]
-        neg_idx = [i for i, w in enumerate(words) if w in negatives]
-        if not anchor_idx or not neg_idx:
-            return False
-        return any(abs(ai - ni) <= max_gap for ai in anchor_idx for ni in neg_idx)
-
-    def _is_near_by_char_gap(joined_no_space: str, anchors: List[str], negatives: List[str], max_gap: int) -> bool:
-        if not joined_no_space:
-            return False
-        for a in anchors:
-            a0 = str(a).strip().lower()
-            if not a0:
-                continue
-            for n in negatives:
-                n0 = str(n).strip().lower()
-                if not n0:
-                    continue
-                if re.search(rf"{re.escape(a0)}.{{0,{max_gap}}}{re.escape(n0)}", joined_no_space):
-                    return True
-                if re.search(rf"{re.escape(n0)}.{{0,{max_gap}}}{re.escape(a0)}", joined_no_space):
-                    return True
-        return False
-
     def label_topics(words):
-        if not words:
-            return []
-        safe_words = [str(w).strip().lower() for w in words if str(w).strip()]
-        if not safe_words:
-            return []
-        word_set = set(safe_words)
-        joined_text = " ".join(safe_words)
-        joined_no_space = "".join(safe_words)
-        hit_topics: List[str] = []
-
-        # 1) 先走進階「片語 + 極性詞」規則（可抓到：服務態度很差 / 非常差）
-        for topic, cfg in _PAIN_TOPIC_POLARITY_RULES.items():
-            anchors = [str(x).strip().lower() for x in cfg.get("anchors", []) if str(x).strip()]
-            negatives = [str(x).strip().lower() for x in cfg.get("negatives", []) if str(x).strip()]
-            if not anchors or not negatives:
-                continue
-            has_anchor = any(_contains_hint(word_set, joined_text, joined_no_space, a) for a in anchors)
-            has_negative = any(_contains_hint(word_set, joined_text, joined_no_space, n) for n in negatives)
-            if not (has_anchor and has_negative):
-                continue
-
-            max_word_gap = int(cfg.get("max_word_gap", 3))
-            max_char_gap = int(cfg.get("max_char_gap", 8))
-            if _is_near_by_word_gap(safe_words, anchors, negatives, max_word_gap) or _is_near_by_char_gap(
-                joined_no_space,
-                anchors,
-                negatives,
-                max_char_gap,
-            ):
-                hit_topics.append(topic)
-
-        # 2) 再走既有關鍵詞命中規則（補足其他主題與舊資料相容）
-        for topic, hints in _PAIN_TOPIC_RULES.items():
-            if topic in hit_topics:
-                continue
-            for hint in hints:
-                if _contains_hint(word_set, joined_text, joined_no_space, str(hint)):
-                    hit_topics.append(topic)
-                    break
-        return hit_topics
+        return label_pain_topics(words)
 
     return udf(label_topics, ArrayType(StringType()))
 
@@ -1663,15 +1633,14 @@ def run_gold_topic_snapshot_rebuild_etl(
         _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
     else:
         _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
-    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
-    extra_stopwords: List[str] = []
-    if active_stopwords_path:
-        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+    extra_stopwords, active_stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
+    if extra_stopwords:
         _logger.info(
-            "stopwords_selected: dataset_id=%s path=%s count=%s",
+            "stopwords_selected: dataset_id=%s path=%s count=%s domain_builtin=%s",
             ds,
-            active_stopwords_path,
+            active_stopwords_path or "<builtin>",
             len(extra_stopwords),
+            domain_stopwords_count,
         )
     else:
         _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
@@ -1713,9 +1682,11 @@ def run_gold_topic_snapshot_rebuild_etl(
         "topic_frequency_top": topic_frequency_top,
         "jieba_userdict_used": bool(active_userdict_path),
         "jieba_userdict_path": active_userdict_path or "",
-        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_used": bool(extra_stopwords),
         "stopwords_path": active_stopwords_path or "",
         "stopwords_count": len(extra_stopwords),
+        "domain_stopwords_count": domain_stopwords_count,
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "summary": summary,
     }
 
@@ -1750,15 +1721,14 @@ def run_gold_word_frequency_etl(
         _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
     else:
         _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
-    active_stopwords_path = _resolve_existing_stopwords_path(spark, ds)
-    extra_stopwords: List[str] = []
-    if active_stopwords_path:
-        extra_stopwords = _load_stopwords_from_path(spark, active_stopwords_path)
+    extra_stopwords, active_stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
+    if extra_stopwords:
         _logger.info(
-            "stopwords_selected: dataset_id=%s path=%s count=%s",
+            "stopwords_selected: dataset_id=%s path=%s count=%s domain_builtin=%s",
             ds,
-            active_stopwords_path,
+            active_stopwords_path or "<builtin>",
             len(extra_stopwords),
+            domain_stopwords_count,
         )
     else:
         _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
@@ -1913,15 +1883,16 @@ def run_gold_word_frequency_etl(
         "gold_dataset_rows_after": gold_dataset_rows_after,
         "jieba_userdict_used": bool(active_userdict_path),
         "jieba_userdict_path": active_userdict_path or "",
-        "stopwords_used": bool(active_stopwords_path),
+        "stopwords_used": bool(extra_stopwords),
         "stopwords_path": active_stopwords_path or "",
         "stopwords_count": len(extra_stopwords),
+        "domain_stopwords_count": domain_stopwords_count,
+        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "silver_tokens_source": (
             "silver_tokens_column"
             if "tokens" in df_silver.columns
-            else "gold_jieba_fallback"
+            else "silver_tokens_missing"
         ),
-        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "topic_output_rows": topic_output_rows,
         "topic_snapshot_rows": topic_snapshot_rows,
         "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
