@@ -19,7 +19,7 @@ from services.text_similarity import (
     pain_fuzzy_min_ratio,
 )
 
-TOPIC_RULE_VERSION = "v1.3-drinks-fuzzy"
+TOPIC_RULE_VERSION = "v1.4.1-drinks-funnel-invoice"
 
 # 明確負面／抱怨片語（不含「親切、貼心」等正面詞）
 PAIN_TOPIC_RULES: Dict[str, List[str]] = {
@@ -33,6 +33,8 @@ PAIN_TOPIC_RULES: Dict[str, List[str]] = {
         "等半天",
         "時間管理",
         "等太久",
+        "好慢",
+        "好久",
     ],
     "服務態度": [
         "態度差",
@@ -91,18 +93,19 @@ PAIN_TOPIC_RULES: Dict[str, List[str]] = {
         "不干净",
     ],
     "載具發票": [
-        "載具",
-        "发具",
-        "發票",
-        "发票",
-        "收據",
-        "收据",
-        "小票",
-        "統編",
-        "电子发票",
-        "電子發票",
+        # 僅保留明確抱怨片語；「載具／發票／電子發票」等 UI 字樣改由極性規則近距離判斷
         "沒綁載具",
         "没绑载具",
+        "載具沒綁",
+        "载具没绑",
+        "沒綁发具",
+        "發票打錯",
+        "发票打错",
+        "發票開錯",
+        "没开发票",
+        "沒開發票",
+        "漏開發票",
+        "漏开发票",
     ],
     "結帳支付": [
         "結帳",
@@ -151,10 +154,27 @@ PAIN_TOPIC_POLARITY_RULES: Dict[str, Dict[str, Any]] = {
         "max_char_gap": 8,
     },
     "載具發票": {
-        "anchors": ["載具", "發票", "收據", "小票", "統編"],
-        "negatives": ["沒", "无", "無", "錯", "漏", "問題", "綁", "绑", "爛"],
-        "max_word_gap": 4,
-        "max_char_gap": 12,
+        "anchors": ["載具", "发具", "發票", "发票", "電子發票", "电子发票", "收據", "收据", "小票", "統編"],
+        "negatives": [
+            "沒綁",
+            "没绑",
+            "沒開",
+            "没开",
+            "漏開",
+            "漏开",
+            "開錯",
+            "开错",
+            "打錯",
+            "打错",
+            "失敗",
+            "失败",
+            "無法",
+            "无法",
+            "綁定",
+            "绑定",
+        ],
+        "max_word_gap": 3,
+        "max_char_gap": 8,
     },
     "結帳支付": {
         "anchors": ["結帳", "结账", "付", "付款", "支付", "收銀", "收银", "line", "pay"],
@@ -262,68 +282,14 @@ def _is_near_by_char_gap(
 
 
 def label_pain_topics(words: Sequence[str] | None) -> List[str]:
-    """由單則評論的 token 列表產出痛點主題標籤（去重、保留順序）。"""
-    if not words:
-        return []
-    safe_words = [str(w).strip().lower() for w in words if str(w).strip()]
-    if not safe_words:
-        return []
-    word_set = set(safe_words)
-    joined_text = " ".join(safe_words)
-    joined_no_space = "".join(safe_words)
-    hit_topics: List[str] = []
-    anchor_ratio = pain_fuzzy_anchor_ratio()
+    """由單則評論的 token 列表產出痛點主題標籤（漏斗第二層確認後）。"""
+    from services.pain_funnel import analyze_pain_review
 
-    for topic, cfg in PAIN_TOPIC_POLARITY_RULES.items():
-        anchors = [str(x).strip().lower() for x in cfg.get("anchors", []) if str(x).strip()]
-        negatives = [str(x).strip().lower() for x in cfg.get("negatives", []) if str(x).strip()]
-        if not anchors or not negatives:
-            continue
-        has_anchor = any(
-            _contains_hint(
-                word_set,
-                joined_text,
-                joined_no_space,
-                a,
-                allow_fuzzy=True,
-                fuzzy_ratio=anchor_ratio,
-            )
-            for a in anchors
-        )
-        has_negative = any(
-            _contains_hint(word_set, joined_text, joined_no_space, n, allow_fuzzy=False)
-            for n in negatives
-        )
-        if not (has_anchor and has_negative):
-            continue
-        max_word_gap = int(cfg.get("max_word_gap", 3))
-        max_char_gap = int(cfg.get("max_char_gap", 8))
-        if _is_near_by_word_gap(
-            safe_words,
-            anchors,
-            negatives,
-            max_word_gap,
-            anchor_fuzzy_ratio=anchor_ratio,
-        ) or _is_near_by_char_gap(
-            joined_no_space,
-            anchors,
-            negatives,
-            max_char_gap,
-        ):
-            hit_topics.append(topic)
+    return analyze_pain_review(words).pain_topics
 
-    for topic, hints in PAIN_TOPIC_RULES.items():
-        if topic in hit_topics:
-            continue
-        for hint in hints:
-            if _contains_hint(
-                word_set,
-                joined_text,
-                joined_no_space,
-                str(hint),
-                allow_fuzzy=True,
-            ):
-                hit_topics.append(topic)
-                break
 
-    return hit_topics
+def analyze_pain_review_tokens(words: Sequence[str] | None):
+    """執行完整漏斗；回傳 PainReviewAnalysis（含 candidates、sentiment）。"""
+    from services.pain_funnel import analyze_pain_review
+
+    return analyze_pain_review(words)

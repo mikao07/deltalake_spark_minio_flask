@@ -12,7 +12,8 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 | `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
 | `services/ocr_spark.py` | Bronze OCR：binaryFile → 前處理（含二值化）→ Tesseract（含 user-words）→ Delta |
 | `services/domain_lexicons.py` | 依 `dataset_id` 內建停用詞、Jieba 詞、OCR user-words |
-| `services/pain_topic_rules.py` | Gold 痛點主題規則（含模糊匹配抗 OCR 錯字） |
+| `services/pain_funnel.py` | 痛點漏斗：撈網 → 過濾 → 情緒（`pain_candidates` / `sentiment`） |
+| `services/pain_topic_rules.py` | 痛點主題詞庫與極性規則（供漏斗使用） |
 | `services/text_similarity.py` | 痛點規則用的字串相似度（rapidfuzz / difflib fallback） |
 | `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
 | `dic/` | 領域辭典：`stop_words/`、`jieba_dicts/`、`ocr_user_words/`（可上傳 MinIO 擴充） |
@@ -24,7 +25,7 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 
 - **Bronze**：`raw/images/{dataset_id}/` 影像 → **可調前處理**（放大、灰階、對比、銳化、**二值化**）→ **Tesseract**（預設 **`OCR_PSM=11`**，可載入 **user-words**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**領域辭典**。
 - **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 去標點與正規化空白；**Jieba 分詞 + 內建停用詞**（可選 **自訂 Jieba 詞典**）產出 `tokens`，MERGE 至 `SILVER_OCR_TABLE_PATH`。金層僅消費 `tokens`。
-- **Gold**：讀銀層 `tokens` 做詞頻與痛點主題；**`dataset_id=drinks` 套用內建領域停用詞**，可上傳 `dic/stop_words/drinks.txt` 擴充。痛點主題見 `services/pain_topic_rules.py`（**v1.3-drinks-fuzzy**：規則式分類 + **模糊匹配** 容忍 OCR 錯字）。**詞頻／TF-IDF 為輔助探索；商業結論請看痛點主題快照。**
+- **Gold**：讀銀層 `tokens` 跑**痛點漏斗**（撈網 → 過濾 → 情緒）產出主題；`dataset_id=drinks` 套用內建領域停用詞（詞頻用）。規則 **`v1.4-drinks-funnel`**。
 - **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
 - **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**金層頁** `/pipeline/gold` 有同名勾選（預設開啟）；**銅層頁**上傳表單亦有一鍵選項。
 
@@ -154,9 +155,13 @@ tesseract 你的截圖.png stdout -l chi_tra --psm 6
 
 ### 痛點主題與模糊匹配（Gold）
 
-- **主輸出**：首頁 **痛點主題快照**（`GOLD_TOPIC_SNAPSHOT_PATH`），由 `label_pain_topics()` 對銀層 `tokens` 打標。
-- **規則**：`services/pain_topic_rules.py`（`TOPIC_RULE_VERSION=v1.3-drinks-fuzzy`）— 片語規則 + 錨點／負面詞距離規則。
-- **模糊匹配**：`services/text_similarity.py` — OCR 錯字（如 `出餐漫` ≈ `出餐慢`）仍可歸類；可用環境變數調整：
+- **主輸出**：首頁 **痛點主題快照**（`GOLD_TOPIC_SNAPSHOT_PATH`），由痛點**漏斗**對銀層 `tokens` 打標。
+- **漏斗**（`services/pain_funnel.py`）：
+  1. **第一層撈網**：關鍵字 + 模糊匹配，產出 `pain_candidates`（高 recall）
+  2. **第二層過濾**：片語／極性規則；**負面證據優先**；僅正向（如很好、不錯）且無負面 → 剔除痛點
+  3. **情緒**：`positive` \| `neutral` \| `negative`（有痛點主題或負面證據 → negative）
+- **規則版本**：`services/pain_topic_rules.py`（`TOPIC_RULE_VERSION=v1.4-drinks-funnel`）
+- **模糊匹配**：`services/text_similarity.py`（`PAIN_FUZZY_*`）
 
 | 變數 | 預設 | 說明 |
 |------|------|------|

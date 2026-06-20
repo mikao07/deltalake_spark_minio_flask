@@ -1251,18 +1251,26 @@ def build_gold_pain_topic_frequency_dataframe(
 ) -> DataFrame:
     """
     從同一批評論計算痛點主題頻率（以 image_path 視為單一評論文件，單文件內同主題只計一次）。
+    使用銀層完整 tokens 跑痛點漏斗（非詞頻用停用詞過濾後的 keyword 子集）。
     """
-    df_exploded = _build_filtered_keyword_exploded_dataframe(
-        df_silver_ocr,
-        dataset_id_for_log=dataset_id_for_log,
-        jieba_userdict_path=jieba_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords,
+    del apply_noise_filter, extra_stopwords, jieba_userdict_path  # 痛點標註用完整 tokens
+
+    if "tokens" not in df_silver_ocr.columns:
+        _logger.warning(
+            "gold_pain_topics_missing_tokens: dataset_id=%s",
+            dataset_id_for_log,
+        )
+        spark = df_silver_ocr.sparkSession
+        return spark.createDataFrame([], "topic string, frequency long")
+
+    df_docs = df_silver_ocr.filter(col("tokens").isNotNull() & (size(col("tokens")) > 0)).select(
+        "image_path",
+        col("tokens"),
     )
-    df_doc_keywords = df_exploded.groupBy("image_path").agg(collect_set("keyword").alias("doc_keywords"))
     df_topics = (
-        df_doc_keywords.withColumn("topics", _topic_label_udf(col("doc_keywords")))
+        df_docs.withColumn("topics", _topic_label_udf(col("tokens")))
         .select(explode(col("topics")).alias("topic"))
+        .filter(col("topic").isNotNull() & (col("topic") != ""))
     )
     return (
         df_topics.groupBy("topic")
