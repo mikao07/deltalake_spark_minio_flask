@@ -35,4 +35,4 @@ jobs:
         env:
           BUCKET_NAME: data-lake
           ALLOWED_DELTA_PATH_PREFIXES: s3a://data-lake/
-        run: pytest tests/ -q --tb=short
+        run: python -m pytest tests/ -q --tb=short
