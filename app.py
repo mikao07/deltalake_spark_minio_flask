@@ -229,7 +229,6 @@ def _execute_pipeline_to_gold_inner(
     dataset_id: str,
     raw_images_path: str,
     write_mode: str,
-    apply_noise_filter: bool,
     coalesce_partitions: int,
     skip_gold_if_no_new_ocr: bool,
     progress: Callable[[int, int, str], None],
@@ -255,7 +254,6 @@ def _execute_pipeline_to_gold_inner(
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
                 "gold_path": GOLD_WORD_COUNT_PATH,
                 "write_mode": write_mode,
-                "apply_noise_filter": apply_noise_filter,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
                 "is_incremental_short_circuit": True,
@@ -294,7 +292,6 @@ def _execute_pipeline_to_gold_inner(
             silver_ocr_path=SILVER_OCR_TABLE_PATH,
             gold_path=GOLD_WORD_COUNT_PATH,
             dataset_id=dataset_id,
-            apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
             silver_batch_ts=silver_result.get("silver_batch_ts"),
             prefer_incremental=bool(silver_result.get("inserted_rows", 0) > 0),
@@ -309,7 +306,6 @@ def _execute_pipeline_to_gold_inner(
             "silver_ocr_path": SILVER_OCR_TABLE_PATH,
             "gold_path": GOLD_WORD_COUNT_PATH,
             "write_mode": write_mode,
-            "apply_noise_filter": apply_noise_filter,
             "coalesce_partitions": coalesce_partitions,
             "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
             "bronze_result": bronze_result,
@@ -1487,7 +1483,6 @@ def delta_gold_word_frequency_run():
         "dataset_id": "invoice_ocr",
         "silver_ocr_path": "s3a://.../silver/ocr_features/",
         "gold_path": "s3a://.../gold/word_frequency/",
-        "apply_noise_filter": true,
         "coalesce_partitions": 1,
         "dry_run": false
       }
@@ -1506,7 +1501,6 @@ def delta_gold_word_frequency_run():
             "dataset_id",
             "silver_ocr_path",
             "gold_path",
-            "apply_noise_filter",
             "coalesce_partitions",
             "dry_run",
         ),
@@ -1542,7 +1536,6 @@ def delta_gold_word_frequency_run():
     if err:
         return err
 
-    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
     try:
         coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
     except (TypeError, ValueError):
@@ -1556,7 +1549,6 @@ def delta_gold_word_frequency_run():
                 "dataset_id": dataset_id,
                 "silver_ocr_path": silver_ocr_path,
                 "gold_path": gold_path,
-                "apply_noise_filter": apply_noise_filter,
                 "coalesce_partitions": coalesce_partitions,
             }
         )
@@ -1568,7 +1560,6 @@ def delta_gold_word_frequency_run():
             silver_ocr_path=silver_ocr_path,
             gold_path=gold_path,
             dataset_id=dataset_id,
-            apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
         )
         _record_etl_metric(
@@ -1579,7 +1570,6 @@ def delta_gold_word_frequency_run():
                 "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "silver_ocr_path": silver_ocr_path,
                 "gold_path": gold_path,
-                "apply_noise_filter": apply_noise_filter,
                 "output_rows": gold_result.get("gold_output_rows"),
                 "silver_filtered_rows": gold_result.get("silver_filtered_rows"),
                 "is_gold_written": gold_result.get("is_gold_written"),
@@ -1596,7 +1586,6 @@ def delta_gold_word_frequency_run():
                 "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "silver_ocr_path": silver_ocr_path,
                 "gold_path": gold_path,
-                "apply_noise_filter": apply_noise_filter,
                 "error": str(e),
             }
         )
@@ -1608,7 +1597,6 @@ def delta_gold_word_frequency_run():
             "dataset_id": dataset_id,
             "silver_ocr_path": silver_ocr_path,
             "gold_path": gold_path,
-            "apply_noise_filter": apply_noise_filter,
             "coalesce_partitions": coalesce_partitions,
             "gold_result": gold_result,
             "是否成功寫入金層": "是" if gold_result.get("is_gold_written") else "否",
@@ -1624,7 +1612,7 @@ def delta_gold_topic_snapshot_rebuild():
     適用：手動清空 MinIO 上 topic_snapshot 目錄後，依 Silver 補寫快照。
 
     body 或查詢參數（dataset_id 必填）:
-      { "dataset_id": "drinks", "silver_ocr_path": "s3a://.../", "apply_noise_filter": true, "dry_run": false }
+      { "dataset_id": "drinks", "silver_ocr_path": "s3a://.../", "dry_run": false }
 
     查詢字串範例：POST /delta/gold/topic-snapshot/rebuild?dataset_id=drinks
     """
@@ -1634,7 +1622,7 @@ def delta_gold_topic_snapshot_rebuild():
 
     body = _merge_missing_from_query(
         _parse_request_json_object(),
-        ("dataset_id", "silver_ocr_path", "apply_noise_filter", "dry_run"),
+        ("dataset_id", "silver_ocr_path", "dry_run"),
     )
     if not isinstance(body, dict):
         return _json_error("body 必須是 JSON object。", 400)
@@ -1663,7 +1651,6 @@ def delta_gold_topic_snapshot_rebuild():
     if err:
         return err
 
-    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
     dry_run = _body_get_bool(body, "dry_run", False)
     if dry_run:
         return jsonify(
@@ -1672,7 +1659,6 @@ def delta_gold_topic_snapshot_rebuild():
                 "dataset_id": dataset_id,
                 "silver_ocr_path": silver_ocr_path,
                 "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
-                "apply_noise_filter": apply_noise_filter,
             }
         )
 
@@ -1682,7 +1668,6 @@ def delta_gold_topic_snapshot_rebuild():
         result = run_gold_topic_snapshot_rebuild_etl(
             silver_ocr_path=silver_ocr_path,
             dataset_id=dataset_id,
-            apply_noise_filter=apply_noise_filter,
         )
         _record_etl_metric(
             {
@@ -1798,7 +1783,6 @@ def delta_pipeline_to_gold_run():
       {
         "dataset_id": "invoice_ocr",
         "write_mode": "append",
-        "apply_noise_filter": true,
         "coalesce_partitions": 1,
         "skip_gold_if_no_new_ocr": true,
         "dry_run": false,
@@ -1819,7 +1803,6 @@ def delta_pipeline_to_gold_run():
         (
             "dataset_id",
             "write_mode",
-            "apply_noise_filter",
             "coalesce_partitions",
             "skip_gold_if_no_new_ocr",
             "dry_run",
@@ -1844,7 +1827,6 @@ def delta_pipeline_to_gold_run():
     if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append"):
         return _json_error('write_mode 必須是 "overwrite" 或 "append"。', 400)
 
-    apply_noise_filter = _body_get_bool(body, "apply_noise_filter", True)
     try:
         coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
     except (TypeError, ValueError):
@@ -1878,7 +1860,6 @@ def delta_pipeline_to_gold_run():
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
                 "gold_path": GOLD_WORD_COUNT_PATH,
                 "write_mode": write_mode,
-                "apply_noise_filter": apply_noise_filter,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
             }
@@ -1906,7 +1887,6 @@ def delta_pipeline_to_gold_run():
                 dataset_id=dataset_id,
                 raw_images_path=raw_images_path,
                 write_mode=write_mode,
-                apply_noise_filter=apply_noise_filter,
                 coalesce_partitions=coalesce_partitions,
                 skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
                 progress=progress,
@@ -1930,7 +1910,6 @@ def delta_pipeline_to_gold_run():
             dataset_id=dataset_id,
             raw_images_path=raw_images_path,
             write_mode=write_mode,
-            apply_noise_filter=apply_noise_filter,
             coalesce_partitions=coalesce_partitions,
             skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
             progress=_noop_progress,

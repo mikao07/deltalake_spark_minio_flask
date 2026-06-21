@@ -47,6 +47,7 @@ services:
     build:
       context: .
       dockerfile: "Dockerfile - ubuntu"
+    image: ${DOCKER_IMAGE:-mikao07/deltalake_spark_minio_flask:latest}
     container_name: car_rental_app
     ports:
       - "${WEB_PORT:-5000}:${PORT:-5000}"

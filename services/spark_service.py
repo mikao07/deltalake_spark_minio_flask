@@ -632,15 +632,10 @@ def run_silver_ocr_etl(
 
 
 # ---------------------------------------------------------------------------
-# Gold 層：優先讀銀層 tokens → 詞頻／痛點主題；無 tokens 時退回 Jieba 分詞
+# Gold 層：讀銀層 tokens → 詞頻／痛點主題／TF-IDF／PMI（過濾已在 Silver 完成）
 # ---------------------------------------------------------------------------
 _jieba_pyfile_registered: str | None = None
 _jieba_userdict_registered: str | None = None
-_jieba_segment_udf_cache: dict[str, Any] = {}
-
-# 與 services.text_tokens.BUILTIN_STOPWORDS 對齊（金層 fallback 分詞時使用）
-_COMMON_NOISE = sorted(BUILTIN_STOPWORDS)
-_MIN_WORD_LENGTH = 2
 _TOPIC_RULE_VERSION = TOPIC_RULE_VERSION
 
 
@@ -877,87 +872,12 @@ def register_jieba_pyfile_if_needed(
                 )
 
 
-def _make_jieba_segment_udf(
-    jieba_userdict_path: str | None = None,
-    dataset_id_for_log: str | None = None,
-):
-    userdict_basename = ""
-    if jieba_userdict_path and str(jieba_userdict_path).strip():
-        userdict_basename = os.path.basename(str(jieba_userdict_path).strip())
-
-    def segment_chinese_jieba_distributed(text):
-        if text is None:
-            return []
-        if not hasattr(segment_chinese_jieba_distributed, "_jieba_initialized"):
-            segment_chinese_jieba_distributed._jieba_initialized = False
-            segment_chinese_jieba_distributed._jieba_error_logged = False
-            segment_chinese_jieba_distributed._userdict_loaded = False
-            segment_chinese_jieba_distributed._userdict_error_logged = False
-        try:
-            import jieba
-
-            if not segment_chinese_jieba_distributed._jieba_initialized:
-                jieba.initialize()
-                segment_chinese_jieba_distributed._jieba_initialized = True
-
-            if (
-                userdict_basename
-                and not segment_chinese_jieba_distributed._userdict_loaded
-            ):
-                try:
-                    userdict_local_path = SparkFiles.get(userdict_basename)
-                    jieba.load_userdict(userdict_local_path)
-                    segment_chinese_jieba_distributed._userdict_loaded = True
-                except Exception as e:
-                    if not segment_chinese_jieba_distributed._userdict_error_logged:
-                        _logger.warning(
-                            "jieba_userdict_load_failed_once: dataset_id=%s path=%s error=%s",
-                            dataset_id_for_log,
-                            jieba_userdict_path,
-                            e,
-                        )
-                        segment_chinese_jieba_distributed._userdict_error_logged = True
-
-            text_cleaned = text
-            words = jieba.cut(text_cleaned, cut_all=False)
-            return [word.strip().lower() for word in words if len(word.strip()) > 0]
-        except Exception as e:
-            if not segment_chinese_jieba_distributed._jieba_error_logged:
-                _logger.warning("jieba_segment_udf_failed_once: %s", e)
-                segment_chinese_jieba_distributed._jieba_error_logged = True
-            return []
-
-    return udf(segment_chinese_jieba_distributed, ArrayType(StringType()))
-
-
-def _get_jieba_segment_udf(
-    jieba_userdict_path: str | None = None,
-    dataset_id_for_log: str | None = None,
-):
-    cache_key = f"{str(jieba_userdict_path or '').strip()}|{str(dataset_id_for_log or '').strip()}"
-    existing = _jieba_segment_udf_cache.get(cache_key)
-    if existing is not None:
-        return existing
-    created = _make_jieba_segment_udf(
-        jieba_userdict_path if str(jieba_userdict_path or "").strip() else None,
-        dataset_id_for_log=dataset_id_for_log,
-    )
-    _jieba_segment_udf_cache[cache_key] = created
-    return created
-
-
-def _build_filtered_keyword_exploded_dataframe(
+def _explode_silver_tokens_to_keywords(
     df_silver_ocr: DataFrame,
     *,
     dataset_id_for_log: str | None = None,
-    jieba_userdict_path: str | None = None,
-    apply_noise_filter: bool = True,
-    extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
-    """
-    產出 (image_path, keyword) 列：僅使用銀層 tokens。
-    標點清理與分詞應在 Silver 完成；金層不再對 extracted_text 做清洗或 Jieba。
-    """
+    """產出 (image_path, keyword) 列：explode 銀層 tokens（停用詞／雜訊過濾已在 Silver 完成）。"""
     if "tokens" not in df_silver_ocr.columns:
         _logger.warning(
             "gold_keywords_missing_silver_tokens: dataset_id=%s — 請重跑 Silver ETL 以產出 cleaned_text / tokens",
@@ -970,18 +890,9 @@ def _build_filtered_keyword_exploded_dataframe(
             ).filter(lit(False))
         )
 
-    df_keywords_exploded = (
+    return (
         df_silver_ocr.select("image_path", explode(col("tokens")).alias("keyword"))
         .filter(col("keyword").isNotNull() & (col("keyword") != ""))
-    )
-    if not apply_noise_filter:
-        return df_keywords_exploded
-    noise_terms = sorted(set(_COMMON_NOISE) | set(extra_stopwords or []))
-    return df_keywords_exploded.filter(
-        (length(col("keyword")) >= _MIN_WORD_LENGTH)
-        & (~col("keyword").rlike("^[0-9]+$"))
-        & (~col("keyword").rlike("^[a-z]{1,2}$"))
-        & (~col("keyword").isin(noise_terms))
     )
 
 
@@ -989,23 +900,11 @@ def build_gold_word_frequency_dataframe(
     df_silver_ocr: DataFrame,
     *,
     dataset_id_for_log: str | None = None,
-    jieba_userdict_path: str | None = None,
-    apply_noise_filter: bool = True,
-    extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
-    """
-    從 Silver OCR 表（需含 tokens；清洗在銀層完成）產生 keyword / frequency 聚合。
-    apply_noise_filter=True 時採用 Notebook 第二段淨化規則（長度、純數字、**極短英文**、雜訊詞）。
-    extra_stopwords 為外部停用詞表（與內建 _COMMON_NOISE 合併）。
-    英文僅剔除 1～2 個字母（舊版曾剔除 1～4 字，會把 good/food/like 等大量評論常用詞清掉，導致詞頻幾乎為空）。
-    """
-
-    df_exploded = _build_filtered_keyword_exploded_dataframe(
+    """從 Silver OCR 表（需含 tokens）產生 keyword / frequency 聚合。"""
+    df_exploded = _explode_silver_tokens_to_keywords(
         df_silver_ocr,
         dataset_id_for_log=dataset_id_for_log,
-        jieba_userdict_path=jieba_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords,
     )
     return (
         df_exploded.groupBy("keyword")
@@ -1147,9 +1046,6 @@ def run_gold_corpus_analytics_etl(
     df_silver: DataFrame,
     *,
     dataset_id: str | None = None,
-    jieba_userdict_path: str | None = None,
-    apply_noise_filter: bool = True,
-    extra_stopwords: Iterable[str] | None = None,
     coalesce_partitions: int = 1,
     min_bigram_count: int = 2,
     tfidf_path: str | None = None,
@@ -1163,12 +1059,9 @@ def run_gold_corpus_analytics_etl(
     tfidf_out = tfidf_path or GOLD_TFIDF_KEYWORDS_PATH
     phrase_out = phrase_path or GOLD_PHRASE_CANDIDATES_PATH
 
-    df_exploded = _build_filtered_keyword_exploded_dataframe(
+    df_exploded = _explode_silver_tokens_to_keywords(
         df_silver,
         dataset_id_for_log=ds,
-        jieba_userdict_path=jieba_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords,
     )
     df_tfidf = build_gold_tfidf_keywords_dataframe(df_exploded)
     df_phrases = build_gold_phrase_candidates_dataframe(df_silver, min_bigram_count=min_bigram_count)
@@ -1245,16 +1138,11 @@ def build_gold_pain_topic_frequency_dataframe(
     df_silver_ocr: DataFrame,
     *,
     dataset_id_for_log: str | None = None,
-    jieba_userdict_path: str | None = None,
-    apply_noise_filter: bool = True,
-    extra_stopwords: Iterable[str] | None = None,
 ) -> DataFrame:
     """
     從同一批評論計算痛點主題頻率（以 image_path 視為單一評論文件，單文件內同主題只計一次）。
-    使用銀層完整 tokens 跑痛點漏斗（非詞頻用停用詞過濾後的 keyword 子集）。
+    使用銀層 tokens 跑痛點漏斗。
     """
-    del apply_noise_filter, extra_stopwords, jieba_userdict_path  # 痛點標註用完整 tokens
-
     if "tokens" not in df_silver_ocr.columns:
         _logger.warning(
             "gold_pain_topics_missing_tokens: dataset_id=%s",
@@ -1628,7 +1516,6 @@ def run_gold_topic_snapshot_rebuild_etl(
     *,
     silver_ocr_path: str | None = None,
     dataset_id: str | None = None,
-    apply_noise_filter: bool = True,
 ) -> Dict[str, Any]:
     """
     僅依 Silver 重算痛點主題並 append 至 topic_snapshot（不寫入詞頻 Gold 表）。
@@ -1640,29 +1527,6 @@ def run_gold_topic_snapshot_rebuild_etl(
     if not ds:
         raise ValueError("dataset_id 必填")
 
-    active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
-    register_jieba_pyfile_if_needed(
-        spark,
-        JIEBA_ZIP_PATH,
-        active_userdict_path,
-        dataset_id=ds,
-    )
-    if active_userdict_path:
-        _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
-    else:
-        _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
-    extra_stopwords, active_stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
-    if extra_stopwords:
-        _logger.info(
-            "stopwords_selected: dataset_id=%s path=%s count=%s domain_builtin=%s",
-            ds,
-            active_stopwords_path or "<builtin>",
-            len(extra_stopwords),
-            domain_stopwords_count,
-        )
-    else:
-        _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
-
     df_silver = read_delta_table(spark, silver)
     df_silver = _filter_df_by_dataset_id(df_silver, ds)
     silver_filtered_rows = int(df_silver.count())
@@ -1670,9 +1534,6 @@ def run_gold_topic_snapshot_rebuild_etl(
     df_topic = build_gold_pain_topic_frequency_dataframe(
         df_silver,
         dataset_id_for_log=ds,
-        jieba_userdict_path=active_userdict_path,
-        apply_noise_filter=apply_noise_filter,
-        extra_stopwords=extra_stopwords if apply_noise_filter else None,
     )
     topic_snapshot_rows = write_gold_topic_snapshot_delta(
         df_topic,
@@ -1698,13 +1559,6 @@ def run_gold_topic_snapshot_rebuild_etl(
         "topic_snapshot_path": GOLD_TOPIC_SNAPSHOT_PATH,
         "topic_rule_version": _TOPIC_RULE_VERSION,
         "topic_frequency_top": topic_frequency_top,
-        "jieba_userdict_used": bool(active_userdict_path),
-        "jieba_userdict_path": active_userdict_path or "",
-        "stopwords_used": bool(extra_stopwords),
-        "stopwords_path": active_stopwords_path or "",
-        "stopwords_count": len(extra_stopwords),
-        "domain_stopwords_count": domain_stopwords_count,
-        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "summary": summary,
     }
 
@@ -1714,7 +1568,6 @@ def run_gold_word_frequency_etl(
     silver_ocr_path: str | None = None,
     gold_path: str | None = None,
     dataset_id: str | None = None,
-    apply_noise_filter: bool = True,
     coalesce_partitions: int = 1,
     silver_batch_ts: str | None = None,
     prefer_incremental: bool = False,
@@ -1728,28 +1581,6 @@ def run_gold_word_frequency_etl(
     silver = silver_ocr_path or SILVER_OCR_TABLE_PATH
     gold = gold_path or GOLD_WORD_COUNT_PATH
     ds = _normalize_dataset_id_or_none(dataset_id)
-    active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
-    register_jieba_pyfile_if_needed(
-        spark,
-        JIEBA_ZIP_PATH,
-        active_userdict_path,
-        dataset_id=ds,
-    )
-    if active_userdict_path:
-        _logger.info("jieba_userdict_selected: dataset_id=%s path=%s", ds, active_userdict_path)
-    else:
-        _logger.info("jieba_userdict_selected: dataset_id=%s path=<none>", ds)
-    extra_stopwords, active_stopwords_path, domain_stopwords_count = _collect_extra_stopwords(spark, ds)
-    if extra_stopwords:
-        _logger.info(
-            "stopwords_selected: dataset_id=%s path=%s count=%s domain_builtin=%s",
-            ds,
-            active_stopwords_path or "<builtin>",
-            len(extra_stopwords),
-            domain_stopwords_count,
-        )
-    else:
-        _logger.info("stopwords_selected: dataset_id=%s path=<none>", ds)
     df_silver = read_delta_table(spark, silver)
     if ds:
         df_silver = _filter_df_by_dataset_id(df_silver, ds)
@@ -1769,16 +1600,10 @@ def run_gold_word_frequency_etl(
             df_wc_delta = build_gold_word_frequency_dataframe(
                 df_silver_delta,
                 dataset_id_for_log=ds,
-                jieba_userdict_path=active_userdict_path,
-                apply_noise_filter=apply_noise_filter,
-                extra_stopwords=extra_stopwords if apply_noise_filter else None,
             )
             df_topic = build_gold_pain_topic_frequency_dataframe(
                 df_silver_delta,
                 dataset_id_for_log=ds,
-                jieba_userdict_path=active_userdict_path,
-                apply_noise_filter=apply_noise_filter,
-                extra_stopwords=extra_stopwords if apply_noise_filter else None,
             )
             topic_snapshot_rows = write_gold_topic_snapshot_delta(
                 df_topic,
@@ -1818,16 +1643,10 @@ def run_gold_word_frequency_etl(
         df_wc = build_gold_word_frequency_dataframe(
             df_silver,
             dataset_id_for_log=ds,
-            jieba_userdict_path=active_userdict_path,
-            apply_noise_filter=apply_noise_filter,
-            extra_stopwords=extra_stopwords if apply_noise_filter else None,
         )
         df_topic = build_gold_pain_topic_frequency_dataframe(
             df_silver,
             dataset_id_for_log=ds,
-            jieba_userdict_path=active_userdict_path,
-            apply_noise_filter=apply_noise_filter,
-            extra_stopwords=extra_stopwords if apply_noise_filter else None,
         )
         topic_snapshot_rows = write_gold_topic_snapshot_delta(
             df_topic,
@@ -1866,7 +1685,7 @@ def run_gold_word_frequency_etl(
     elif silver_filtered_rows > 0:
         summary = (
             f"金層流程有執行，但詞頻產出為 0 筆（Silver 篩選後有 {silver_filtered_rows} 筆）。"
-            "通常是分詞後被雜訊規則過濾掉。"
+            "通常是銀層分詞後 tokens 為空或被停用詞過濾掉。"
         )
     else:
         summary = "金層流程有執行，但 Silver 篩選後為 0 筆，所以沒有可寫入的金層資料。"
@@ -1885,9 +1704,6 @@ def run_gold_word_frequency_etl(
             corpus_analytics = run_gold_corpus_analytics_etl(
                 df_silver,
                 dataset_id=ds,
-                jieba_userdict_path=active_userdict_path,
-                apply_noise_filter=apply_noise_filter,
-                extra_stopwords=extra_stopwords if apply_noise_filter else None,
                 coalesce_partitions=coalesce_partitions,
             )
         except Exception as e:
@@ -1899,13 +1715,6 @@ def run_gold_word_frequency_etl(
         "gold_output_rows": gold_output_rows,
         "gold_total_rows_after": gold_total_rows_after,
         "gold_dataset_rows_after": gold_dataset_rows_after,
-        "jieba_userdict_used": bool(active_userdict_path),
-        "jieba_userdict_path": active_userdict_path or "",
-        "stopwords_used": bool(extra_stopwords),
-        "stopwords_path": active_stopwords_path or "",
-        "stopwords_count": len(extra_stopwords),
-        "domain_stopwords_count": domain_stopwords_count,
-        "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "silver_tokens_source": (
             "silver_tokens_column"
             if "tokens" in df_silver.columns

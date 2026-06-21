@@ -47,6 +47,7 @@ services:
 
   web:
     build: .
+    image: ${DOCKER_IMAGE:-mikao07/deltalake_spark_minio_flask:latest}
     ports:
       - "${WEB_PORT:-5000}:${PORT:-5000}"
     env_file:
