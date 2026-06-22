@@ -81,8 +81,7 @@
 
       <div class="alert alert-light border small mb-4 py-2">
         <strong>說明：</strong><br />
-        · <strong>金層（落盤）</strong>：讀 Delta 表 <code>{{ gold_path }}</code>，為 ETL 寫入結果。<br />
-        · <strong>金層（首頁同源）</strong>：與首頁一致，皆讀落盤 Gold 表；有指定 dataset_id 時會用該欄位過濾。<br />
+        · <strong>金層（TF-IDF 落盤）</strong>：讀 Delta 表 <code>{{ gold_path }}</code>，為 ETL 寫入結果。<br />
         · 若「銀層列數遠少於你的圖片張數」，請先確認該 id 的 Bronze OCR 與 Silver ETL 是否已跑完。
       </div>
 
@@ -247,7 +246,7 @@
       </section>
 
       <section class="layer-section card shadow-sm">
-        <div class="card-header py-2"><strong>Gold — 落盤 Delta 表</strong></div>
+        <div class="card-header py-2"><strong>Gold — TF-IDF Delta 表</strong></div>
         <div class="card-body">
           <p class="path-label text-secondary mb-2">{{ gold_path }}</p>
           {% if gold_disk_error %}
@@ -278,38 +277,6 @@
             {% if gold_disk_hint %}
               <div class="alert alert-info small py-2 mb-0 mt-2">{{ gold_disk_hint }}</div>
             {% endif %}
-          {% endif %}
-        </div>
-      </section>
-
-      <section class="layer-section card shadow-sm">
-        <div class="card-header py-2"><strong>Gold — 與首頁圖表同源（讀落盤 Gold）</strong></div>
-        <div class="card-body">
-          {% if gold_live_error %}
-            <div class="alert alert-warning py-2 small mb-0">讀取／計算失敗：{{ gold_live_error }}</div>
-          {% elif gold_live_rows and gold_live_rows|length > 0 %}
-            <div class="table-scroll border rounded">
-              <table class="table table-sm table-striped mb-0">
-                <thead class="table-light sticky-top">
-                  <tr>
-                    {% for k in gold_live_rows[0].keys() %}
-                      <th class="small">{{ k }}</th>
-                    {% endfor %}
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for row in gold_live_rows %}
-                    <tr>
-                      {% for v in row.values() %}
-                        <td class="small text-break">{% if v is none %}-{% else %}{{ v }}{% endif %}</td>
-                      {% endfor %}
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-          {% else %}
-            <p class="text-muted small mb-0">無資料。</p>
           {% endif %}
         </div>
       </section>

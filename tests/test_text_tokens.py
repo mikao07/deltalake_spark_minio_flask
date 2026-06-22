@@ -18,6 +18,25 @@ def test_clean_text_for_segmentation_strips_punctuation():
     assert clean_text_for_segmentation("  珍珠奶茶，很好喝！  ") == "珍珠奶茶 很好喝"
 
 
+def test_clean_text_strips_ocr_digit_noise():
+    raw = "可是我到了耶」2222? 2222? 第二次叫外送"
+    out = clean_text_for_segmentation(raw)
+    assert "2222" not in out
+    assert "第二次" in out
+    assert "外送" in out
+
+
+def test_clean_text_strips_isolated_pure_digits():
+    assert clean_text_for_segmentation("12 30 2222 拜託") == "拜託"
+    assert clean_text_for_segmentation("耶 2222 2222 第二次") == "耶 第二次"
+
+
+def test_strip_pure_digit_tokens_keeps_mixed_alnum():
+    from services.text_tokens import strip_pure_digit_tokens
+
+    assert strip_pure_digit_tokens("12點前 沒來") == "12點前 沒來"
+
+
 def test_segment_text_to_tokens_already_cleaned_skips_restrip():
     from services.text_tokens import segment_text_to_tokens
 

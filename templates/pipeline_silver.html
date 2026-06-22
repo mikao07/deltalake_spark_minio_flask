@@ -13,16 +13,19 @@
         max-height: 420px;
         overflow: auto;
       }
+      #silver-quality-card.border-pass { border-color: var(--bs-success) !important; }
+      #silver-quality-card.border-warn { border-color: var(--bs-warning) !important; }
+      #silver-quality-card.border-fail { border-color: var(--bs-danger) !important; }
     </style>
   </head>
   <body class="bg-light">
     <div class="container py-4" style="max-width: 960px">
       {% include 'includes/pipeline_nav.html' %}
 
-      <h1 class="h4 mb-2">銀層 Silver：清洗、分詞與 MERGE</h1>
+      <h1 class="h4 mb-2">銀層 Silver：物理清洗、分詞與 MERGE</h1>
       <p class="text-muted small mb-3">
-        從 Bronze OCR 讀取 → <code>cleaned_text</code>（去標點）→ Jieba 分詞 <code>tokens</code> → MERGE 至
-        <code>{{ silver_path }}</code>。預覽時 <code>extracted_text</code> 為 OCR 原文；分析請看 <code>cleaned_text</code> / <code>tokens</code>。
+        從 Bronze OCR 讀取 → <code>cleaned_text</code>（物理清洗）→ Jieba + 內建虛詞 → 冪等 <code>tokens</code> → MERGE 至
+        <code>{{ silver_path }}</code>。ETL 完成後會跑<strong>品質閘門</strong>（領域停用詞在 Gold 套用）。
       </p>
       <div class="alert alert-info small py-2 mb-4">
         <strong>建議下一步：</strong>
@@ -51,16 +54,22 @@
             />
           </div>
           <button type="button" class="btn btn-primary" id="btn-run-silver">執行 Silver OCR ETL</button>
-          <p class="small text-muted mt-2 mb-0" id="silver-etl-note"></p>
+          <p class="small mt-2 mb-0" id="silver-etl-note"></p>
           {% if latest_silver_metric %}
             <div class="alert alert-light border small py-2 mt-3 mb-0">
               <strong>最近一次 Silver ETL：</strong>
               status={{ latest_silver_metric.status }} · duration={{ latest_silver_metric.duration_ms or '—' }} ms
+              {% if latest_silver_metric.silver_transform_version %}
+                · transform={{ latest_silver_metric.silver_transform_version }}
+              {% endif %}
               {% if latest_silver_metric.error %}<br />錯誤：{{ latest_silver_metric.error }}{% endif %}
             </div>
           {% endif %}
         </div>
       </div>
+
+      {% set quality = latest_silver_quality %}
+      {% include 'includes/silver_quality_panel.html' %}
 
       <section class="card shadow-sm mb-4">
         <div class="card-header py-2"><strong>分詞與辭典狀態</strong></div>
@@ -69,9 +78,10 @@
             <div class="alert alert-warning py-2 mb-2">檢查失敗：{{ dictionary_status.error }}</div>
           {% endif %}
           <div class="mb-2">
-            <strong>銀層自動分詞：</strong>
-            <span class="text-success">Jieba + 內建停用詞</span>
-            <span class="text-muted ms-1">（{{ dictionary_status.builtin_stopwords_count or '—' }} 個）</span>
+            <strong>銀層分詞（冪等）：</strong>
+            <span class="text-success">Jieba + 內建虛詞</span>
+            <code class="ms-1">{{ dictionary_status.silver_transform_version or 'v2.0.0' }}</code>
+            <span class="text-muted ms-1">（{{ dictionary_status.builtin_stopwords_count or '—' }} 個虛詞）</span>
           </div>
           <div class="mb-1">
             <strong>Jieba 自訂辭典（可選）：</strong>
@@ -83,13 +93,17 @@
             {% endif %}
           </div>
           <div>
-            <strong>外部停用詞（可選）：</strong>
-            {% if dictionary_status.stopwords_used %}
-              <span class="text-success">已套用</span>
-              <code class="ms-1">{{ dictionary_status.stopwords_path }}</code>
-              <span class="text-muted ms-1">({{ dictionary_status.stopwords_count }} 詞)</span>
+            <strong>Gold 領域停用詞（Silver 不套用）：</strong>
+            {% if dictionary_status.gold_effective_stopwords_count %}
+              <span class="text-success">lexicon {{ dictionary_status.gold_lexicon_version or '—' }}</span>
+              <span class="text-muted ms-1">
+                （effective {{ dictionary_status.gold_effective_stopwords_count }} 詞，保護 {{ dictionary_status.gold_protected_terms_count or '—' }} 詞）
+              </span>
+              {% if dictionary_status.gold_stopwords_path %}
+                <br /><code class="small">{{ dictionary_status.gold_stopwords_path }}</code>
+              {% endif %}
             {% else %}
-              <span class="text-muted">未設定（僅內建停用詞）</span>
+              <span class="text-muted">金層 ETL 時載入</span>
             {% endif %}
           </div>
         </div>
@@ -137,9 +151,13 @@
     </div>
 
     <script id="pipeline-silver-dataset-data" type="application/json">{{ (selected_dataset_id or '') | tojson }}</script>
+    <script id="pipeline-silver-initial-quality" type="application/json">{{ (latest_silver_quality or none) | tojson }}</script>
     <script>
       const PIPELINE_DATASET_ID = JSON.parse(
         document.getElementById("pipeline-silver-dataset-data").textContent || '""'
+      );
+      const INITIAL_SILVER_QUALITY = JSON.parse(
+        document.getElementById("pipeline-silver-initial-quality").textContent || "null"
       );
 
       function adminHeadersJson() {
@@ -147,6 +165,131 @@
         const headers = { "Content-Type": "application/json" };
         if (tok) headers["X-Admin-Token"] = tok;
         return headers;
+      }
+
+      function escHtml(s) {
+        return String(s ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function severityBadge(sev) {
+        if (sev === "hard") return '<span class="badge text-bg-danger">hard</span>';
+        return '<span class="badge text-bg-warning text-dark">warn</span>';
+      }
+
+      function renderSilverQuality(quality) {
+        const root = document.getElementById("silver-quality-panel-root");
+        const body = document.getElementById("silver-quality-body");
+        const badge = document.getElementById("silver-quality-badge");
+        const card = document.getElementById("silver-quality-card");
+        if (!root || !body || !badge || !card) return;
+
+        if (!quality || typeof quality !== "object") {
+          root.classList.add("d-none");
+          return;
+        }
+
+        root.classList.remove("d-none");
+        card.classList.remove("border-pass", "border-warn", "border-fail");
+
+        let html = "";
+        if (quality.skipped) {
+          badge.className = "badge text-bg-secondary";
+          badge.textContent = "略過";
+          card.classList.add("border-warn");
+          html =
+            '<p class="text-muted mb-0">品質檢查已略過：' +
+            escHtml(quality.reason || "—") +
+            "</p>";
+        } else {
+          const warnings = quality.warnings || [];
+          const hardFailures = quality.hard_failures || [];
+          const passed = !!quality.passed;
+
+          if (!passed) {
+            badge.className = "badge text-bg-danger";
+            badge.textContent = "未通過";
+            card.classList.add("border-fail");
+          } else if (warnings.length > 0) {
+            badge.className = "badge text-bg-warning text-dark";
+            badge.textContent = "通過（有警告）";
+            card.classList.add("border-warn");
+          } else {
+            badge.className = "badge text-bg-success";
+            badge.textContent = "通過";
+            card.classList.add("border-pass");
+          }
+
+          html +=
+            '<p class="mb-2"><span class="text-muted">轉換版本</span> <code>' +
+            escHtml(quality.transform_version || "—") +
+            '</code><span class="text-muted ms-2">檢查列數</span> <strong>' +
+            escHtml(quality.total_rows != null ? quality.total_rows : "—") +
+            "</strong></p>";
+
+          if (hardFailures.length > 0) {
+            html +=
+              '<div class="alert alert-danger py-2 mb-2"><strong>未通過（hard）</strong><ul class="mb-0 ps-3">';
+            hardFailures.forEach(function (msg) {
+              html += "<li>" + escHtml(msg) + "</li>";
+            });
+            html += "</ul></div>";
+          }
+          if (warnings.length > 0) {
+            html +=
+              '<div class="alert alert-warning py-2 mb-2"><strong>警告（warn）</strong><ul class="mb-0 ps-3">';
+            warnings.forEach(function (msg) {
+              html += "<li>" + escHtml(msg) + "</li>";
+            });
+            html += "</ul></div>";
+          }
+          if (passed && warnings.length === 0) {
+            html += '<div class="alert alert-success py-2 mb-2">所有 hard 檢查通過，目前無 warn。</div>';
+          } else if (passed) {
+            html += '<div class="alert alert-success py-2 mb-2">Hard 檢查通過；請留意上方 warn。</div>';
+          }
+
+          const checks = quality.checks || [];
+          if (checks.length > 0) {
+            html +=
+              '<details class="mt-2"><summary class="text-muted" style="cursor:pointer">展開各項檢查明細（' +
+              checks.length +
+              ' 項）</summary><div class="table-responsive border rounded mt-2"><table class="table table-sm table-striped mb-0"><thead class="table-light"><tr><th>項目</th><th>嚴重度</th><th>結果</th><th>說明</th></tr></thead><tbody>';
+            checks.forEach(function (c) {
+              const rowClass =
+                !c.passed && c.severity === "hard"
+                  ? "table-danger"
+                  : !c.passed
+                    ? "table-warning"
+                    : "";
+              html +=
+                '<tr class="' +
+                rowClass +
+                '"><td><code>' +
+                escHtml(c.name) +
+                "</code></td><td>" +
+                severityBadge(c.severity) +
+                "</td><td>" +
+                (c.passed
+                  ? '<span class="text-success">pass</span>'
+                  : '<span class="text-danger">fail</span>') +
+                "</td><td class=\"text-break\">" +
+                escHtml(c.message) +
+                "</td></tr>";
+            });
+            html += "</tbody></table></div></details>";
+          }
+        }
+
+        body.innerHTML = html;
+        root.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+
+      if (INITIAL_SILVER_QUALITY) {
+        renderSilverQuality(INITIAL_SILVER_QUALITY);
       }
 
       document.getElementById("btn-run-silver").addEventListener("click", async function () {
@@ -158,7 +301,7 @@
           return;
         }
         note.className = "small text-muted mt-2 mb-0";
-        note.textContent = "Silver ETL 執行中（可能較久）…";
+        note.textContent = "Silver ETL 執行中（完成後會跑品質閘門）…";
         try {
           const res = await fetch("/delta/silver/ocr/run", {
             method: "POST",
@@ -170,16 +313,49 @@
           try {
             data = JSON.parse(txt);
           } catch (_) {}
+
+          const quality = data.silver_quality || null;
+          if (quality) renderSilverQuality(quality);
+
           if (!res.ok) {
             note.className = "small text-danger mt-2 mb-0";
-            note.textContent = "Silver ETL 失敗：" + ((data && data.error) || txt || res.statusText);
+            const errMsg = (data && data.error) || txt || res.statusText;
+            if (res.status === 422) {
+              note.textContent =
+                "Silver ETL 已寫入，但品質閘門未通過（見上方紅色面板）：" + errMsg;
+            } else {
+              note.textContent = "Silver ETL 失敗：" + errMsg;
+            }
             return;
           }
-          note.className = "small text-success mt-2 mb-0";
+
           const rows =
             data.updated_rows !== undefined && data.updated_rows !== null ? data.updated_rows : "—";
-          note.textContent =
-            "Silver ETL 成功：dataset_id=" + datasetId + "，updated_rows=" + rows + "。可重新整理頁面看預覽。";
+          const warnCount = quality && quality.warnings ? quality.warnings.length : 0;
+          const mergeNote = data.merge_note || "";
+          if (rows === 0 || rows === "0") {
+            note.className = "small text-warning mt-2 mb-0";
+            note.textContent =
+              mergeNote ||
+              "Silver ETL 未寫入任何列（可能與現有資料完全一致）。請查看品質面板；若剛升級轉換版本，請重建容器後再跑一次。";
+          } else if (warnCount > 0) {
+            note.className = "small text-warning mt-2 mb-0 fw-semibold";
+            note.textContent =
+              "Silver ETL 完成（updated_rows=" +
+              rows +
+              "），但有 " +
+              warnCount +
+              " 項警告，請查看品質面板後再跑 Gold。";
+          } else {
+            note.className = "small text-success mt-2 mb-0";
+            note.textContent =
+              "Silver ETL 成功：updated_rows=" +
+              rows +
+              "，品質閘門通過。正在重新整理預覽…";
+            setTimeout(function () {
+              window.location.reload();
+            }, 600);
+          }
         } catch (err) {
           note.className = "small text-danger mt-2 mb-0";
           note.textContent = "Silver ETL 失敗：" + String(err);

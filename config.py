@@ -47,12 +47,6 @@ SILVER_TABLE_PATH = os.getenv("SILVER_TABLE_PATH", "s3a://data-lake/silver/clean
 # Notebook：SILVER_OCR_TABLE_PATH
 SILVER_OCR_TABLE_PATH = os.getenv("SILVER_OCR_TABLE_PATH", "s3a://data-lake/silver/ocr_features/")
 
-# Notebook：GOLD_WORD_COUNT_PATH（詞頻分析 Gold 層）
-GOLD_WORD_COUNT_PATH = os.getenv(
-    "GOLD_WORD_COUNT_PATH",
-    f"s3a://{BUCKET_NAME}/gold/word_frequency/",
-)
-
 # Gold：痛點主題快照（topic / frequency）
 GOLD_TOPIC_SNAPSHOT_PATH = os.getenv(
     "GOLD_TOPIC_SNAPSHOT_PATH",
@@ -91,9 +85,41 @@ JIEBA_USERDICT_PATH = os.getenv("JIEBA_USERDICT_PATH", "")
 # 可選：依 dataset_id 綁定字典路徑模板，例：s3a://bucket/dic/jieba_dicts/{dataset_id}.txt
 JIEBA_USERDICT_DATASET_PATTERN = os.getenv("JIEBA_USERDICT_DATASET_PATTERN", "")
 
-# 可選：停用詞表（每行一詞；# 開頭為註解；與 jieba 詞典分開）
+# 可選：停用詞表（每行一詞；# 開頭為註解；與 jieba 詞典分開；僅 Gold 分析使用）
 STOPWORDS_PATH = os.getenv("STOPWORDS_PATH", "")
 STOPWORDS_DATASET_PATTERN = os.getenv("STOPWORDS_DATASET_PATTERN", "")
+STOPWORDS_LEXICON_VERSION = os.getenv("STOPWORDS_LEXICON_VERSION", "v1.0.0")
+
+# 銀層轉換版本（冪等性：同版本 + 同 Bronze → 同 Silver）
+SILVER_TRANSFORM_VERSION = os.getenv("SILVER_TRANSFORM_VERSION", "v2.0.0")
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+SILVER_QUALITY_ENABLED = _env_bool("SILVER_QUALITY_ENABLED", True)
+SILVER_QUALITY_FAIL_ON_HARD = _env_bool("SILVER_QUALITY_FAIL_ON_HARD", True)
+SILVER_QUALITY_MAX_NOISE_ROW_RATIO = _env_float("SILVER_QUALITY_MAX_NOISE_ROW_RATIO", 0.001)
+SILVER_QUALITY_MAX_LEN1_TOKEN_RATIO = _env_float("SILVER_QUALITY_MAX_LEN1_TOKEN_RATIO", 0.01)
+SILVER_QUALITY_MAX_LONG_TOKEN_RATIO = _env_float("SILVER_QUALITY_MAX_LONG_TOKEN_RATIO", 0.005)
+SILVER_QUALITY_MAX_EMPTY_CLEANED_RATIO = _env_float("SILVER_QUALITY_MAX_EMPTY_CLEANED_RATIO", 0.5)
+SILVER_QUALITY_MIN_NONEMPTY_TOKENS_RATIO = _env_float("SILVER_QUALITY_MIN_NONEMPTY_TOKENS_RATIO", 0.3)
+SILVER_QUALITY_MIN_CHAR_RETENTION_RATIO = _env_float("SILVER_QUALITY_MIN_CHAR_RETENTION_RATIO", 0.15)
+SILVER_QUALITY_TOP_N = int(os.getenv("SILVER_QUALITY_TOP_N", "50"))
+SILVER_TOP_TOKEN_DENYLIST = tuple(
+    w.strip()
+    for w in os.getenv("SILVER_TOP_TOKEN_DENYLIST", "").split(",")
+    if w.strip()
+)
 
 # Notebook：RAW_IMAGE_PREFIX（用於拼 RAW_IMAGES_PATH）
 RAW_IMAGE_PREFIX = os.getenv("RAW_IMAGE_PREFIX", "raw/images/")

@@ -24,7 +24,6 @@ from config import (
     GOLD_TOPIC_SNAPSHOT_PATH,
     GOLD_TFIDF_KEYWORDS_PATH,
     GOLD_PHRASE_CANDIDATES_PATH,
-    GOLD_WORD_COUNT_PATH,
     MINIO_ENDPOINT,
     RAW_IMAGE_PREFIX,
     RAW_IMAGES_PATH,
@@ -41,6 +40,7 @@ from services.readiness import build_ready_payload, resolve_include_spark
 from services.async_jobs import job_registry, job_to_public_dict
 from services.etl_metrics import append_etl_metric, read_etl_metrics
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
+from services.silver_quality import SilverQualityError
 from services.spark_service import (
     SparkManager,
     analyze_bronze_duplicates,
@@ -53,7 +53,6 @@ from services.spark_service import (
     get_gold_topic_snapshot_comparison,
     list_gold_topic_snapshots,
     get_gold_topic_snapshot_latest_data,
-    get_gold_word_frequency_data,
     get_gold_tfidf_keywords_data,
     get_gold_phrase_candidates_data,
     get_silver_ocr_data,
@@ -62,7 +61,7 @@ from services.spark_service import (
     records_to_df,
     read_delta_table,
     run_silver_ocr_etl,
-    run_gold_word_frequency_etl,
+    run_gold_etl,
     run_gold_corpus_analytics_etl,
     run_gold_topic_snapshot_rebuild_etl,
     delete_gold_topic_snapshot_rows,
@@ -252,7 +251,7 @@ def _execute_pipeline_to_gold_inner(
                 "raw_images_path": raw_images_path,
                 "bronze_path": BRONZE_TABLE_PATH,
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-                "gold_path": GOLD_WORD_COUNT_PATH,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
                 "write_mode": write_mode,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
@@ -261,7 +260,7 @@ def _execute_pipeline_to_gold_inner(
                 "bronze_result": bronze_result,
                 "silver_result": {"updated_rows": 0, "skipped": True},
                 "gold_result": {
-                    "gold_output_rows": 0,
+                    "tfidf_output_rows": 0,
                     "is_gold_written": False,
                     "skipped": True,
                     "summary": "本次沒有新增 OCR 資料，已跳過 Gold 重算。",
@@ -276,6 +275,7 @@ def _execute_pipeline_to_gold_inner(
                     "bronze_processed_rows": bronze_processed_rows,
                     "silver_updated_rows": 0,
                     "gold_output_rows": 0,
+                    "tfidf_output_rows": 0,
                     "is_gold_written": False,
                     "is_incremental_short_circuit": True,
                 }
@@ -287,10 +287,9 @@ def _execute_pipeline_to_gold_inner(
             silver_ocr_path=SILVER_OCR_TABLE_PATH,
             dataset_id=dataset_id,
         )
-        progress(3, 3, "金層 Gold 詞頻…")
-        gold_result = run_gold_word_frequency_etl(
+        progress(3, 3, "金層 Gold ETL…")
+        gold_result = run_gold_etl(
             silver_ocr_path=SILVER_OCR_TABLE_PATH,
-            gold_path=GOLD_WORD_COUNT_PATH,
             dataset_id=dataset_id,
             coalesce_partitions=coalesce_partitions,
             silver_batch_ts=silver_result.get("silver_batch_ts"),
@@ -300,11 +299,11 @@ def _execute_pipeline_to_gold_inner(
         out = {
             "status": "ok",
             "dataset_id": dataset_id,
-            "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+            "steps": ["bronze_ocr", "silver_ocr", "gold_etl"],
             "raw_images_path": raw_images_path,
             "bronze_path": BRONZE_TABLE_PATH,
             "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-            "gold_path": GOLD_WORD_COUNT_PATH,
+            "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
             "write_mode": write_mode,
             "coalesce_partitions": coalesce_partitions,
             "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
@@ -320,7 +319,8 @@ def _execute_pipeline_to_gold_inner(
                 "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "bronze_processed_rows": bronze_result.get("processed_rows"),
                 "silver_updated_rows": silver_result.get("updated_rows"),
-                "gold_output_rows": gold_result.get("gold_output_rows"),
+                "gold_output_rows": gold_result.get("tfidf_output_rows"),
+                "tfidf_output_rows": gold_result.get("tfidf_output_rows"),
                 "is_gold_written": gold_result.get("is_gold_written"),
                 "topic_output_rows": gold_result.get("topic_output_rows"),
                 "topic_frequency_top": gold_result.get("topic_frequency_top"),
@@ -461,14 +461,6 @@ def _safe_bronze_preview(
         return [], str(e)
 
 
-def _safe_gold_preview(limit: int = 15, dataset_id: str | None = None):
-    try:
-        return get_gold_word_frequency_data(limit=limit, dataset_id=dataset_id), None
-    except Exception as e:
-        _logger.warning("gold_preview_failed: %s", e)
-        return [], str(e)
-
-
 def _safe_tfidf_preview(limit: int = 15, dataset_id: str | None = None):
     try:
         return get_gold_tfidf_keywords_data(limit=limit, dataset_id=dataset_id), None
@@ -546,6 +538,34 @@ def _latest_etl_metric_for(etl_name: str, dataset_id: str | None) -> Dict[str, A
     return None
 
 
+def _silver_quality_for_metric(quality: Any) -> Dict[str, Any] | None:
+    """精簡 silver_quality 供 JSONL／頁面顯示。"""
+    if not isinstance(quality, dict):
+        return None
+    if quality.get("skipped"):
+        return {
+            "skipped": True,
+            "reason": quality.get("reason"),
+            "passed": True,
+        }
+    return {
+        "passed": bool(quality.get("passed")),
+        "transform_version": quality.get("transform_version"),
+        "total_rows": quality.get("total_rows"),
+        "warnings": list(quality.get("warnings") or []),
+        "hard_failures": list(quality.get("hard_failures") or []),
+        "checks": list(quality.get("checks") or []),
+    }
+
+
+def _latest_silver_quality_for_dataset(dataset_id: str | None) -> Dict[str, Any] | None:
+    metric = _latest_etl_metric_for("silver_ocr_etl", dataset_id)
+    if not metric:
+        return None
+    q = metric.get("silver_quality")
+    return q if isinstance(q, dict) else None
+
+
 @app.get("/upload")
 def upload_page():
     """相容舊連結：導向銅層管線頁。"""
@@ -605,6 +625,7 @@ def pipeline_silver_page():
         bronze_has_rows=bool(bronze_rows) if selected else None,
         dictionary_status=dictionary_status,
         latest_silver_metric=_latest_etl_metric_for("silver_ocr_etl", selected),
+        latest_silver_quality=_latest_silver_quality_for_dataset(selected),
         **ctx,
     )
 
@@ -624,12 +645,12 @@ def pipeline_gold_page():
         gold_disk_hint = "已選 dataset 但 Gold 表無對應列；請確認已執行金層 ETL 且 dataset_id 欄位一致。"
     return render_template(
         TEMPLATE_PIPELINE_GOLD,
-        gold_path=GOLD_WORD_COUNT_PATH,
+        gold_path=GOLD_TFIDF_KEYWORDS_PATH,
         gold_disk_rows=gold_disk_rows,
         gold_disk_error=gold_disk_error,
         gold_disk_hint=gold_disk_hint,
         preview_limit=preview_limit,
-        latest_gold_metric=_latest_etl_metric_for("gold_word_frequency_etl", selected),
+        latest_gold_metric=_latest_etl_metric_for("gold_etl", selected),
         **ctx,
     )
 
@@ -651,7 +672,6 @@ def index():
         _logger.warning("list_dataset_ids_for_index_failed: %s", e)
 
     sys_status = get_system_status()
-    gold_rows, gold_error = _safe_gold_preview(limit=15, dataset_id=selected_dataset_id)
     tfidf_rows, tfidf_error = _safe_tfidf_preview(limit=15, dataset_id=selected_dataset_id)
     phrase_rows, phrase_error = _safe_phrase_preview(limit=15, dataset_id=selected_dataset_id)
     topic_rows: List[Dict[str, Any]] = []
@@ -672,22 +692,12 @@ def index():
         topic_rows = []
         topic_compare_rows = []
 
-    if selected_dataset_id and not gold_error and not gold_rows:
-        any_rows, any_err = _safe_gold_preview(limit=1, dataset_id=None)
-        if not any_err and any_rows:
-            topic_hint = (
-                "目前 Gold 表有資料，但你選的 dataset_id 沒對應列。"
-                "常見原因是最近一次金層 ETL 以「未指定 dataset_id」執行，導致欄位值為空。"
-            )
-
     return render_template(
         TEMPLATE_INDEX,
         cpu_percent=sys_status.get("cpu_percent"),
         memory_percent=sys_status.get("memory_percent"),
         dataset_options=dataset_options,
         selected_dataset_id=selected_dataset_id,
-        gold_rows=gold_rows,
-        gold_error=gold_error,
         tfidf_rows=tfidf_rows,
         tfidf_error=tfidf_error,
         phrase_rows=phrase_rows,
@@ -697,7 +707,6 @@ def index():
         topic_snapshot_options=topic_snapshot_options,
         selected_topic_snapshots=selected_topic_snapshots,
         topic_hint=topic_hint,
-        gold_table_path=GOLD_WORD_COUNT_PATH,
         tfidf_table_path=GOLD_TFIDF_KEYWORDS_PATH,
         phrase_table_path=GOLD_PHRASE_CANDIDATES_PATH,
         topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
@@ -708,7 +717,7 @@ def index():
 @app.get("/layers")
 def layers_preview_page():
     """
-    獨立頁：預覽銅／銀／金層表格內容，方便對照 OCR → 銀層 → 詞頻何處異常（避免首頁過擠）。
+    獨立頁：預覽銅／銀／金層表格內容，方便對照 OCR → 銀層 → TF-IDF 何處異常（避免首頁過擠）。
     """
     dataset_raw = request.args.get("dataset_id", "").strip().lower()
     selected_dataset_id: str | None = None
@@ -747,7 +756,6 @@ def layers_preview_page():
         dataset_id=selected_dataset_id,
         newest_first=newest_first,
     )
-    gold_live_rows, gold_live_error = _safe_gold_preview(limit=preview_limit, dataset_id=selected_dataset_id)
     etl_metrics_rows = read_etl_metrics(limit=12, dataset_id=selected_dataset_id or None)
     latest_etl_metric = etl_metrics_rows[0] if etl_metrics_rows else None
     dictionary_status: Dict[str, Any] = {}
@@ -777,7 +785,7 @@ def layers_preview_page():
         else:
             gold_disk_hint = (
                 "MinIO 若有很小的 part 檔仍可能 0 列（空 partition）。"
-                "請用 GET /api/gold/word-frequency?limit=20 看 count，或確認金層 ETL 是否產出有效詞頻列。"
+                "請用 GET /api/gold/tfidf-keywords?limit=20 確認，或確認金層 ETL 是否產出有效 TF-IDF 列。"
             )
 
     return render_template(
@@ -788,7 +796,7 @@ def layers_preview_page():
         sort_time=sort_by_time,
         bronze_path=BRONZE_TABLE_PATH,
         silver_path=SILVER_OCR_TABLE_PATH,
-        gold_path=GOLD_WORD_COUNT_PATH,
+        gold_path=GOLD_TFIDF_KEYWORDS_PATH,
         bronze_rows=bronze_rows,
         bronze_error=bronze_error,
         silver_rows=silver_rows,
@@ -796,8 +804,6 @@ def layers_preview_page():
         gold_disk_rows=gold_disk_rows,
         gold_disk_error=gold_disk_error,
         gold_disk_hint=gold_disk_hint,
-        gold_live_rows=gold_live_rows,
-        gold_live_error=gold_live_error,
         latest_etl_metric=latest_etl_metric,
         etl_metrics_rows=etl_metrics_rows,
         dictionary_status=dictionary_status,
@@ -845,7 +851,7 @@ def api_etl_metrics():
     query:
       - limit: 預設 100，最大 1000
       - dataset_id: 可選
-      - etl_name: 可選（bronze_ocr / silver_ocr_etl / gold_word_frequency_etl / pipeline_to_gold）
+      - etl_name: 可選（bronze_ocr / silver_ocr_etl / gold_etl / pipeline_to_gold）
     """
     err = _require_admin_token_if_configured()
     if err:
@@ -1053,35 +1059,126 @@ def api_health_storage():
     )
 
 
-@app.get("/api/gold/word-frequency")
-def api_gold_word_frequency():
+@app.post("/delta/gold/run")
+def delta_gold_run():
     """
-    query: limit（預設 20，最大 200）
-    讀取 config 的 GOLD_WORD_COUNT_PATH（依 frequency 降序）。
+    執行金層 ETL：Silver OCR → 痛點主題 + TF-IDF / PMI（run_gold_etl）。
+
+    body（皆可選）:
+      {
+        "dataset_id": "invoice_ocr",
+        "silver_ocr_path": "s3a://.../silver/ocr_features/",
+        "coalesce_partitions": 1,
+        "dry_run": false
+      }
+
+    亦可用查詢字串補齊欄位（與 body 合併），例如：
+    POST /delta/gold/run?dataset_id=drinks&dry_run=false
     """
 
-    raw = request.args.get("limit", "20")
-    try:
-        limit = int(raw)
-    except (TypeError, ValueError):
-        return _json_error("limit 必須是整數。", 400)
-    limit = max(1, min(limit, 200))
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
 
-    dataset_raw = request.args.get("dataset_id", "").strip().lower()
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        (
+            "dataset_id",
+            "silver_ocr_path",
+            "coalesce_partitions",
+            "dry_run",
+        ),
+    )
+    if not isinstance(body, dict):
+        return _json_error("body 必須是 JSON object。", 400)
+
+    dataset_raw = body.get("dataset_id")
+    if isinstance(dataset_raw, str) and not dataset_raw.strip():
+        dataset_raw = None
     dataset_id: str | None = None
-    if dataset_raw:
+    if dataset_raw is not None:
+        if not isinstance(dataset_raw, str):
+            return _json_error("dataset_id 必須是字串。", 400)
         try:
             dataset_id = normalize_dataset_id(dataset_raw)
         except ValueError as e:
             return _json_error(str(e), 400)
 
-    rows = get_gold_word_frequency_data(limit=limit, dataset_id=dataset_id)
+    silver_raw = body.get("silver_ocr_path")
+    silver_ocr_path = (
+        silver_raw.strip()
+        if isinstance(silver_raw, str) and silver_raw.strip()
+        else SILVER_OCR_TABLE_PATH
+    )
+
+    err = _validate_delta_path(silver_ocr_path)
+    if err:
+        return err
+
+    try:
+        coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
+    except (TypeError, ValueError):
+        return _json_error("coalesce_partitions 必須是整數。", 400)
+
+    dry_run = _body_get_bool(body, "dry_run", False)
+    if dry_run:
+        return jsonify(
+            {
+                "status": "dry_run",
+                "dataset_id": dataset_id,
+                "silver_ocr_path": silver_ocr_path,
+                "coalesce_partitions": coalesce_partitions,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+            }
+        )
+
+    _get_spark_manager()
+    started = time.perf_counter()
+    try:
+        gold_result = run_gold_etl(
+            silver_ocr_path=silver_ocr_path,
+            dataset_id=dataset_id,
+            coalesce_partitions=coalesce_partitions,
+        )
+        _record_etl_metric(
+            {
+                "etl_name": "gold_etl",
+                "dataset_id": dataset_id,
+                "status": "ok",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+                "output_rows": gold_result.get("tfidf_output_rows"),
+                "silver_filtered_rows": gold_result.get("silver_filtered_rows"),
+                "is_gold_written": gold_result.get("is_gold_written"),
+                "topic_output_rows": gold_result.get("topic_output_rows"),
+                "topic_frequency_top": gold_result.get("topic_frequency_top"),
+            }
+        )
+    except Exception as e:
+        _record_etl_metric(
+            {
+                "etl_name": "gold_etl",
+                "dataset_id": dataset_id,
+                "status": "failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+                "error": str(e),
+            }
+        )
+        _logger.exception("gold_run_failed")
+        return _json_error(f"Gold ETL 失敗：{e}", 500)
     return jsonify(
         {
-            "path": GOLD_WORD_COUNT_PATH,
+            "status": "ok",
             "dataset_id": dataset_id,
-            "rows": rows,
-            "count": len(rows),
+            "silver_ocr_path": silver_ocr_path,
+            "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+            "coalesce_partitions": coalesce_partitions,
+            "gold_result": gold_result,
+            "是否成功寫入金層": "是" if gold_result.get("is_gold_written") else "否",
+            "白話說明": gold_result.get("summary"),
         }
     )
 
@@ -1454,7 +1551,35 @@ def delta_silver_ocr_run():
                 "output_rows": result.get("updated_rows"),
                 "bronze_path": bronze_path,
                 "silver_ocr_path": silver_ocr_path,
+                "silver_transform_version": result.get("silver_transform_version"),
+                "silver_quality": _silver_quality_for_metric(result.get("silver_quality")),
             }
+        )
+    except SilverQualityError as e:
+        quality_payload = _silver_quality_for_metric(getattr(e, "report", None)) or {
+            "passed": False,
+            "hard_failures": [str(e)],
+            "warnings": [],
+            "checks": [],
+        }
+        _record_etl_metric(
+            {
+                "etl_name": "silver_ocr_etl",
+                "dataset_id": dataset_id,
+                "status": "quality_failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+                "silver_quality": quality_payload,
+            }
+        )
+        _logger.error("silver_ocr_quality_failed: %s", e)
+        return _json_error(
+            f"Silver 品質閘門未通過：{e}",
+            422,
+            status="quality_failed",
+            silver_quality=quality_payload,
         )
     except Exception as e:
         _record_etl_metric(
@@ -1473,142 +1598,10 @@ def delta_silver_ocr_run():
     return jsonify({"status": "ok", **result})
 
 
-@app.post("/delta/gold/word-frequency/run")
-def delta_gold_word_frequency_run():
-    """
-    執行金層詞頻 ETL：Silver OCR → Jieba → Gold（run_gold_word_frequency_etl）。
-
-    body（皆可選）:
-      {
-        "dataset_id": "invoice_ocr",
-        "silver_ocr_path": "s3a://.../silver/ocr_features/",
-        "gold_path": "s3a://.../gold/word_frequency/",
-        "coalesce_partitions": 1,
-        "dry_run": false
-      }
-
-    亦可用查詢字串補齊欄位（與 body 合併），例如：
-    POST /delta/gold/word-frequency/run?dataset_id=drinks&dry_run=false
-    """
-
-    err = _require_admin_token_if_configured()
-    if err:
-        return err
-
-    body = _merge_missing_from_query(
-        _parse_request_json_object(),
-        (
-            "dataset_id",
-            "silver_ocr_path",
-            "gold_path",
-            "coalesce_partitions",
-            "dry_run",
-        ),
-    )
-    if not isinstance(body, dict):
-        return _json_error("body 必須是 JSON object。", 400)
-
-    dataset_raw = body.get("dataset_id")
-    if isinstance(dataset_raw, str) and not dataset_raw.strip():
-        dataset_raw = None
-    dataset_id: str | None = None
-    if dataset_raw is not None:
-        if not isinstance(dataset_raw, str):
-            return _json_error("dataset_id 必須是字串。", 400)
-        try:
-            dataset_id = normalize_dataset_id(dataset_raw)
-        except ValueError as e:
-            return _json_error(str(e), 400)
-
-    silver_raw = body.get("silver_ocr_path")
-    gold_raw = body.get("gold_path")
-    silver_ocr_path = (
-        silver_raw.strip()
-        if isinstance(silver_raw, str) and silver_raw.strip()
-        else SILVER_OCR_TABLE_PATH
-    )
-    gold_path = gold_raw.strip() if isinstance(gold_raw, str) and gold_raw.strip() else GOLD_WORD_COUNT_PATH
-
-    err = _validate_delta_path(silver_ocr_path)
-    if err:
-        return err
-    err = _validate_delta_path(gold_path)
-    if err:
-        return err
-
-    try:
-        coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
-    except (TypeError, ValueError):
-        return _json_error("coalesce_partitions 必須是整數。", 400)
-
-    dry_run = _body_get_bool(body, "dry_run", False)
-    if dry_run:
-        return jsonify(
-            {
-                "status": "dry_run",
-                "dataset_id": dataset_id,
-                "silver_ocr_path": silver_ocr_path,
-                "gold_path": gold_path,
-                "coalesce_partitions": coalesce_partitions,
-            }
-        )
-
-    _get_spark_manager()
-    started = time.perf_counter()
-    try:
-        gold_result = run_gold_word_frequency_etl(
-            silver_ocr_path=silver_ocr_path,
-            gold_path=gold_path,
-            dataset_id=dataset_id,
-            coalesce_partitions=coalesce_partitions,
-        )
-        _record_etl_metric(
-            {
-                "etl_name": "gold_word_frequency_etl",
-                "dataset_id": dataset_id,
-                "status": "ok",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "silver_ocr_path": silver_ocr_path,
-                "gold_path": gold_path,
-                "output_rows": gold_result.get("gold_output_rows"),
-                "silver_filtered_rows": gold_result.get("silver_filtered_rows"),
-                "is_gold_written": gold_result.get("is_gold_written"),
-                "topic_output_rows": gold_result.get("topic_output_rows"),
-                "topic_frequency_top": gold_result.get("topic_frequency_top"),
-            }
-        )
-    except Exception as e:
-        _record_etl_metric(
-            {
-                "etl_name": "gold_word_frequency_etl",
-                "dataset_id": dataset_id,
-                "status": "failed",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "silver_ocr_path": silver_ocr_path,
-                "gold_path": gold_path,
-                "error": str(e),
-            }
-        )
-        _logger.exception("gold_word_frequency_run_failed")
-        return _json_error(f"Gold 詞頻 ETL 失敗：{e}", 500)
-    return jsonify(
-        {
-            "status": "ok",
-            "dataset_id": dataset_id,
-            "silver_ocr_path": silver_ocr_path,
-            "gold_path": gold_path,
-            "coalesce_partitions": coalesce_partitions,
-            "gold_result": gold_result,
-            "是否成功寫入金層": "是" if gold_result.get("is_gold_written") else "否",
-            "白話說明": gold_result.get("summary"),
-        }
-    )
-
-
 @app.post("/delta/gold/topic-snapshot/rebuild")
 def delta_gold_topic_snapshot_rebuild():
     """
-    僅重建痛點主題快照（append 至 topic_snapshot），不寫入詞頻 Gold 表。
+    僅重建痛點主題快照（append 至 topic_snapshot）。
     適用：手動清空 MinIO 上 topic_snapshot 目錄後，依 Silver 補寫快照。
 
     body 或查詢參數（dataset_id 必填）:
@@ -1777,7 +1770,7 @@ def delta_gold_topic_snapshot_delete():
 @app.post("/delta/pipeline/to-gold/run")
 def delta_pipeline_to_gold_run():
     """
-    一鍵執行完整流程：Bronze OCR -> Silver OCR -> Gold 詞頻（同一個 dataset_id）。
+    一鍵執行完整流程：Bronze OCR -> Silver OCR -> Gold ETL（同一個 dataset_id）。
 
     body:
       {
@@ -1844,7 +1837,7 @@ def delta_pipeline_to_gold_run():
     err = _validate_delta_path(SILVER_OCR_TABLE_PATH)
     if err:
         return err
-    err = _validate_delta_path(GOLD_WORD_COUNT_PATH)
+    err = _validate_delta_path(GOLD_TFIDF_KEYWORDS_PATH)
     if err:
         return err
 
@@ -1854,11 +1847,11 @@ def delta_pipeline_to_gold_run():
             {
                 "status": "dry_run",
                 "dataset_id": dataset_id,
-                "steps": ["bronze_ocr", "silver_ocr", "gold_word_frequency"],
+                "steps": ["bronze_ocr", "silver_ocr", "gold_etl"],
                 "raw_images_path": raw_images_path,
                 "bronze_path": BRONZE_TABLE_PATH,
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-                "gold_path": GOLD_WORD_COUNT_PATH,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
                 "write_mode": write_mode,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,

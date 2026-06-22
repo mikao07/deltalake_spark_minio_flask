@@ -1,0 +1,17 @@
+<div id="silver-quality-panel-root" class="{% if not quality %}d-none{% endif %}">
+  <section class="card shadow-sm mb-4 border {% if quality and not quality.get('skipped') %}{% if not quality.get('passed') %}border-fail{% elif quality.get('warnings') and quality.get('warnings')|length > 0 %}border-warn{% else %}border-pass{% endif %}{% endif %}" id="silver-quality-card">
+    <div class="card-header py-2 d-flex justify-content-between align-items-center">
+      <strong>銀層品質閘門（三道防線）</strong>
+      <span id="silver-quality-badge" class="badge {% if quality and not quality.get('skipped') %}{% if not quality.get('passed') %}text-bg-danger{% elif quality.get('warnings') and quality.get('warnings')|length > 0 %}text-bg-warning text-dark{% else %}text-bg-success{% endif %}{% endif %}">
+        {% if quality and not quality.get('skipped') %}
+          {% if not quality.get('passed') %}未通過{% elif quality.get('warnings') and quality.get('warnings')|length > 0 %}通過（有警告）{% else %}通過{% endif %}
+        {% endif %}
+      </span>
+    </div>
+    <div class="card-body small" id="silver-quality-body">
+      {% if quality %}
+        {% include 'includes/silver_quality_panel_inner.html' %}
+      {% endif %}
+    </div>
+  </section>
+</div>

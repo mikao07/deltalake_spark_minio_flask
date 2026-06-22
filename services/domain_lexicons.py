@@ -1,8 +1,8 @@
 """
 依 dataset_id 提供的領域辭典（停用詞、Jieba 分詞、OCR user-words 等）。
 
-MinIO 上無對應檔案時，仍會套用內建詞表，方便本機／開發先跑通 Gold 再看資料。
-上傳 dic/stop_words/{dataset_id}.txt 後會與內建詞合併（檔案可覆寫擴充）。
+領域停用詞於 Gold 層套用（見 services.lexicon）；Silver 僅用內建虛詞。
+MinIO / dic/stop_words/{version}/{dataset_id}.txt 與內建詞合併後，經痛點保護詞扣減為 effective_stop。
 """
 
 from __future__ import annotations
@@ -164,6 +164,8 @@ _DRINKS_OCR_USER_WORDS: FrozenSet[str] = frozenset(
         "正常冰",
         "LinePay",
         "Line Pay",
+        "LINE Pay",
+        "line pay",
         "UberEats",
         "foodpanda",
         "載具",

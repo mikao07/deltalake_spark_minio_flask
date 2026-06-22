@@ -3,8 +3,11 @@
 
 分層職責：
 - Bronze：保留 OCR 原文（extracted_text）
-- Silver：cleaned_text（去標點、正規化空白）→ tokens（Jieba + 停用詞）
-- Gold：僅消費銀層 tokens，不再清洗原文
+- Silver：cleaned_text（物理清洗）→ tokens（Jieba + 內建虛詞停用詞；冪等）
+- Gold：讀銀層 tokens，套用版本化 lexicon（領域停用詞 − 痛點保護詞）後分析
+
+評論痛點場景下，空白分隔的純數字（含 OCR 誤認的 2222）不進 cleaned_text；
+需查發票／編號請看 Bronze extracted_text。
 """
 
 from __future__ import annotations
@@ -136,20 +139,34 @@ BUILTIN_STOPWORDS: frozenset[str] = frozenset(w.lower() for w in _BUILTIN_STOPWO
 
 _MIN_WORD_LENGTH = 2
 
-# 與 spark_service._silver_cleaned_text_expr 的 Spark 正則對齊（\p{L}\p{N} + 底線 + 空白）
+# 與 spark_service 銀層 UDF 對齊（\p{L}\p{N} + 底線 + 空白，再剝純數字 token）
 SILVER_CLEAN_TEXT_SPARK_PATTERN = r"[^\p{L}\p{N}\s_]"
 _CLEAN_TEXT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_PURE_DIGIT_TOKEN_RE = re.compile(r"^\d+$")
+
+
+def strip_pure_digit_tokens(text: str) -> str:
+    """
+    移除空白分隔的純數字 token（2222、12、30 等）。
+    與 filter_segmented_tokens 的 isdigit 過濾對齊，讓 cleaned_text 不殘留 OCR 數字雜訊。
+    """
+    if not text:
+        return ""
+    parts = str(text).split()
+    kept = [p for p in parts if p and not _PURE_DIGIT_TOKEN_RE.fullmatch(p)]
+    return " ".join(kept)
 
 
 def clean_text_for_segmentation(text: str | None) -> str:
-    """與金層 regexp_replace 對齊：保留字母/數字/底線/空白，轉小寫。"""
+    """去標點 → 正規化空白 → 剝純數字 token → 轉小寫。"""
     if text is None:
         return ""
     raw = str(text).strip()
     if not raw:
         return ""
     cleaned = _CLEAN_TEXT_RE.sub(" ", raw)
-    return " ".join(cleaned.lower().split())
+    cleaned = " ".join(cleaned.lower().split())
+    return strip_pure_digit_tokens(cleaned)
 
 
 def filter_segmented_tokens(

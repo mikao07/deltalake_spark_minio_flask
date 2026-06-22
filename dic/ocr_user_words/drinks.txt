@@ -23,6 +23,8 @@ CoCo
 正常冰
 LinePay
 Line Pay
+LINE Pay
+line pay
 UberEats
 foodpanda
 載具

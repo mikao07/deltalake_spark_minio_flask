@@ -19,16 +19,16 @@
     <div class="container py-4" style="max-width: 960px">
       {% include 'includes/pipeline_nav.html' %}
 
-      <h1 class="h4 mb-2">金層 Gold：詞頻、TF-IDF、PMI 與痛點</h1>
+      <h1 class="h4 mb-2">金層 Gold：TF-IDF、PMI 與痛點</h1>
       <p class="text-muted small mb-3">
-        從 Silver 讀取 tokens → 詞頻／語料分析 → 寫入 Gold 表。圖表與痛點快照請至
+        從 Silver 讀取 tokens → 痛點主題／TF-IDF／PMI → 寫入 Gold 表。圖表與痛點快照請至
         <a href="{{ url_for('index', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('index') }}">Dashboard</a>。
         <strong>write_mode</strong> 僅在<a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">銅層頁</a>設定；一鍵管線在此固定使用 Bronze append。
       </p>
       <div class="alert alert-info small py-2 mb-4">
         <strong>建議下一步：</strong> ETL 完成後 →
         <a href="{{ url_for('index', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('index') }}"
-          >Dashboard 查看詞頻、TF-IDF、PMI、痛點</a
+          >Dashboard 查看 TF-IDF、PMI、痛點</a
         >
       </div>
 
@@ -43,9 +43,9 @@
             autocomplete="off"
           />
 
-          <h2 class="h6 mb-2">僅金層詞頻 ETL</h2>
-          <p class="small text-muted">假設 Silver 已就緒；會一併跑 TF-IDF／PMI 語料分析。</p>
-          <button type="button" class="btn btn-outline-primary btn-sm" id="btn-run-gold-only">執行 Gold 詞頻 ETL</button>
+          <h2 class="h6 mb-2">僅金層 ETL</h2>
+          <p class="small text-muted">假設 Silver 已就緒；會一併跑痛點主題、TF-IDF／PMI。</p>
+          <button type="button" class="btn btn-outline-primary btn-sm" id="btn-run-gold-only">執行 Gold ETL</button>
           <p class="small text-muted mt-2 mb-4" id="gold-only-note"></p>
 
           <hr />
@@ -79,14 +79,14 @@
           {% if latest_gold_metric %}
             <div class="alert alert-light border small py-2 mt-3 mb-0">
               <strong>最近一次 Gold ETL：</strong>
-              status={{ latest_gold_metric.status }} · gold_output_rows={{ latest_gold_metric.gold_output_rows if latest_gold_metric.gold_output_rows is not none else '—' }}
+              status={{ latest_gold_metric.status }} · tfidf_output_rows={{ latest_gold_metric.output_rows if latest_gold_metric.output_rows is not none else (latest_gold_metric.tfidf_output_rows if latest_gold_metric.tfidf_output_rows is not none else '—') }}
             </div>
           {% endif %}
         </div>
       </div>
 
       <section class="card shadow-sm">
-        <div class="card-header py-2"><strong>Gold 落盤預覽（最多 {{ preview_limit }} 列）</strong></div>
+        <div class="card-header py-2"><strong>Gold TF-IDF 落盤預覽（最多 {{ preview_limit }} 列）</strong></div>
         <div class="card-body">
           <p class="small text-muted mb-2">{{ gold_path }}</p>
           {% if gold_disk_error %}
@@ -248,7 +248,7 @@
         note.className = "small text-muted";
         note.textContent = "Gold ETL 執行中…";
         try {
-          const res = await fetch("/delta/gold/word-frequency/run", {
+          const res = await fetch("/delta/gold/run", {
             method: "POST",
             headers: adminHeadersJson(),
             body: JSON.stringify({ dataset_id: PIPELINE_DATASET_ID, dry_run: false }),
@@ -264,9 +264,10 @@
             return;
           }
           const gr = data.gold_result || data;
-          const out = gr && typeof gr.gold_output_rows === "number" ? gr.gold_output_rows : "—";
+          const out =
+            gr && typeof gr.tfidf_output_rows === "number" ? gr.tfidf_output_rows : "—";
           note.className = "small text-success";
-          note.textContent = "Gold ETL 成功，gold_output_rows=" + out + "。請至 Dashboard 看圖表。";
+          note.textContent = "Gold ETL 成功，tfidf_output_rows=" + out + "。請至 Dashboard 看圖表。";
         } catch (err) {
           note.className = "small text-danger";
           note.textContent = "失敗：" + String(err);

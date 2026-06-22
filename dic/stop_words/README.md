@@ -1,16 +1,19 @@
-# 領域辭典（上傳至 MinIO）
+# 領域停用詞（Gold lexicon）
 
-路徑需與 `.env` 的 `STOPWORDS_DATASET_PATTERN` 對齊，例如：
+**Silver 不套用**本目錄詞表；僅在 Gold 讀取銀層 `tokens` 後過濾（`effective_stop = stop − 痛點保護詞`）。
 
-- 本機範本：`dic/stop_words/drinks.txt`
-- MinIO：`s3a://data-lake/dic/stop_words/drinks.txt`
+## 路徑
 
-上傳範例（mc 已設定 alias）：
+| 用途 | 路徑 |
+|------|------|
+| 版本化（建議） | `dic/stop_words/v1.0.0/drinks.txt` |
+| 相容舊路徑 | `dic/stop_words/drinks.txt` |
+| MinIO 模板 | `STOPWORDS_DATASET_PATTERN=s3a://data-lake/dic/stop_words/{version}/{dataset_id}.txt` |
 
-```bash
-mc cp dic/stop_words/drinks.txt local/data-lake/dic/stop_words/drinks.txt
-```
+環境變數 `STOPWORDS_LEXICON_VERSION=v1.0.0` 與 Git tag 對齊；變更詞表後 **只重跑 Gold**，不必重跑 Silver。
 
-**注意**：`dataset_id=drinks` 即使未上傳 MinIO 檔，也會套用 `services/domain_lexicons.py` 內建停用詞；上傳檔案會與內建詞 **合併**。
+內建領域詞見 `services/domain_lexicons.py`（無檔案時仍會合併）。
 
-重跑 **Silver ETL**（更新 tokens 停用詞）→ **Gold ETL**（更新詞頻與痛點快照）。
+## 遷移
+
+若 Silver 曾在舊版套用停用詞，請在升級 `SILVER_TRANSFORM_VERSION` 後 **全量重跑 Silver 一次**，再重跑 Gold。

@@ -24,8 +24,8 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 ### 資料管線（摘要）
 
 - **Bronze**：`raw/images/{dataset_id}/` 影像 → **可調前處理**（放大、灰階、對比、銳化、**二值化**）→ **Tesseract**（預設 **`OCR_PSM=11`**，可載入 **user-words**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**領域辭典**。
-- **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 去標點與正規化空白；**Jieba 分詞 + 內建停用詞**（可選 **自訂 Jieba 詞典**）產出 `tokens`，MERGE 至 `SILVER_OCR_TABLE_PATH`。金層僅消費 `tokens`。
-- **Gold**：讀銀層 `tokens` 跑**痛點漏斗**（撈網 → 過濾 → 情緒）產出主題；`dataset_id=drinks` 套用內建領域停用詞（詞頻用）。規則 **`v1.4-drinks-funnel`**。
+- **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 物理清洗（去標點、剝純數字雜訊）；**Jieba + 內建虛詞停用詞** 產出冪等 `tokens`（`SILVER_TRANSFORM_VERSION`）。ETL 後執行**三道品質防線**（Schema／Token 分佈／留存率）。**不**套用領域停用詞。
+- **Gold**：讀銀層 `tokens` → 套用版本化 lexicon（`effective_stop = stop − 痛點保護詞`）→ 痛點漏斗、TF-IDF、PMI。規則 **`v1.4-drinks-funnel`**；辭典 **`STOPWORDS_LEXICON_VERSION`**。
 - **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
 - **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**金層頁** `/pipeline/gold` 有同名勾選（預設開啟）；**銅層頁**上傳表單亦有一鍵選項。
 
@@ -38,11 +38,10 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **Delta Upsert**：`POST /delta/upsert`（需 `ADMIN_TOKEN` 時帶 `X-Admin-Token`）
 - **僅保留最新批次**：`POST /delta/cleanup-latest-only`（同上）
 - **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`
-- **Gold 詞頻預覽**：`GET /api/gold/word-frequency`
 - **TF-IDF 痛點候選（Phase A）**：`GET /api/gold/tfidf-keywords`
 - **PMI 片語候選（Phase B）**：`GET /api/gold/phrase-candidates`
-- **金層詞頻 ETL**（Silver→Gold）：`POST /delta/gold/word-frequency/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
-- **痛點快照僅重建**（不寫詞頻表）：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
+- **金層 ETL**（Silver→Gold）：`POST /delta/gold/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
+- **痛點快照僅重建**：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
 - **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）
 - **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見金層管線頁說明）
 - **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
@@ -55,11 +54,11 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 （完整行為以 `app.py` 為準。）
 
 **小提示**：部分 `POST` API 的 JSON 若因 `Content-Type` 未帶好而為空，可改用 **URL 查詢字串**補上 `dataset_id` 等欄位（與 body 合併），例如  
-`POST /delta/gold/word-frequency/run?dataset_id=drinks&dry_run=false`。
+`POST /delta/gold/run?dataset_id=drinks&dry_run=false`。
 
 ### 首頁 /layers 與 Gold 顯示規則（重要）
 
-- 首頁 **詞頻**與 **`/layers`** 的 Gold 預覽以 **落盤 Gold 詞頻 Delta** 為來源（輔助探索）。
+- 首頁 **TF-IDF**與 **`/layers`** 的 Gold 預覽以 **落盤 TF-IDF Delta** 為來源（輔助探索）。
 - **痛點主題**圖表以 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照為**主要商業輸出**（規則 + 模糊匹配）；請以金層 ETL 或 `topic-snapshot/rebuild` 寫入，並確認帶正確 `dataset_id`。
 - 帶 `dataset_id` 時會以表內 `dataset_id` 欄位過濾。
 - `/layers` 可切換時間排序；並可檢視 **辭典／停用詞套用狀態**（目前篩選之 `dataset_id`）。
@@ -133,11 +132,11 @@ tesseract 你的截圖.png stdout -l chi_tra --psm 6
 
 | 類型 | 路徑（repo / MinIO） | 作用層 | 目的 |
 |------|----------------------|--------|------|
-| **停用詞** | `dic/stop_words/{dataset_id}.txt` | Silver / Gold | 擋好喝、珍珠等中性詞，讓 TF-IDF／詞頻較乾淨 |
+| **停用詞** | `dic/stop_words/{version}/{dataset_id}.txt` | **Gold** | 擋中性詞；變更後只重跑 Gold |
 | **Jieba 詞典** | `dic/jieba_dicts/{dataset_id}.txt` | Silver | 避免「服務態度」「50嵐」被切開 |
 | **OCR user-words** | `dic/ocr_user_words/{dataset_id}.txt` | Bronze | 提升 Tesseract 品牌／規格辨識 |
 
-- **內建詞**：`services/domain_lexicons.py` 在 MinIO 無檔時仍會套用 `drinks` 停用詞與 OCR 詞；Jieba 會 **fallback** 至 repo 內 `dic/jieba_dicts/drinks.txt`。
+- **內建詞**：`services/domain_lexicons.py` 在 MinIO 無檔時仍會於 **Gold** 合併 `drinks` 停用詞；Jieba 會 **fallback** 至 repo 內 `dic/jieba_dicts/drinks.txt`。
 - **環境變數**（見 `.env.example`）：
   - `STOPWORDS_DATASET_PATTERN=s3a://data-lake/dic/stop_words/{dataset_id}.txt`
   - `JIEBA_USERDICT_DATASET_PATTERN=s3a://data-lake/dic/jieba_dicts/{dataset_id}.txt`
@@ -150,7 +149,8 @@ tesseract 你的截圖.png stdout -l chi_tra --psm 6
 | 改了什麼 | 重跑 |
 |----------|------|
 | 二值化、OCR user-words | Bronze → Silver → Gold |
-| Jieba 詞典、停用詞 | Silver → Gold |
+| Jieba 詞典 | Silver → Gold |
+| 停用詞（lexicon 版本） | **Gold**（Silver 不重跑） |
 | 痛點規則／模糊匹配 | Gold（或 `topic-snapshot/rebuild`） |
 
 ### 痛點主題與模糊匹配（Gold）
@@ -214,7 +214,7 @@ python .\app.py
 
 頂部導覽列可帶 `?dataset_id=` 跨頁共用同一分類。
 
-**金層頁（一鍵管線）**：可勾選 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合只更新**停用詞／Jieba 詞典**（Silver）或**痛點規則／模糊門檻**（Gold）後要重算。行為等同 API 的 `skip_gold_if_no_new_ocr`。`write_mode`（append／overwrite）**僅在銅層頁**設定。
+**金層頁（一鍵管線）**：可勾選 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合升級 **`SILVER_TRANSFORM_VERSION`** 或更新 **Jieba 詞典**（Silver）或 **停用詞 lexicon／痛點規則**（Gold）後要重算。行為等同 API 的 `skip_gold_if_no_new_ocr`。`write_mode`（append／overwrite）**僅在銅層頁**設定。
 
 ---
 
@@ -284,7 +284,7 @@ docker run --rm -p 5000:5000 `
 ### 安全與治理（建議）
 
 - **`ADMIN_TOKEN`**：設定後，多數 **寫入／ETL／上傳／除錯** API 需帶 header `X-Admin-Token`；**未設定**時這些檢查不會生效（僅適合本機開發）。
-- **仍可能為公開的讀取**：例如 `GET /health`、`GET /api/gold/word-frequency`、`POST /delta/read` 等（詳見 `app.py`）；若對外服務請評估是否再加網路隔離或反向代理。
+- **仍可能為公開的讀取**：例如 `GET /health`、`GET /api/gold/tfidf-keywords`、`POST /delta/read` 等（詳見 `app.py`）；若對外服務請評估是否再加網路隔離或反向代理。
 - **路徑白名單**：`ALLOWED_DELTA_PATH_PREFIXES`（逗號分隔）；未設定時預設僅 `s3a://<BUCKET_NAME>/`
 - **上傳**：`MAX_UPLOAD_MB`（預設 15）；Docker 埠是否只綁 `127.0.0.1` 請依部署決定。
 
@@ -351,11 +351,11 @@ $body = @{ dry_run = $true; dataset_id = "invoice_ocr" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run" -ContentType "application/json" -Body $body
 ```
 
-金層詞頻（dry-run，建議用 `Invoke-RestMethod` 避免 JSON 引號問題）：
+金層 ETL（dry-run，建議用 `Invoke-RestMethod` 避免 JSON 引號問題）：
 
 ```powershell
 $body = @{ dataset_id = "drinks"; dry_run = $true } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/word-frequency/run" `
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/run" `
   -ContentType "application/json" -Body $body
 ```
 

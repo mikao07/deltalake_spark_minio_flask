@@ -65,17 +65,17 @@ def test_delta_cleanup_dry_run_does_not_require_spark(monkeypatch):
     assert r.get_json()["status"] == "dry_run"
 
 
-def test_delta_gold_word_frequency_run_dry_run(monkeypatch):
+def test_delta_gold_run_dry_run(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(
-        "/delta/gold/word-frequency/run",
+        "/delta/gold/run",
         json={"dry_run": True},
     )
     assert r.status_code == 200
     j = r.get_json()
     assert j["status"] == "dry_run"
     assert "silver_ocr_path" in j
-    assert "gold_path" in j
+    assert "tfidf_path" in j
 
 
 def test_upload_images_requires_file(monkeypatch):
@@ -135,10 +135,10 @@ def test_delta_silver_ocr_run_dry_run_with_dataset(monkeypatch):
     assert "silver_ocr_path" in j
 
 
-def test_delta_gold_word_frequency_run_dry_run_with_dataset(monkeypatch):
+def test_delta_gold_run_dry_run_with_dataset(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(
-        "/delta/gold/word-frequency/run",
+        "/delta/gold/run",
         json={"dry_run": True, "dataset_id": "invoice_ocr"},
     )
     assert r.status_code == 200
@@ -250,10 +250,10 @@ def test_delta_ocr_bronze_run_empty_source_returns_400(monkeypatch):
     assert j["dataset_id"] == "invoice_ocr"
 
 
-def test_delta_gold_word_frequency_run_rejects_bad_coalesce(monkeypatch):
+def test_delta_gold_run_rejects_bad_coalesce(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(
-        "/delta/gold/word-frequency/run",
+        "/delta/gold/run",
         json={"dry_run": True, "coalesce_partitions": "x"},
     )
     assert r.status_code == 400

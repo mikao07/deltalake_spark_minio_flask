@@ -143,56 +143,6 @@
         </div>
       </div>
 
-      <div class="card shadow-sm">
-        <div class="card-body">
-          <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
-            <h2 class="h5 mb-0">Gold 詞頻（keyword / frequency）- 前 15 筆</h2>
-            <span class="text-secondary small text-break">路徑：{{ gold_table_path }}</span>
-          </div>
-          <p class="small text-muted mb-3">
-            資料來源 Gold 落盤表：<span class="text-break">{{ gold_table_path }}</span>。上游來源為 Silver OCR：
-            <span class="text-break">{{ silver_ocr_table_path }}</span>。若需重建金層，請以
-            <code>POST /delta/gold/word-frequency/run</code>（建議設定 <code>ADMIN_TOKEN</code>）呼叫 ETL。
-          </p>
-
-          {% if gold_error %}
-            <div class="alert alert-warning py-2 small mb-2">無法讀取 Gold：{{ gold_error }}</div>
-          {% endif %}
-
-          {% if gold_rows and gold_rows|length > 0 %}
-            <h3 class="h6 text-secondary mb-2">關鍵字詞頻分析（長條圖）</h3>
-            <div
-              class="position-relative mb-4 mx-n1 px-1"
-              style="height: 520px; max-height: 70vh;"
-            >
-              <canvas id="goldWordFreqChart" aria-label="Gold 層詞頻長條圖"></canvas>
-            </div>
-
-            <h3 class="h6 text-secondary mb-2">資料表</h3>
-            <div class="table-responsive">
-              <table class="table table-striped table-hover table-sm align-middle">
-                <thead class="table-light">
-                  <tr>
-                    <th scope="col">keyword</th>
-                    <th scope="col">frequency</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for row in gold_rows %}
-                    <tr>
-                      <td>{{ row.get("keyword") }}</td>
-                      <td>{{ row.get("frequency") }}</td>
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-          {% elif not gold_error %}
-            <div class="text-muted">目前沒有 Gold 詞頻資料可顯示（可能尚未執行 ETL）。</div>
-          {% endif %}
-        </div>
-      </div>
-
       <div class="card shadow-sm mt-4">
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
@@ -200,8 +150,9 @@
             <span class="text-secondary small text-break">路徑：{{ tfidf_table_path }}</span>
           </div>
           <p class="small text-muted mb-3">
-            依<strong>區分力</strong>排序（非單純高頻）：只在少數評論中突出的詞，較像痛點信號。
+            依<strong>區分力</strong>排序；<code>total_tf</code> 即詞彙出現次數。只在少數評論中突出的詞，較像痛點信號。
             隨金層 ETL 一併寫入；亦可 <code>GET /api/gold/tfidf-keywords</code> 查詢。
+            重建請用 <code>POST /delta/gold/run</code>（建議設定 <code>ADMIN_TOKEN</code>）。
           </p>
           {% if tfidf_error %}
             <div class="alert alert-warning py-2 small mb-2">無法讀取 TF-IDF：{{ tfidf_error }}</div>
@@ -354,16 +305,15 @@
           {% else %}
             <div class="text-muted">
               目前沒有痛點主題結果可顯示。請用目前 dataset 重新執行一次
-              <code>POST /delta/gold/word-frequency/run</code>。
+              <code>POST /delta/gold/run</code>。
             </div>
           {% endif %}
         </div>
       </div>
     </div>
 
-    {% if gold_rows and gold_rows|length > 0 or tfidf_rows and tfidf_rows|length > 0 or phrase_rows and phrase_rows|length > 0 or topic_rows and topic_rows|length > 0 or topic_compare_rows and topic_compare_rows|length > 0 %}
+    {% if tfidf_rows and tfidf_rows|length > 0 or phrase_rows and phrase_rows|length > 0 or topic_rows and topic_rows|length > 0 or topic_compare_rows and topic_compare_rows|length > 0 %}
       <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" crossorigin="anonymous"></script>
-      <script id="gold-chart-data" type="application/json">{{ gold_rows | tojson if gold_rows and gold_rows|length > 0 else [] }}</script>
       <script id="tfidf-chart-data" type="application/json">{{ tfidf_rows | tojson if tfidf_rows and tfidf_rows|length > 0 else [] }}</script>
       <script id="phrase-chart-data" type="application/json">{{ phrase_rows | tojson if phrase_rows and phrase_rows|length > 0 else [] }}</script>
       <script id="topic-chart-data" type="application/json">{{ topic_rows | tojson if topic_rows and topic_rows|length > 0 else [] }}</script>
@@ -377,73 +327,6 @@
           const root = document.documentElement;
           const tickColor = getComputedStyle(root).getPropertyValue("--bs-secondary-color") || "#6c757d";
           const gridColor = "rgba(0,0,0,0.06)";
-
-          const goldEl = document.getElementById("gold-chart-data");
-          const goldRows = JSON.parse((goldEl && goldEl.textContent) || "[]");
-          const goldLabels = goldRows.map(function (r) { return String(r.keyword ?? ""); }).reverse();
-          const goldValues = goldRows.map(function (r) {
-            const f = r.frequency;
-            return toNumber(f);
-          }).reverse();
-
-          const goldCanvas = document.getElementById("goldWordFreqChart");
-          if (goldCanvas && typeof Chart !== "undefined" && goldLabels.length > 0) {
-            new Chart(goldCanvas.getContext("2d"), {
-              type: "bar",
-              data: {
-                labels: goldLabels,
-                datasets: [
-                  {
-                    label: "frequency",
-                    data: goldValues,
-                    backgroundColor: "rgba(13, 110, 253, 0.65)",
-                    borderColor: "rgba(13, 110, 253, 1)",
-                    borderWidth: 1,
-                    borderRadius: 4,
-                    maxBarThickness: 22,
-                  },
-                ],
-              },
-              options: {
-                indexAxis: "y",
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                  legend: { display: false },
-                  title: {
-                    display: true,
-                    text: "Top 關鍵字詞頻（Gold 層）",
-                    color: tickColor.trim() || "#6c757d",
-                    font: { size: 14, weight: "600" },
-                  },
-                  tooltip: {
-                    callbacks: {
-                      label: function (ctx) {
-                        const v = ctx.parsed.x;
-                        return "次數：" + v;
-                      },
-                    },
-                  },
-                },
-                scales: {
-                  x: {
-                    beginAtZero: true,
-                    ticks: { color: tickColor.trim() },
-                    grid: { color: gridColor },
-                    title: { display: true, text: "frequency", color: tickColor.trim(), font: { size: 11 } },
-                  },
-                  y: {
-                    ticks: {
-                      color: tickColor.trim(),
-                      autoSkip: false,
-                      font: { size: 11 },
-                    },
-                    grid: { display: false },
-                  },
-                },
-              },
-            });
-          }
 
           const tfidfEl = document.getElementById("tfidf-chart-data");
           const tfidfRows = JSON.parse((tfidfEl && tfidfEl.textContent) || "[]");

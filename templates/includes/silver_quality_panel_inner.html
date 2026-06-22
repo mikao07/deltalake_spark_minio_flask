@@ -1,0 +1,70 @@
+{% macro severity_label(sev) -%}
+  {% if sev == 'hard' %}<span class="badge text-bg-danger">hard</span>{% else %}<span class="badge text-bg-warning text-dark">warn</span>{% endif %}
+{%- endmacro %}
+
+{% if quality.get('skipped') %}
+  <p class="text-muted mb-0">品質檢查已略過：{{ quality.get('reason') or '—' }}</p>
+{% else %}
+  <p class="mb-2">
+    <span class="text-muted">轉換版本</span>
+    <code>{{ quality.get('transform_version') or '—' }}</code>
+    <span class="text-muted ms-2">檢查列數</span>
+    <strong>{{ quality.get('total_rows') if quality.get('total_rows') is not none else '—' }}</strong>
+  </p>
+
+  {% if quality.get('hard_failures') and quality.get('hard_failures')|length > 0 %}
+    <div class="alert alert-danger py-2 mb-2">
+      <strong>未通過（hard）</strong>
+      <ul class="mb-0 ps-3">
+        {% for msg in quality.get('hard_failures') %}
+          <li>{{ msg }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if quality.get('warnings') and quality.get('warnings')|length > 0 %}
+    <div class="alert alert-warning py-2 mb-2">
+      <strong>警告（warn）</strong>
+      <ul class="mb-0 ps-3">
+        {% for msg in quality.get('warnings') %}
+          <li>{{ msg }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if quality.get('passed') and not (quality.get('warnings') and quality.get('warnings')|length > 0) %}
+    <div class="alert alert-success py-2 mb-2">所有 hard 檢查通過，目前無 warn。</div>
+  {% elif quality.get('passed') %}
+    <div class="alert alert-success py-2 mb-2">Hard 檢查通過；請留意上方 warn。</div>
+  {% endif %}
+
+  {% if quality.get('checks') and quality.get('checks')|length > 0 %}
+    <details class="mt-2">
+      <summary class="text-muted" style="cursor: pointer">展開各項檢查明細（{{ quality.get('checks')|length }} 項）</summary>
+      <div class="table-responsive border rounded mt-2">
+        <table class="table table-sm table-striped mb-0 align-middle">
+          <thead class="table-light">
+            <tr>
+              <th>項目</th>
+              <th>嚴重度</th>
+              <th>結果</th>
+              <th>說明</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for c in quality.get('checks') %}
+              <tr class="{% if not c.get('passed') and c.get('severity') == 'hard' %}table-danger{% elif not c.get('passed') %}table-warning{% endif %}">
+                <td><code>{{ c.get('name') }}</code></td>
+                <td>{{ severity_label(c.get('severity')) }}</td>
+                <td>{% if c.get('passed') %}<span class="text-success">pass</span>{% else %}<span class="text-danger">fail</span>{% endif %}</td>
+                <td class="text-break">{{ c.get('message') }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  {% endif %}
+{% endif %}
