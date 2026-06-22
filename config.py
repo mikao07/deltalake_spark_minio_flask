@@ -91,7 +91,7 @@ STOPWORDS_DATASET_PATTERN = os.getenv("STOPWORDS_DATASET_PATTERN", "")
 STOPWORDS_LEXICON_VERSION = os.getenv("STOPWORDS_LEXICON_VERSION", "v1.0.0")
 
 # 銀層轉換版本（冪等性：同版本 + 同 Bronze → 同 Silver）
-SILVER_TRANSFORM_VERSION = os.getenv("SILVER_TRANSFORM_VERSION", "v2.0.0")
+SILVER_TRANSFORM_VERSION = os.getenv("SILVER_TRANSFORM_VERSION", "v2.1.0")
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))

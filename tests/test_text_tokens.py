@@ -3,7 +3,9 @@
 from services.text_tokens import (
     BUILTIN_STOPWORDS,
     clean_text_for_segmentation,
+    collapse_cjk_internal_spaces,
     filter_segmented_tokens,
+    strip_ocr_garbage_tokens,
 )
 
 
@@ -15,7 +17,25 @@ def test_builtin_stopwords_include_common_particles():
 
 
 def test_clean_text_for_segmentation_strips_punctuation():
-    assert clean_text_for_segmentation("  珍珠奶茶，很好喝！  ") == "珍珠奶茶 很好喝"
+    assert clean_text_for_segmentation("  珍珠奶茶，很好喝！  ") == "珍珠奶茶很好喝"
+
+
+def test_collapse_cjk_internal_spaces():
+    assert collapse_cjk_internal_spaces("珍珠 燕麥都整個硬") == "珍珠燕麥都整個硬"
+    assert collapse_cjk_internal_spaces("Line Pay 很好") == "Line Pay 很好"
+
+
+def test_strip_ocr_garbage_tokens_removes_bare_keeps_line_pay():
+    assert strip_ocr_garbage_tokens("以上了 bare 台請三") == "以上了 台請三"
+    assert strip_ocr_garbage_tokens("用 line pay 結帳") == "用 line pay 結帳"
+
+
+def test_clean_text_cjk_and_garbage_bronze_sample():
+    raw = "珍珠 燕麥都整個硬 很久沒有沒喝到這麼NG料 BARE see"
+    out = clean_text_for_segmentation(raw)
+    assert "珍珠燕麥" in out
+    assert "bare" not in out.split()
+    assert "see" not in out.split()
 
 
 def test_clean_text_strips_ocr_digit_noise():
@@ -28,7 +48,7 @@ def test_clean_text_strips_ocr_digit_noise():
 
 def test_clean_text_strips_isolated_pure_digits():
     assert clean_text_for_segmentation("12 30 2222 拜託") == "拜託"
-    assert clean_text_for_segmentation("耶 2222 2222 第二次") == "耶 第二次"
+    assert clean_text_for_segmentation("耶 2222 2222 第二次") == "耶第二次"
 
 
 def test_strip_pure_digit_tokens_keeps_mixed_alnum():

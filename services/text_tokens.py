@@ -143,6 +143,64 @@ _MIN_WORD_LENGTH = 2
 SILVER_CLEAN_TEXT_SPARK_PATTERN = r"[^\p{L}\p{N}\s_]"
 _CLEAN_TEXT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _PURE_DIGIT_TOKEN_RE = re.compile(r"^\d+$")
+_CJK_INTERNAL_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F9FF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+# 銀層物理清洗：保留的洋文片語（去垃圾 token 前暫存）
+_OCR_PHRASE_WHITELIST: tuple[str, ...] = (
+    "line pay",
+    "fine pay",
+    "uber eat",
+)
+
+# OCR 洋文碎屑（獨立 token；非白名單片語內）
+_OCR_GARBAGE_TOKENS: frozenset[str] = frozenset(
+    {"bare", "see", "img", "png", "html", "the", "ok", "aei", "ei", "aer"}
+)
+
+
+def collapse_cjk_internal_spaces(text: str) -> str:
+    """移除兩個中文字之間的 OCR 空格（例：珍珠 燕麥 → 珍珠燕麥）。"""
+    if not text:
+        return ""
+    return _CJK_INTERNAL_SPACE_RE.sub("", text)
+
+
+def _protect_ocr_phrases(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """將白名單片語換成占位符，避免後續當垃圾 token 刪除。"""
+    out = text
+    slots: list[tuple[str, str]] = []
+    for i, phrase in enumerate(_OCR_PHRASE_WHITELIST):
+        token = f"__wl{i}__"
+        pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+        if not pattern.search(out):
+            continue
+        out = pattern.sub(token, out)
+        slots.append((token, phrase.lower()))
+    return out, slots
+
+
+def _restore_ocr_phrases(text: str, slots: list[tuple[str, str]]) -> str:
+    out = text
+    for token, phrase in slots:
+        out = out.replace(token, phrase)
+    return out
+
+
+def strip_ocr_garbage_tokens(text: str) -> str:
+    """移除獨立 OCR 洋文垃圾 token（BARE、see 等），保留白名單片語。"""
+    if not text:
+        return ""
+    protected, slots = _protect_ocr_phrases(text)
+    kept = [p for p in protected.split() if p.lower() not in _OCR_GARBAGE_TOKENS]
+    return _restore_ocr_phrases(" ".join(kept), slots)
 
 
 def strip_pure_digit_tokens(text: str) -> str:
@@ -158,15 +216,19 @@ def strip_pure_digit_tokens(text: str) -> str:
 
 
 def clean_text_for_segmentation(text: str | None) -> str:
-    """去標點 → 正規化空白 → 剝純數字 token → 轉小寫。"""
+    """去 emoji／標點 → CJK 去空格 → 剝 OCR 垃圾 token → 剝純數字 → 轉小寫。"""
     if text is None:
         return ""
     raw = str(text).strip()
     if not raw:
         return ""
+    raw = _EMOJI_RE.sub(" ", raw)
     cleaned = _CLEAN_TEXT_RE.sub(" ", raw)
     cleaned = " ".join(cleaned.lower().split())
-    return strip_pure_digit_tokens(cleaned)
+    cleaned = strip_ocr_garbage_tokens(cleaned)
+    cleaned = strip_pure_digit_tokens(cleaned)
+    cleaned = collapse_cjk_internal_spaces(cleaned)
+    return cleaned
 
 
 def filter_segmented_tokens(
