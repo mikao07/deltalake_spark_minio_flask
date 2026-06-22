@@ -137,6 +137,12 @@ OCR_CONTRAST = os.getenv("OCR_CONTRAST", "1.5")
 OCR_SHARPNESS = os.getenv("OCR_SHARPNESS", "1.0")
 OCR_BINARIZE = os.getenv("OCR_BINARIZE", "off")
 OCR_PREPROCESS_VERSION = os.getenv("OCR_PREPROCESS_VERSION", "v1")
+OCR_SIGNATURE = os.getenv("OCR_SIGNATURE", "").strip()
+# 前處理 preset 分流（預設關閉；開啟後於單次 Bronze OCR 內依圖選 profile）
+OCR_PRESET_ROUTER_ENABLED = _env_bool("OCR_PRESET_ROUTER_ENABLED", False)
+OCR_LOW_RES_SHORT_SIDE = int(os.getenv("OCR_LOW_RES_SHORT_SIDE", "720"))
+OCR_LOW_RES_TARGET_SIDE = int(os.getenv("OCR_LOW_RES_TARGET_SIDE", "1080"))
+OCR_LIGHT_DOC_MEAN_LUMA = _env_float("OCR_LIGHT_DOC_MEAN_LUMA", 180.0)
 # Tesseract user-words（本機路徑或 s3a://；Bronze OCR 前 addFile 分發）
 OCR_USER_WORDS_PATH = os.getenv("OCR_USER_WORDS_PATH", "")
 OCR_USER_WORDS_DATASET_PATTERN = os.getenv("OCR_USER_WORDS_DATASET_PATTERN", "")

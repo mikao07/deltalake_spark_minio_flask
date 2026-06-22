@@ -17,7 +17,24 @@ from pyspark.sql.functions import col, current_timestamp, length, lit, lower, re
 from pyspark.sql.types import StringType
 from minio.error import S3Error
 
-from config import BUCKET_NAME, OCR_USER_WORDS_PATH, RAW_IMAGE_PREFIX
+from config import (
+    BUCKET_NAME,
+    OCR_BINARIZE,
+    OCR_CONTRAST,
+    OCR_LANG,
+    OCR_LIGHT_DOC_MEAN_LUMA,
+    OCR_LOW_RES_SHORT_SIDE,
+    OCR_LOW_RES_TARGET_SIDE,
+    OCR_PREPROCESS_VERSION,
+    OCR_PRESET_ROUTER_ENABLED,
+    OCR_PSM,
+    OCR_SCALE_MIN_SIDE,
+    OCR_SHARPNESS,
+    OCR_SIGNATURE,
+    OCR_USER_WORDS_PATH,
+    RAW_IMAGE_PREFIX,
+    TESSERACT_CMD,
+)
 from services.domain_lexicons import (
     materialize_merged_ocr_user_words_file,
     resolve_local_ocr_user_words_path,
@@ -30,7 +47,7 @@ _VALID_PSM = frozenset(str(i) for i in range(14))
 
 def normalize_psm(psm: str | None, *, default: str | None = None) -> str:
     """Tesseract PSM 0–13；無效值拋 ValueError。"""
-    fallback = (default or os.getenv("OCR_PSM", "11") or "11").strip() or "11"
+    fallback = (default or os.getenv("OCR_PSM") or OCR_PSM or "6").strip() or "6"
     s = str(psm).strip() if psm is not None and str(psm).strip() else fallback
     if s not in _VALID_PSM:
         raise ValueError(f"PSM 必須為 0–13 的整數字串（目前：{s!r}）。")
@@ -86,9 +103,123 @@ def _env_str(name: str, default: str = "") -> str:
     return raw or default
 
 
-def _apply_binarization(gray_img):
-    """灰階 PIL Image → 二值化（OCR_BINARIZE=otsu|adaptive；off 則原樣回傳）。"""
-    mode = _env_str("OCR_BINARIZE", "off").lower()
+def build_ocr_runtime_config() -> dict:
+    """
+    Driver 啟動 Bronze OCR 時組裝設定（可 broadcast 至 executor）。
+    優先 os.environ（單測 monkeypatch），fallback config 模組預設。
+    """
+    return {
+        "lang": (os.getenv("OCR_LANG") or OCR_LANG or "chi_tra+eng").strip(),
+        "psm": normalize_psm(os.getenv("OCR_PSM") or OCR_PSM),
+        "tesseract_cmd": (os.getenv("TESSERACT_CMD") or TESSERACT_CMD or "").strip(),
+        "preprocess_version": (os.getenv("OCR_PREPROCESS_VERSION") or OCR_PREPROCESS_VERSION or "v1").strip(),
+        "scale_min_side": max(0, _env_int("OCR_SCALE_MIN_SIDE", int(str(OCR_SCALE_MIN_SIDE or "0") or "0"))),
+        "contrast": _env_float("OCR_CONTRAST", float(str(OCR_CONTRAST or "1.5"))),
+        "sharpness": _env_float("OCR_SHARPNESS", float(str(OCR_SHARPNESS or "1.0"))),
+        "binarize": (_env_str("OCR_BINARIZE", str(OCR_BINARIZE or "off")) or "off").lower(),
+        "binarize_block_size": _env_int("OCR_BINARIZE_BLOCK_SIZE", 31),
+        "binarize_c": _env_int("OCR_BINARIZE_C", 10),
+        "binarize_invert": (_env_str("OCR_BINARIZE_INVERT", "auto") or "auto").lower(),
+        "binarize_morph": (_env_str("OCR_BINARIZE_MORPH", "off") or "off").lower(),
+        "signature_override": (os.getenv("OCR_SIGNATURE") or OCR_SIGNATURE or "").strip(),
+        "preset_router_enabled": _env_bool_from_env("OCR_PRESET_ROUTER_ENABLED", OCR_PRESET_ROUTER_ENABLED),
+        "low_res_short_side": _env_int("OCR_LOW_RES_SHORT_SIDE", int(OCR_LOW_RES_SHORT_SIDE)),
+        "low_res_target_side": _env_int("OCR_LOW_RES_TARGET_SIDE", int(OCR_LOW_RES_TARGET_SIDE)),
+        "light_doc_mean_luma": _env_float("OCR_LIGHT_DOC_MEAN_LUMA", float(OCR_LIGHT_DOC_MEAN_LUMA)),
+    }
+
+
+def _env_bool_from_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _preprocess_params_from_config(cfg: dict) -> dict:
+    return {
+        "scale_min_side": int(cfg.get("scale_min_side", 0)),
+        "contrast": float(cfg.get("contrast", 1.5)),
+        "sharpness": float(cfg.get("sharpness", 1.0)),
+        "binarize": str(cfg.get("binarize", "off")).lower(),
+        "binarize_block_size": int(cfg.get("binarize_block_size", 31)),
+        "binarize_c": int(cfg.get("binarize_c", 10)),
+        "binarize_invert": str(cfg.get("binarize_invert", "auto")).lower(),
+        "binarize_morph": str(cfg.get("binarize_morph", "off")).lower(),
+    }
+
+
+def _dark_ui_preprocess_params(cfg: dict) -> dict:
+    return _preprocess_params_from_config(cfg)
+
+
+def _low_res_preprocess_params(cfg: dict) -> dict:
+    base = _dark_ui_preprocess_params(cfg)
+    target = max(1, int(cfg.get("low_res_target_side", 1080)))
+    base["scale_min_side"] = target
+    return base
+
+
+def _light_doc_preprocess_params(cfg: dict) -> dict:
+    base = _dark_ui_preprocess_params(cfg)
+    base["contrast"] = min(base["contrast"], 1.2)
+    base["binarize"] = "otsu"
+    return base
+
+
+def select_preprocess_profile(img, cfg: dict) -> tuple[str, dict]:
+    """
+    單次開圖內選擇前處理 profile（預設關閉 router → 一律 dark_ui）。
+  回傳 (profile_name, preprocess_params)。
+    """
+    if not cfg.get("preset_router_enabled"):
+        return "dark_ui", _dark_ui_preprocess_params(cfg)
+
+    from PIL import Image
+
+    if not isinstance(img, Image.Image):
+        raise TypeError("select_preprocess_profile 需要 PIL.Image。")
+
+    w, h = img.size
+    short = min(w, h)
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    mean_luma = float(sum(pixels)) / max(1, len(pixels))
+
+    if short < int(cfg.get("low_res_short_side", 720)):
+        return "low_res", _low_res_preprocess_params(cfg)
+    if mean_luma > float(cfg.get("light_doc_mean_luma", 180.0)):
+        return "light_doc", _light_doc_preprocess_params(cfg)
+    return "dark_ui", _dark_ui_preprocess_params(cfg)
+
+
+def build_ocr_signature(cfg: dict, *, profile: str = "dark_ui", preprocess: dict | None = None) -> str:
+    override = str(cfg.get("signature_override") or "").strip()
+    if override:
+        return override
+    params = preprocess or _dark_ui_preprocess_params(cfg)
+    lang = str(cfg.get("lang") or "chi_tra+eng").strip()
+    psm = normalize_psm(str(cfg.get("psm")))
+    pre = str(cfg.get("preprocess_version") or "v1").strip()
+    scale = str(max(0, int(params.get("scale_min_side", 0))))
+    contrast = str(params.get("contrast", 1.5))
+    sharp = str(params.get("sharpness", 1.0))
+    binarize = str(params.get("binarize", "off")).lower() or "off"
+    return (
+        f"tesseract|lang={lang}|psm={psm}|pre={pre}|profile={profile}"
+        f"|scale={scale}|ctr={contrast}|shp={sharp}|bin={binarize}"
+    )
+
+
+def broadcast_ocr_runtime_config(spark: SparkSession, cfg: dict | None = None):
+    """將 OCR 設定 broadcast 給 Spark executor（避免 worker 讀不到 driver .env）。"""
+    payload = cfg or build_ocr_runtime_config()
+    return spark.sparkContext.broadcast(payload)
+
+
+def _apply_binarization(gray_img, preprocess: dict):
+    """灰階 PIL Image → 二值化（preprocess['binarize']=otsu|adaptive；off 則原樣回傳）。"""
+    mode = str(preprocess.get("binarize", "off")).lower()
     if mode in ("off", "none", ""):
         return gray_img
 
@@ -103,10 +234,10 @@ def _apply_binarization(gray_img):
     if mode == "otsu":
         _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     elif mode == "adaptive":
-        block = max(3, _env_int("OCR_BINARIZE_BLOCK_SIZE", 31))
+        block = max(3, int(preprocess.get("binarize_block_size", 31)))
         if block % 2 == 0:
             block += 1
-        c = _env_int("OCR_BINARIZE_C", 10)
+        c = int(preprocess.get("binarize_c", 10))
         binary = cv2.adaptiveThreshold(
             arr,
             255,
@@ -118,14 +249,14 @@ def _apply_binarization(gray_img):
     else:
         return gray_img
 
-    invert = _env_str("OCR_BINARIZE_INVERT", "auto").lower()
+    invert = str(preprocess.get("binarize_invert", "auto")).lower()
     if invert == "auto":
         if float(np.mean(binary)) < 127.0:
             binary = cv2.bitwise_not(binary)
     elif invert in ("1", "true", "yes", "on"):
         binary = cv2.bitwise_not(binary)
 
-    morph = _env_str("OCR_BINARIZE_MORPH", "off").lower()
+    morph = str(preprocess.get("binarize_morph", "off")).lower()
     if morph == "open":
         kernel = np.ones((2, 2), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
@@ -133,17 +264,22 @@ def _apply_binarization(gray_img):
     return Image.fromarray(binary)
 
 
-def preprocess_image_for_ocr(img):
+def preprocess_image_for_ocr(
+    img,
+    *,
+    runtime_config: dict | None = None,
+    preprocess_params: dict | None = None,
+):
     """
-    Bronze OCR 前處理（可由 .env 調校）：
-    - OCR_SCALE_MIN_SIDE：短邊低於此值時等比放大（0=不放大）
-    - OCR_CONTRAST：對比度倍率（灰階後）
-    - OCR_SHARPNESS：銳利度倍率（1.0=不變）
-    - OCR_BINARIZE：off | otsu | adaptive（彩色 UI 截圖建議 otsu）
+    Bronze OCR 前處理（可由 runtime_config / preset profile 調校）。
     """
     from PIL import Image, ImageEnhance
 
-    scale_min = max(0, _env_int("OCR_SCALE_MIN_SIDE", 0))
+    cfg = runtime_config or build_ocr_runtime_config()
+    if preprocess_params is None:
+        _profile, preprocess_params = select_preprocess_profile(img, cfg)
+
+    scale_min = max(0, int(preprocess_params.get("scale_min_side", 0)))
     if scale_min > 0:
         w, h = img.size
         short = min(w, h)
@@ -154,15 +290,15 @@ def preprocess_image_for_ocr(img):
 
     img = img.convert("L")
 
-    contrast = _env_float("OCR_CONTRAST", 1.5)
+    contrast = float(preprocess_params.get("contrast", 1.5))
     if contrast != 1.0:
         img = ImageEnhance.Contrast(img).enhance(contrast)
 
-    sharpness = _env_float("OCR_SHARPNESS", 1.0)
+    sharpness = float(preprocess_params.get("sharpness", 1.0))
     if sharpness != 1.0:
         img = ImageEnhance.Sharpness(img).enhance(sharpness)
 
-    return _apply_binarization(img)
+    return _apply_binarization(img, preprocess_params)
 
 
 _ocr_user_words_registered: str | None = None
@@ -285,10 +421,11 @@ def ocr_image_bytes(
     *,
     psm: str | None = None,
     user_words_path: str | None = None,
+    runtime_config: dict | None = None,
 ) -> Optional[str]:
     """
     將影像二進位內容轉成文字（driver 或 Spark UDF 皆可呼叫）。
-    psm 未指定時使用環境變數 OCR_PSM。
+    runtime_config 應由 driver broadcast；未傳入時於本機組裝（測試／AB 頁）。
     """
     try:
         import pytesseract
@@ -296,12 +433,13 @@ def ocr_image_bytes(
 
         from PIL import Image
 
-        cmd = os.getenv("TESSERACT_CMD", "").strip()
+        cfg = runtime_config or build_ocr_runtime_config()
+        cmd = str(cfg.get("tesseract_cmd") or "").strip()
         if cmd:
             pytesseract.pytesseract.tesseract_cmd = cmd
 
-        ocr_lang = os.getenv("OCR_LANG", "chi_tra+eng")
-        ocr_psm = normalize_psm(psm)
+        ocr_lang = str(cfg.get("lang") or "chi_tra+eng")
+        ocr_psm = normalize_psm(psm, default=str(cfg.get("psm")))
 
         if image_content is None:
             return None
@@ -316,7 +454,8 @@ def ocr_image_bytes(
         buf = BytesIO(data)
         buf.seek(0)
         img = Image.open(buf)
-        img = preprocess_image_for_ocr(img)
+        profile, params = select_preprocess_profile(img, cfg)
+        img = preprocess_image_for_ocr(img, runtime_config=cfg, preprocess_params=params)
 
         tesseract_config = _build_tesseract_config(ocr_psm, user_words_path)
         text = pytesseract.image_to_string(img, lang=ocr_lang, config=tesseract_config)
@@ -329,29 +468,19 @@ def ocr_image_bytes(
         return f"OCR_ERROR_REAL: {e}"
 
 
-def _ocr_binary_to_text(image_content) -> Optional[str]:
-    """Spark UDF 包裝：使用環境變數 OCR_PSM 與 worker 上已分發的 user-words。"""
-    return ocr_image_bytes(image_content)
+def make_ocr_udf(config_bc):
+    """建立綁定 broadcast OCR 設定的 Spark UDF。"""
+
+    def _ocr_binary_to_text(image_content) -> Optional[str]:
+        return ocr_image_bytes(image_content, runtime_config=config_bc.value)
+
+    return udf(_ocr_binary_to_text, StringType())
 
 
-_ocr_udf = udf(_ocr_binary_to_text, StringType())
-
-
-def _get_ocr_signature() -> str:
-    # 可用環境變數覆寫，方便升級 OCR 流程後區分版本
-    sig = os.getenv("OCR_SIGNATURE", "").strip()
-    if sig:
-        return sig
-    lang = os.getenv("OCR_LANG", "chi_tra+eng").strip() or "chi_tra+eng"
-    psm = os.getenv("OCR_PSM", "11").strip() or "11"
-    pre = os.getenv("OCR_PREPROCESS_VERSION", "v1").strip() or "v1"
-    scale = str(max(0, _env_int("OCR_SCALE_MIN_SIDE", 0)))
-    contrast = str(_env_float("OCR_CONTRAST", 1.5))
-    sharp = str(_env_float("OCR_SHARPNESS", 1.0))
-    binarize = _env_str("OCR_BINARIZE", "off").lower() or "off"
-    return (
-        f"tesseract|lang={lang}|psm={psm}|pre={pre}|scale={scale}|ctr={contrast}|shp={sharp}|bin={binarize}"
-    )
+def _get_ocr_signature(cfg: dict | None = None) -> str:
+    """相容舊呼叫；預設 dark_ui profile（router 關閉時整批一致）。"""
+    base = cfg or build_ocr_runtime_config()
+    return build_ocr_signature(base, profile="dark_ui", preprocess=_dark_ui_preprocess_params(base))
 
 
 def _extract_bucket_and_prefix(raw_images_path: str) -> tuple[str, str]:
@@ -460,8 +589,12 @@ def run_bronze_ocr_ingest(
 
     register_ocr_user_words_if_needed(spark, dataset_id=inferred_ds or None)
 
+    ocr_cfg = build_ocr_runtime_config()
+    config_bc = broadcast_ocr_runtime_config(spark, ocr_cfg)
+    ocr_udf = make_ocr_udf(config_bc)
+
     df_paths = _build_df_paths(spark, raw_images_path)
-    sig = _get_ocr_signature()
+    sig = _get_ocr_signature(ocr_cfg)
 
     df_base = (
         df_paths.withColumn("file_hash", sha2(col("image_content"), 256))
@@ -500,7 +633,7 @@ def run_bronze_ocr_ingest(
         }
 
     df_ocr = (
-        df_base.withColumn("extracted_text", _ocr_udf(col("image_content")))
+        df_base.withColumn("extracted_text", ocr_udf(col("image_content")))
         .withColumn("ingestion_timestamp", current_timestamp())
         .withColumn("source_bucket", lit("raw_images"))
         .drop("image_content")
@@ -531,6 +664,11 @@ def run_bronze_ocr_ingest(
         "skipped_rows": skipped_rows,
         "ocr_error_rows_dropped": ocr_error_rows,
         "ocr_signature": sig,
+        "ocr_runtime_config": {
+            "psm": ocr_cfg.get("psm"),
+            "preprocess_version": ocr_cfg.get("preprocess_version"),
+            "preset_router_enabled": ocr_cfg.get("preset_router_enabled"),
+        },
     }
 
 

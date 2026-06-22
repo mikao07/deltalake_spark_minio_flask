@@ -53,6 +53,13 @@ from config import (
     MINIO_ACCESS_KEY,
     MINIO_ENDPOINT,
     MINIO_SECRET_KEY,
+    OCR_BINARIZE,
+    OCR_CONTRAST,
+    OCR_LANG,
+    OCR_PREPROCESS_VERSION,
+    OCR_PSM,
+    OCR_SCALE_MIN_SIDE,
+    OCR_SHARPNESS,
     S3A_CONNECTION_SSL_ENABLED,
     S3A_ENDPOINT_REGION,
     S3A_IMPL,
@@ -60,6 +67,7 @@ from config import (
     SILVER_OCR_TABLE_PATH,
     SILVER_TRANSFORM_VERSION,
     STOPWORDS_LEXICON_VERSION,
+    TESSERACT_CMD,
 )
 from services.domain_lexicons import resolve_local_jieba_userdict_path
 from services.lexicon import collect_gold_lexicon, filter_tokens_for_analytics, parse_stopwords_lines
@@ -134,8 +142,18 @@ class SparkManager:
 
         s3a_endpoint, s3a_ssl_enabled = _normalize_s3a_endpoint(MINIO_ENDPOINT)
 
-        # 依照 Notebook Cell 1：SparkSession 配置（Delta + S3A/MinIO）
-        self.spark = (
+        ocr_executor_env = {
+            "OCR_LANG": OCR_LANG,
+            "OCR_PSM": OCR_PSM,
+            "OCR_SCALE_MIN_SIDE": OCR_SCALE_MIN_SIDE,
+            "OCR_CONTRAST": OCR_CONTRAST,
+            "OCR_SHARPNESS": OCR_SHARPNESS,
+            "OCR_BINARIZE": OCR_BINARIZE,
+            "OCR_PREPROCESS_VERSION": OCR_PREPROCESS_VERSION,
+            "TESSERACT_CMD": TESSERACT_CMD or "",
+        }
+
+        builder = (
             SparkSession.builder.appName(app_name)
             # Maven 套件載入（hadoop-aws / aws-java-sdk-bundle / delta-spark）
             .config("spark.jars.packages", PACKAGES)
@@ -157,8 +175,11 @@ class SparkManager:
             .config("spark.driver.extraJavaOptions", "-Dfile.encoding=UTF-8")
             .config("spark.executor.extraJavaOptions", "-Dfile.encoding=UTF-8")
             .config("spark.sql.execution.python.udf.inPandas.parent.env", "PYTHONIOENCODING=UTF-8")
-            .getOrCreate()
         )
+        for key, value in ocr_executor_env.items():
+            builder = builder.config(f"spark.executorEnv.{key}", str(value))
+
+        self.spark = builder.getOrCreate()
 
         # 對齊 Notebook：後續呼叫時再確保一致行為
         self.spark.conf.set("spark.executorEnv.PYTHONIOENCODING", "UTF-8")

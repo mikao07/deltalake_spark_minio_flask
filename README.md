@@ -10,21 +10,23 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 | `config.py` | 由環境變數讀取 MinIO/S3A、各層 Delta 路徑、OCR、上傳策略 |
 | `services/spark_service.py` | SparkSession、Delta 讀寫、Silver/Gold ETL、系統狀態等 |
 | `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
-| `services/ocr_spark.py` | Bronze OCR：binaryFile → 前處理（含二值化）→ Tesseract（含 user-words）→ Delta |
+| `services/ocr_spark.py` | Bronze OCR：binaryFile → **preset 前處理** → Tesseract（**broadcast 設定**至 executor）→ Delta |
+| `services/ocr_psm_ab.py` | PSM A/B 測試（固定樣本、結果寫入 `test/ocr_psm_ab/`，不污染 Bronze） |
 | `services/domain_lexicons.py` | 依 `dataset_id` 內建停用詞、Jieba 詞、OCR user-words |
 | `services/pain_funnel.py` | 痛點漏斗：撈網 → 過濾 → 情緒（`pain_candidates` / `sentiment`） |
 | `services/pain_topic_rules.py` | 痛點主題詞庫與極性規則（供漏斗使用） |
 | `services/text_similarity.py` | 痛點規則用的字串相似度（rapidfuzz / difflib fallback） |
 | `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
 | `dic/` | 領域辭典：`stop_words/`、`jieba_dicts/`、`ocr_user_words/`（可上傳 MinIO 擴充） |
-| `templates/` | `index.html`（Dashboard）、`pipeline_bronze|silver|gold.html`（管線分頁）、`layers.html`（除錯預覽） |
+| `docs/OCR-決策紀錄.md` | 對外可讀的 OCR／管線**決策摘要**（PSM、前處理、分層職責） |
+| `templates/` | `index.html`（Dashboard）、`pipeline_bronze|silver|gold.html`（管線分頁）、`test_ocr_psm.html`（PSM A/B）、`layers.html`（除錯預覽） |
 | `tests/` | `pytest`：API 驗證、MinIO 檔名邏輯（可不透過真 Spark/MinIO） |
 | `.github/workflows/ci.yml` | Push／PR 至 `main`/`master` 時自動執行 `pytest`（GitHub Actions） |
 
 ### 資料管線（摘要）
 
-- **Bronze**：`raw/images/{dataset_id}/` 影像 → **可調前處理**（放大、灰階、對比、銳化、**二值化**）→ **Tesseract**（預設 **`OCR_PSM=6`**，可載入 **user-words**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**領域辭典**。
-- **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 物理清洗（去標點、剝純數字雜訊）；**Jieba + 內建虛詞停用詞** 產出冪等 `tokens`（`SILVER_TRANSFORM_VERSION`）。ETL 後執行**三道品質防線**（Schema／Token 分佈／留存率）。**不**套用領域停用詞。
+- **Bronze**：`raw/images/{dataset_id}/` 影像 → **前處理 profile**（預設 `dark_ui`：`scale=0`、對比、可選二值化）→ **Tesseract**（**`OCR_PSM=6`**，user-words）→ Delta。Driver 以 **`build_ocr_runtime_config()` + broadcast** 將 OCR 參數傳至 Spark executor（避免 worker 讀不到 `.env`）。`ocr_signature` 含 `psm` / `pre` / **`profile`**。可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**`docs/OCR-決策紀錄.md`**。
+- **Silver**：OCR 原文保留於 **`extracted_text`**（稽核用）；**`cleaned_text`** 物理清洗（去標點、剝純數字雜訊；**CJK 去空格／emoji 清洗規劃中**）；**Jieba + 內建虛詞** 產出冪等 `tokens`（`SILVER_TRANSFORM_VERSION`）。ETL 後執行**三道品質防線**。**不**套用領域停用詞。
 - **Gold**：讀銀層 `tokens` → 套用版本化 lexicon（`effective_stop = stop − 痛點保護詞`）→ 痛點漏斗、TF-IDF、PMI。規則 **`v1.4-drinks-funnel`**；辭典 **`STOPWORDS_LEXICON_VERSION`**。
 - **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
 - **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**金層頁** `/pipeline/gold` 有同名勾選（預設開啟）；**銅層頁**上傳表單亦有一鍵選項。
@@ -45,6 +47,7 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 - **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）
 - **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見金層管線頁說明）
 - **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
+- **OCR PSM A/B 測試**（不寫 Bronze）：`GET /test/ocr-psm`、`POST /api/test/ocr-psm/run`
 - **Silver OCR ETL**：`POST /delta/silver/ocr/run`
 - **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`；`MAX_UPLOAD_MB` 限制大小）
 - **查詢 dataset_id**：`GET /api/datasets`（需 `ADMIN_TOKEN` 時）
@@ -73,58 +76,67 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 
 ### OCR 調校（Bronze / Tesseract）
 
-銅層 OCR 由 `services/ocr_spark.py` 執行：讀取 MinIO 影像 → **可調前處理** → **Tesseract**（可帶 **user-words**）→ 寫入 Bronze Delta。
+銅層 OCR 由 `services/ocr_spark.py` 執行：讀取 MinIO 影像 → **前處理 profile** → **Tesseract**（user-words）→ 寫入 Bronze Delta。完整決策與 AB 結論見 **`docs/OCR-決策紀錄.md`**。
 
-| 變數 | 預設 | 說明 |
-|------|------|------|
-| `OCR_LANG` | `chi_tra+eng` | Tesseract 語言包；純中文評論可試 `chi_tra` |
-| `OCR_PSM` | `6` | Page Segmentation Mode；**6**＝單一文字區塊（AB 實測較少亂碼）；**11**＝稀疏文字 |
-| `OCR_SCALE_MIN_SIDE` | `0` | 短邊低於此像素時等比放大；手機截圖建議 **1400～1800** |
-| `OCR_CONTRAST` | `1.5` | 灰階後對比度倍率；可試 **1.8～2.0** |
-| `OCR_SHARPNESS` | `1.0` | 銳利度倍率；可試 **1.1～1.3** |
-| `OCR_BINARIZE` | `off` | 二值化：`off` \| `otsu` \| `adaptive`；**粉紅外送 UI／深色模式** 截圖可試 **`otsu`** |
-| `OCR_BINARIZE_INVERT` | `auto` | `auto` 依平均亮度自動反相；或 `true` / `false` |
-| `OCR_BINARIZE_BLOCK_SIZE` | `31` | `adaptive` 時區塊大小（奇數） |
-| `OCR_BINARIZE_C` | `10` | `adaptive` 常數 C |
-| `OCR_USER_WORDS_PATH` | （空） | 全域 Tesseract user-words（本機或 `s3a://`） |
-| `OCR_USER_WORDS_DATASET_PATTERN` | （空） | 依 dataset，例：`s3a://data-lake/dic/ocr_user_words/{dataset_id}.txt` |
+**設計要點**
+
+- **銅層封板優先**：變更 OCR 參數後須 **Bronze `overwrite`**；僅重跑 Silver **不會**更新 `extracted_text`。
+- **設定傳遞**：`run_bronze_ocr_ingest` 在 driver 組裝 `build_ocr_runtime_config()` 並 **broadcast** 至 UDF；`spark_service` 另設 `spark.executorEnv.OCR_*`。
+- **PSM 定案（drinks）**：經 `/test/ocr-psm` 對 20 張樣本 AB，採 **`OCR_PSM=6`**（優於 11／4／13）。
+- **前處理 preset**（`OCR_PRESET_ROUTER_ENABLED`，預設 **`false`**）：`dark_ui`（深色 UI 截圖）／`low_res`／`light_doc`；關閉時一律 `dark_ui`。
+
+| 變數 | 預設（drinks） | 說明 |
+|------|----------------|------|
+| `OCR_LANG` | `chi_tra+eng` | Tesseract 語言包 |
+| `OCR_PSM` | **`6`** | 單一文字區塊；外送評論截圖 AB 定案 |
+| `OCR_SCALE_MIN_SIDE` | **`0`** | 短邊低於此值時等比放大；**深色 UI 建議 0**（強制放大易糊字） |
+| `OCR_CONTRAST` | **`1.5`** | 灰階後對比度 |
+| `OCR_SHARPNESS` | `1.0` | 銳利度 |
+| `OCR_BINARIZE` | `off` | `off` \| `otsu` \| `adaptive`；`light_doc` profile 才會用 otsu |
+| `OCR_PREPROCESS_VERSION` | **`v1.1`** | bump 後請 Bronze 重跑；寫入 `ocr_signature` |
+| `OCR_PRESET_ROUTER_ENABLED` | `false` | `true` 時依短邊／亮度選 profile（開啟前請子集 AB） |
+| `OCR_LOW_RES_SHORT_SIDE` | `720` | router 開啟時：短邊低於此 → `low_res` |
+| `OCR_LOW_RES_TARGET_SIDE` | `1080` | `low_res` 放大目標短邊 |
+| `OCR_LIGHT_DOC_MEAN_LUMA` | `180` | router 開啟時：平均亮度高於此 → `light_doc` |
+| `OCR_USER_WORDS_PATH` / `OCR_USER_WORDS_DATASET_PATTERN` | （空） | Tesseract user-words（repo `dic/ocr_user_words/` 或 MinIO） |
 | `TESSERACT_CMD` | （空） | Windows 本機可指向 `tesseract.exe` |
-| `OCR_PREPROCESS_VERSION` | `v1` | 前處理版本；調參後請 bump（目前建議 **`v3`**） |
-| `OCR_SIGNATURE` | （空） | 自訂簽章；未設時由 lang / psm / pre / bin 等自動組成 |
+| `OCR_SIGNATURE` | （空） | 自訂簽章；未設時自動組成（含 `profile=`） |
 
-**調校順序建議**（由低成本到高成本）：
+**調校順序建議**
 
-1. **前處理**：`OCR_SCALE_MIN_SIDE` + `OCR_CONTRAST`
-2. **二值化**：`OCR_BINARIZE=otsu`（彩色背景截圖）
-3. **領域 OCR 詞**：repo 內 `dic/ocr_user_words/drinks.txt` 或上傳 MinIO（見 **領域辭典**）
-4. **PSM / 語言**：`OCR_PSM=6` 與 `11` 對照
-5. **重跑 Bronze** → Silver → Gold
-6. 仍不足再評估 **PaddleOCR**
+1. **PSM A/B 頁** `/test/ocr-psm` 抽樣對照（結果存 `test/ocr_psm_ab/`）
+2. **前處理**：維持 `dark_ui`（`scale=0`、`contrast=1.5`）→ **Bronze overwrite 封板**
+3. **領域 OCR 詞**：`dic/ocr_user_words/drinks.txt`
+4. **銀層物理清洗**（規劃中）：CJK 去空格、OCR 洋文垃圾（bump `SILVER_TRANSFORM_VERSION`）
+5. 仍不足再評估開啟 **preset router** 或 **PaddleOCR**
 
-`.env` 範例（評論截圖起點）：
+`.env` 範例（**drinks 深色截圖，目前定案**）：
 
 ```env
-OCR_LANG=chi_tra
-OCR_PSM=11
-OCR_SCALE_MIN_SIDE=1600
-OCR_CONTRAST=1.8
-OCR_SHARPNESS=1.2
-OCR_BINARIZE=otsu
-OCR_PREPROCESS_VERSION=v3
+OCR_LANG=chi_tra+eng
+OCR_PSM=6
+OCR_SCALE_MIN_SIDE=0
+OCR_CONTRAST=1.5
+OCR_SHARPNESS=1.0
+OCR_BINARIZE=off
+OCR_PREPROCESS_VERSION=v1.1
+OCR_PRESET_ROUTER_ENABLED=false
 ```
 
-**變更 OCR 設定後**，需讓銅層重新辨識影像：
+**變更 OCR 設定後**
 
-1. **重建 Docker**（若用容器）：`docker compose up --build -d`（映像需含 `opencv-python-headless`）
-2. 至 **`/pipeline/bronze`** 執行 Bronze OCR；`write_mode` 建議 **`overwrite`**，或 **`append`**（僅處理 `ocr_signature` 變更後尚未處理的圖）
-3. 再執行 **Silver ETL** → **Gold ETL**
+1. `docker compose up --build -d`（映像含 Tesseract、`opencv-python-headless`）
+2. **`/pipeline/bronze`** → Bronze OCR，`write_mode` 建議 **`overwrite`**
+3. **Silver ETL** → **Gold ETL**
 
-本機可先對單張圖試 PSM（需已安裝 Tesseract）：
+本機單張試 PSM（需已安裝 Tesseract）：
 
 ```powershell
-tesseract 你的截圖.png stdout -l chi_tra --psm 11
-tesseract 你的截圖.png stdout -l chi_tra --psm 6
+tesseract 你的截圖.png stdout -l chi_tra+eng --psm 6
+tesseract 你的截圖.png stdout -l chi_tra+eng --psm 11
 ```
+
+或使用網頁 **`/test/ocr-psm`** 對固定 20 張樣本並排比對。
 
 ### 領域辭典（drinks 範例）
 
@@ -148,9 +160,11 @@ tesseract 你的截圖.png stdout -l chi_tra --psm 6
 
 | 改了什麼 | 重跑 |
 |----------|------|
+| OCR 參數、PSM、前處理 profile | **Bronze overwrite** → Silver → Gold |
 | 二值化、OCR user-words | Bronze → Silver → Gold |
 | Jieba 詞典 | Silver → Gold |
 | 停用詞（lexicon 版本） | **Gold**（Silver 不重跑） |
+| 銀層清洗規則（`SILVER_TRANSFORM_VERSION`） | **Silver** → Gold |
 | 痛點規則／模糊匹配 | Gold（或 `topic-snapshot/rebuild`） |
 
 ### 痛點主題與模糊匹配（Gold）
@@ -209,6 +223,7 @@ python .\app.py
 | `/pipeline/bronze` | 上傳、Bronze OCR、`write_mode`、Bronze 預覽 |
 | `/pipeline/silver` | Silver ETL、分詞／停用詞狀態、銀層預覽 |
 | `/pipeline/gold` | Gold ETL、一鍵管線、金層預覽 |
+| `/test/ocr-psm` | PSM A/B 測試（固定樣本、並排對照、結果存 test 路徑） |
 | `/layers` | 三層表格除錯（進階） |
 | `/upload` | 相容舊連結，302 導向 `/pipeline/bronze` |
 
