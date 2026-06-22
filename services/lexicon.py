@@ -14,7 +14,11 @@ from typing import Any, Dict, Iterable, List, Sequence, Set
 from pyspark.sql import SparkSession
 
 from config import STOPWORDS_DATASET_PATTERN, STOPWORDS_LEXICON_VERSION, STOPWORDS_PATH
-from services.domain_lexicons import get_builtin_domain_stopwords, merge_stopword_lists
+from services.domain_lexicons import (
+    get_builtin_domain_stopwords,
+    get_builtin_tfidf_exploration_stopwords,
+    merge_stopword_lists,
+)
 from services.pain_topic_rules import PAIN_TOPIC_POLARITY_RULES, PAIN_TOPIC_RULES
 
 _logger = logging.getLogger(__name__)
@@ -160,6 +164,26 @@ def build_effective_stopwords(
     return out
 
 
+def build_tfidf_exploration_stopwords(
+    merged_stop: Iterable[str],
+    dataset_id: str | None = None,
+) -> List[str]:
+    """
+    TF-IDF Phase A 探索用停用詞：完整 domain stop + 虛詞／場景詞。
+    不扣痛點保護詞（與漏斗 analytics_tokens 的 effective_stop 分離）。
+    """
+    extra = get_builtin_tfidf_exploration_stopwords(dataset_id)
+    return merge_stopword_lists(merged_stop, extra)
+
+
+def filter_tokens_for_tfidf_exploration(
+    tokens: Sequence[str] | None,
+    tfidf_stopwords: Set[str] | frozenset[str],
+) -> List[str]:
+    """TF-IDF 探索：移除完整停用詞表中的詞（語意同 filter_tokens_for_analytics）。"""
+    return filter_tokens_for_analytics(tokens, tfidf_stopwords)
+
+
 def filter_tokens_for_analytics(
     tokens: Sequence[str] | None,
     effective_stopwords: Set[str] | frozenset[str],
@@ -194,6 +218,7 @@ def collect_gold_lexicon(
     merged_stop = merge_stopword_lists(from_file, builtin)
     protected = expand_pain_protected_terms()
     effective = build_effective_stopwords(merged_stop, protected)
+    tfidf_stop = build_tfidf_exploration_stopwords(merged_stop, ds)
     return {
         "dataset_id": ds,
         "lexicon_version": version,
@@ -204,5 +229,7 @@ def collect_gold_lexicon(
         "protected_terms_count": len(protected),
         "effective_stopwords_count": len(effective),
         "effective_stopwords": effective,
+        "tfidf_exploration_stopwords_count": len(tfidf_stop),
+        "tfidf_exploration_stopwords": tfidf_stop,
         "protected_terms": sorted(protected),
     }

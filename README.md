@@ -1,407 +1,115 @@
-## car_rental_flask_spark_delta
+# 外送平台客訴截圖 · 商業痛點分析資料湖
 
-Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫資料、維護 Delta table，並提供網頁（Dashboard、上傳等）與 REST API。
+OCR 結構化 **外送平台（Uber Eats、foodpanda 等）消費者客訴截圖** → **Medallion（Bronze → Silver → Gold）** → **痛點主題** 與 **規則種子探索**。技術：**Flask · PySpark · Delta Lake · MinIO · Tesseract**。
 
-### 專案結構（重點）
+示範領域：**手搖飲／飲料店**（`dataset_id=drinks`，50 張 App 深色 UI 截圖）。管線以 `dataset_id` 設計，可擴充其他品類。
 
-| 路徑 | 說明 |
-|------|------|
-| `app.py` | Flask 入口：路由、管理員 token、Delta 白名單、背景任務等 |
-| `config.py` | 由環境變數讀取 MinIO/S3A、各層 Delta 路徑、OCR、上傳策略 |
-| `services/spark_service.py` | SparkSession、Delta 讀寫、Silver/Gold ETL、系統狀態等 |
-| `services/minio_upload.py` | MinIO SDK 上傳、`dataset_id` 目錄、同名物件策略 |
-| `services/ocr_spark.py` | Bronze OCR：binaryFile → **preset 前處理** → Tesseract（**broadcast 設定**至 executor）→ Delta |
-| `services/ocr_psm_ab.py` | PSM A/B 測試（固定樣本、結果寫入 `test/ocr_psm_ab/`，不污染 Bronze） |
-| `services/domain_lexicons.py` | 依 `dataset_id` 內建停用詞、Jieba 詞、OCR user-words |
-| `services/pain_funnel.py` | 痛點漏斗：撈網 → 過濾 → 情緒（`pain_candidates` / `sentiment`） |
-| `services/pain_topic_rules.py` | 痛點主題詞庫與極性規則（供漏斗使用） |
-| `services/text_similarity.py` | 痛點規則用的字串相似度（rapidfuzz / difflib fallback） |
-| `services/async_jobs.py` | 記憶體內背景任務（長時間 Spark 工作先回 job_id） |
-| `dic/` | 領域辭典：`stop_words/`、`jieba_dicts/`、`ocr_user_words/`（可上傳 MinIO 擴充） |
-| `docs/OCR-決策紀錄.md` | 對外可讀的 OCR／管線**決策摘要**（PSM、前處理、分層職責） |
-| `templates/` | `index.html`（Dashboard）、`pipeline_bronze|silver|gold.html`（管線分頁）、`test_ocr_psm.html`（PSM A/B）、`layers.html`（除錯預覽） |
-| `tests/` | `pytest`：API 驗證、MinIO 檔名邏輯（可不透過真 Spark/MinIO） |
-| `.github/workflows/ci.yml` | Push／PR 至 `main`/`master` 時自動執行 `pytest`（GitHub Actions） |
-
-### 資料管線（摘要）
-
-- **Bronze**：`raw/images/{dataset_id}/` 影像 → **前處理 profile**（預設 `dark_ui`：`scale=0`、對比、可選二值化）→ **Tesseract**（**`OCR_PSM=6`**，user-words）→ Delta。Driver 以 **`build_ocr_runtime_config()` + broadcast** 將 OCR 參數傳至 Spark executor（避免 worker 讀不到 `.env`）。`ocr_signature` 含 `psm` / `pre` / **`profile`**。可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**`docs/OCR-決策紀錄.md`**。
-- **Silver**：OCR 原文保留於 **`extracted_text`**（稽核用）；**`cleaned_text`** 物理清洗（去標點、剝純數字雜訊；**CJK 去空格／emoji 清洗規劃中**）；**Jieba + 內建虛詞** 產出冪等 `tokens`（`SILVER_TRANSFORM_VERSION`）。ETL 後執行**三道品質防線**。**不**套用領域停用詞。
-- **Gold**：讀銀層 `tokens` → 套用版本化 lexicon（`effective_stop = stop − 痛點保護詞`）→ 痛點漏斗、TF-IDF、PMI。規則 **`v1.4-drinks-funnel`**；辭典 **`STOPWORDS_LEXICON_VERSION`**。
-- **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
-- **一鍵**：`POST /delta/pipeline/to-gold/run`（Bronze→Silver→Gold）；可設定 `skip_gold_if_no_new_ocr`（無新 OCR 時略過後段）。**金層頁** `/pipeline/gold` 有同名勾選（預設開啟）；**銅層頁**上傳表單亦有一鍵選項。
-
-### 功能（API 摘要）
-
-- **健康檢查（輕量，存活探針）**：`GET /health`
-- **就緒／依賴檢查（JSON，MinIO；可選 Spark）**：`GET /ready`（可選查詢 `spark=true`；或環境變數 `READY_CHECK_INCLUDE_SPARK`；失敗時 HTTP 503）
-- **系統狀態**：`GET /api/status`
-- **Delta 預覽**：`POST /delta/read`（路徑須符合 `ALLOWED_DELTA_PATH_PREFIXES`）
-- **Delta Upsert**：`POST /delta/upsert`（需 `ADMIN_TOKEN` 時帶 `X-Admin-Token`）
-- **僅保留最新批次**：`POST /delta/cleanup-latest-only`（同上）
-- **Silver OCR 預覽**：`GET /api/silver`、`GET /api/silver/ocr`
-- **TF-IDF 痛點候選（Phase A）**：`GET /api/gold/tfidf-keywords`
-- **PMI 片語候選（Phase B）**：`GET /api/gold/phrase-candidates`
-- **金層 ETL**（Silver→Gold）：`POST /delta/gold/run`（body 或 **Query** 可補 `dataset_id`、`dry_run` 等）
-- **痛點快照僅重建**：`POST /delta/gold/topic-snapshot/rebuild`（`dataset_id` 必填）
-- **痛點快照刪除**（依 `dataset_id` + `snapshot_at` 刪列，Delta DELETE）：`POST /delta/gold/topic-snapshot/delete`（可先 `dry_run: true`；`snapshot_at` 用首頁對照或列表之 ISO 字串）
-- **一鍵至金層**：`POST /delta/pipeline/to-gold/run`（body 可帶 `skip_gold_if_no_new_ocr`；見金層管線頁說明）
-- **Bronze OCR 攝入**：`POST /delta/ocr/bronze/run`
-- **OCR PSM A/B 測試**（不寫 Bronze）：`GET /test/ocr-psm`、`POST /api/test/ocr-psm/run`
-- **Silver OCR ETL**：`POST /delta/silver/ocr/run`
-- **圖片上傳至 MinIO**：`POST /api/upload/images`（`multipart/form-data`，`dataset_id` 必填；可選 `run_ocr`；`MAX_UPLOAD_MB` 限制大小）
-- **查詢 dataset_id**：`GET /api/datasets`（需 `ADMIN_TOKEN` 時）
-- **背景任務**：`GET /api/jobs/<job_id>`（建立非同步 pipeline 時）
-- **Storage 健康檢查**：`GET /api/health/storage`、`GET /api/debug/storage-check`（需 token 時）
-
-（完整行為以 `app.py` 為準。）
-
-**小提示**：部分 `POST` API 的 JSON 若因 `Content-Type` 未帶好而為空，可改用 **URL 查詢字串**補上 `dataset_id` 等欄位（與 body 合併），例如  
-`POST /delta/gold/run?dataset_id=drinks&dry_run=false`。
-
-### 首頁 /layers 與 Gold 顯示規則（重要）
-
-- 首頁 **TF-IDF**與 **`/layers`** 的 Gold 預覽以 **落盤 TF-IDF Delta** 為來源（輔助探索）。
-- **痛點主題**圖表以 **`GOLD_TOPIC_SNAPSHOT_PATH`** 快照為**主要商業輸出**（規則 + 模糊匹配）；請以金層 ETL 或 `topic-snapshot/rebuild` 寫入，並確認帶正確 `dataset_id`。
-- 帶 `dataset_id` 時會以表內 `dataset_id` 欄位過濾。
-- `/layers` 可切換時間排序；並可檢視 **辭典／停用詞套用狀態**（目前篩選之 `dataset_id`）。
-- 一鍵 ETL 完成後會回傳白話說明與指標（含 `gold_recompute_mode` 等）。
-
-### 需求
-
-- **Python**：本機開發建議 **3.12**（與 `Dockerfile` 一致）；`requirements.txt` 為 PySpark 3.5 / Delta 3.0 系）
-- **Java**：Spark 需要 JVM（容器內為 **JDK 17**）
-- **MinIO 或 S3 相容儲存**：本機、遠端或容器內皆可，由 `MINIO_ENDPOINT` 等設定
-- **OCR**：需 [Tesseract](https://github.com/tesseract-ocr/tesseract) 與語言包（繁中、英文）。Windows 可設定 `TESSERACT_CMD`；**Docker 映像已含 Tesseract**。Bronze 前處理另需 **`opencv-python-headless`**（二值化）；Gold 模糊痛點需 **`rapidfuzz`**（見 `requirements.txt`）。
-
-### OCR 調校（Bronze / Tesseract）
-
-銅層 OCR 由 `services/ocr_spark.py` 執行：讀取 MinIO 影像 → **前處理 profile** → **Tesseract**（user-words）→ 寫入 Bronze Delta。完整決策與 AB 結論見 **`docs/OCR-決策紀錄.md`**。
-
-**設計要點**
-
-- **銅層封板優先**：變更 OCR 參數後須 **Bronze `overwrite`**；僅重跑 Silver **不會**更新 `extracted_text`。
-- **設定傳遞**：`run_bronze_ocr_ingest` 在 driver 組裝 `build_ocr_runtime_config()` 並 **broadcast** 至 UDF；`spark_service` 另設 `spark.executorEnv.OCR_*`。
-- **PSM 定案（drinks）**：經 `/test/ocr-psm` 對 20 張樣本 AB，採 **`OCR_PSM=6`**（優於 11／4／13）。
-- **前處理 preset**（`OCR_PRESET_ROUTER_ENABLED`，預設 **`false`**）：`dark_ui`（深色 UI 截圖）／`low_res`／`light_doc`；關閉時一律 `dark_ui`。
-
-| 變數 | 預設（drinks） | 說明 |
-|------|----------------|------|
-| `OCR_LANG` | `chi_tra+eng` | Tesseract 語言包 |
-| `OCR_PSM` | **`6`** | 單一文字區塊；外送評論截圖 AB 定案 |
-| `OCR_SCALE_MIN_SIDE` | **`0`** | 短邊低於此值時等比放大；**深色 UI 建議 0**（強制放大易糊字） |
-| `OCR_CONTRAST` | **`1.5`** | 灰階後對比度 |
-| `OCR_SHARPNESS` | `1.0` | 銳利度 |
-| `OCR_BINARIZE` | `off` | `off` \| `otsu` \| `adaptive`；`light_doc` profile 才會用 otsu |
-| `OCR_PREPROCESS_VERSION` | **`v1.1`** | bump 後請 Bronze 重跑；寫入 `ocr_signature` |
-| `OCR_PRESET_ROUTER_ENABLED` | `false` | `true` 時依短邊／亮度選 profile（開啟前請子集 AB） |
-| `OCR_LOW_RES_SHORT_SIDE` | `720` | router 開啟時：短邊低於此 → `low_res` |
-| `OCR_LOW_RES_TARGET_SIDE` | `1080` | `low_res` 放大目標短邊 |
-| `OCR_LIGHT_DOC_MEAN_LUMA` | `180` | router 開啟時：平均亮度高於此 → `light_doc` |
-| `OCR_USER_WORDS_PATH` / `OCR_USER_WORDS_DATASET_PATTERN` | （空） | Tesseract user-words（repo `dic/ocr_user_words/` 或 MinIO） |
-| `TESSERACT_CMD` | （空） | Windows 本機可指向 `tesseract.exe` |
-| `OCR_SIGNATURE` | （空） | 自訂簽章；未設時自動組成（含 `profile=`） |
-
-**調校順序建議**
-
-1. **PSM A/B 頁** `/test/ocr-psm` 抽樣對照（結果存 `test/ocr_psm_ab/`）
-2. **前處理**：維持 `dark_ui`（`scale=0`、`contrast=1.5`）→ **Bronze overwrite 封板**
-3. **領域 OCR 詞**：`dic/ocr_user_words/drinks.txt`
-4. **銀層物理清洗**（規劃中）：CJK 去空格、OCR 洋文垃圾（bump `SILVER_TRANSFORM_VERSION`）
-5. 仍不足再評估開啟 **preset router** 或 **PaddleOCR**
-
-`.env` 範例（**drinks 深色截圖，目前定案**）：
-
-```env
-OCR_LANG=chi_tra+eng
-OCR_PSM=6
-OCR_SCALE_MIN_SIDE=0
-OCR_CONTRAST=1.5
-OCR_SHARPNESS=1.0
-OCR_BINARIZE=off
-OCR_PREPROCESS_VERSION=v1.1
-OCR_PRESET_ROUTER_ENABLED=false
-```
-
-**變更 OCR 設定後**
-
-1. `docker compose up --build -d`（映像含 Tesseract、`opencv-python-headless`）
-2. **`/pipeline/bronze`** → Bronze OCR，`write_mode` 建議 **`overwrite`**
-3. **Silver ETL** → **Gold ETL**
-
-本機單張試 PSM（需已安裝 Tesseract）：
-
-```powershell
-tesseract 你的截圖.png stdout -l chi_tra+eng --psm 6
-tesseract 你的截圖.png stdout -l chi_tra+eng --psm 11
-```
-
-或使用網頁 **`/test/ocr-psm`** 對固定 20 張樣本並排比對。
-
-### 領域辭典（drinks 範例）
-
-三種辭典分工不同，請勿混用：
-
-| 類型 | 路徑（repo / MinIO） | 作用層 | 目的 |
-|------|----------------------|--------|------|
-| **停用詞** | `dic/stop_words/{version}/{dataset_id}.txt` | **Gold** | 擋中性詞；變更後只重跑 Gold |
-| **Jieba 詞典** | `dic/jieba_dicts/{dataset_id}.txt` | Silver | 避免「服務態度」「50嵐」被切開 |
-| **OCR user-words** | `dic/ocr_user_words/{dataset_id}.txt` | Bronze | 提升 Tesseract 品牌／規格辨識 |
-
-- **內建詞**：`services/domain_lexicons.py` 在 MinIO 無檔時仍會於 **Gold** 合併 `drinks` 停用詞；Jieba 會 **fallback** 至 repo 內 `dic/jieba_dicts/drinks.txt`。
-- **環境變數**（見 `.env.example`）：
-  - `STOPWORDS_DATASET_PATTERN=s3a://data-lake/dic/stop_words/{dataset_id}.txt`
-  - `JIEBA_USERDICT_DATASET_PATTERN=s3a://data-lake/dic/jieba_dicts/{dataset_id}.txt`
-  - `OCR_USER_WORDS_DATASET_PATTERN=s3a://data-lake/dic/ocr_user_words/{dataset_id}.txt`
-
-**維護節奏**：TF-IDF Top 雜詞 → 加**停用詞**；分詞切壞 → 加 **Jieba 詞**；整詞 OCR 認錯 → 加 **OCR user-words**。
-
-**重跑對照**：
-
-| 改了什麼 | 重跑 |
-|----------|------|
-| OCR 參數、PSM、前處理 profile | **Bronze overwrite** → Silver → Gold |
-| 二值化、OCR user-words | Bronze → Silver → Gold |
-| Jieba 詞典 | Silver → Gold |
-| 停用詞（lexicon 版本） | **Gold**（Silver 不重跑） |
-| 銀層清洗規則（`SILVER_TRANSFORM_VERSION`） | **Silver** → Gold |
-| 痛點規則／模糊匹配 | Gold（或 `topic-snapshot/rebuild`） |
-
-### 痛點主題與模糊匹配（Gold）
-
-- **主輸出**：首頁 **痛點主題快照**（`GOLD_TOPIC_SNAPSHOT_PATH`），由痛點**漏斗**對銀層 `tokens` 打標。
-- **漏斗**（`services/pain_funnel.py`）：
-  1. **第一層撈網**：關鍵字 + 模糊匹配，產出 `pain_candidates`（高 recall）
-  2. **第二層過濾**：片語／極性規則；**負面證據優先**；僅正向（如很好、不錯）且無負面 → 剔除痛點
-  3. **情緒**：`positive` \| `neutral` \| `negative`（有痛點主題或負面證據 → negative）
-- **規則版本**：`services/pain_topic_rules.py`（`TOPIC_RULE_VERSION=v1.4-drinks-funnel`）
-- **模糊匹配**：`services/text_similarity.py`（`PAIN_FUZZY_*`）
-
-| 變數 | 預設 | 說明 |
-|------|------|------|
-| `PAIN_FUZZY_ENABLED` | `true` | 是否啟用模糊匹配 |
-| `PAIN_FUZZY_MIN_RATIO` | `0.78` | 片語規則相似度門檻 |
-| `PAIN_FUZZY_ANCHOR_RATIO` | `0.88` | 極性規則 anchor 門檻（較嚴） |
-| `PAIN_FUZZY_MIN_CHARS` | `3` | 少於此字數不做模糊（防誤殺） |
-
-- **TF-IDF / PMI**：Phase A／B 候選詞供探索與加詞參考，**不等同**最終痛點結論。
-
-### 快速開始（Windows / PowerShell）
-
-1) 建立虛擬環境並安裝依賴：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-2) 設定環境變數（建議複製 `.env.example` 為 `.env` 再修改）：
-
-- **至少**：`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`
-- **MinIO 位址**：見 `.env.example`；`MINIO_ENDPOINT` 可為 `host:port`（Spark S3A 相容）或 `http://host:port`
-
-```powershell
-$env:MINIO_ACCESS_KEY="your_access_key"
-$env:MINIO_SECRET_KEY="your_secret_key"
-$env:MINIO_ENDPOINT="127.0.0.1:9000"
-$env:BUCKET_NAME="data-lake"
-```
-
-3) 啟動 Flask：
-
-```powershell
-python .\app.py
-```
-
-預設：`http://127.0.0.1:5000`  
-首頁 Dashboard：`http://127.0.0.1:5000/`（選定 `dataset_id` 後可使用 **刪除痛點快照** 區塊，呼叫 `POST /delta/gold/topic-snapshot/delete`）  
-**資料管線（分頁）**：
-
-| URL | 用途 |
-|-----|------|
-| `/pipeline/bronze` | 上傳、Bronze OCR、`write_mode`、Bronze 預覽 |
-| `/pipeline/silver` | Silver ETL、分詞／停用詞狀態、銀層預覽 |
-| `/pipeline/gold` | Gold ETL、一鍵管線、金層預覽 |
-| `/test/ocr-psm` | PSM A/B 測試（固定樣本、並排對照、結果存 test 路徑） |
-| `/layers` | 三層表格除錯（進階） |
-| `/upload` | 相容舊連結，302 導向 `/pipeline/bronze` |
-
-頂部導覽列可帶 `?dataset_id=` 跨頁共用同一分類。
-
-**金層頁（一鍵管線）**：可勾選 **「無新 OCR 時跳過銀層／金層」**（預設**開啟**）。**關閉**後，即使本次 Bronze 沒有新增筆數，仍會重跑 Silver／金層，適合升級 **`SILVER_TRANSFORM_VERSION`** 或更新 **Jieba 詞典**（Silver）或 **停用詞 lexicon／痛點規則**（Gold）後要重算。行為等同 API 的 `skip_gold_if_no_new_ocr`。`write_mode`（append／overwrite）**僅在銅層頁**設定。
+> 本 repo 目錄名 `flask_spark_delta_docker` 為歷史命名；Docker 容器名等亦可能沿用舊專案代號，不影響管線行為。
 
 ---
 
-### Docker：檔案該用哪一個？
+## 架構（摘要）
 
-本專案有 **多份 Compose**，用途不同；**沒有**「一個檔適用所有情境」。
+```mermaid
+flowchart TB
+  subgraph bronze [Bronze]
+    IMG[MinIO 原始截圖] --> OCR[Tesseract · PSM 6 · dark_ui]
+    OCR --> EXT[extracted_text + ocr_signature]
+  end
+  subgraph silver [Silver]
+    EXT --> CLEAN[cleaned_text · tokens v2.1.0]
+  end
+  subgraph gold [Gold]
+    CLEAN --> FUNNEL[痛點漏斗 → 主題快照]
+    CLEAN --> TFIDF[TF-IDF 探索 · PMI 片語]
+  end
+```
 
-| Compose 檔 | 內容 | 適合情境 |
-|--------------|------|----------|
-| **`docker-compose.yml`** | 僅 **`web`** 服務（預設 **`Dockerfile`** 建置），**不**包含 MinIO | MinIO 在**別台／區網／宿主機**；連線與路徑皆由 **`.env`（環境變數）** 設定，compose 內僅保留預設值 |
-| **`docker-compose(new_minio).yml`** | **MinIO + minio-init + web**（**`Dockerfile`** slim 映像） | 本機想 **一鍵起 MinIO + 應用**（開發／示範） |
-| **`docker-compose - ubuntu.yml`** | **MinIO + minio-init + app**（**`Dockerfile - ubuntu`**，內含 Spark 二進位等） | 需與 **Ubuntu/VM 式** 環境接近、或掛載本機目錄除錯 |
+| 層級 | 做什麼 | 面試可強調 |
+|------|--------|------------|
+| **Bronze** | OCR 原文落盤，簽章版控 | PSM A/B 定案、broadcast 設定至 Spark executor |
+| **Silver** | 清洗 + Jieba 分詞，三道品質閘門 | 銀層不套用領域停用詞（留給 Gold） |
+| **Gold** | 規則式痛點分類 + 資料驅動探索 | 漏斗（撈網→過濾）與 TF-IDF **token 分流** |
 
-**映像建置對照**
+**輸出怎麼看：** 首頁 **痛點主題快照** = 客訴結論；**TF-IDF** = 規則種子探索（非最終痛點）。
 
-| Dockerfile | 說明 |
-|------------|------|
-| **`Dockerfile`** | `python:3.12-slim` + JDK 17 + Tesseract；`pip install -r requirements-lock.txt`；含 **`dic/`** 領域辭典 |
-| **`Dockerfile - ubuntu`** | `ubuntu:24.04` + JDK + 下載 **Spark 3.5.0** 至 `/opt/spark` + `pip install -r requirements.txt`；映像較大、建置較久 |
+---
 
-需安裝 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（含 Compose V2）。
+## 技術棧
 
-#### 情境 A：預設檔（只起 Web，連外部 MinIO）
+Flask · PySpark 3.5 · Delta Lake 3.0 · MinIO（S3A）· Tesseract · Jieba · Docker
+
+---
+
+## 快速開始
+
+1. 複製環境設定：`cp .env.example .env`（填入 MinIO 金鑰與位址）
+2. 啟動（連外部 MinIO 時請改 `.env` 內 `MINIO_ENDPOINT`）：
 
 ```powershell
 docker compose up --build
 ```
 
-- 會讀取專案根目錄的 **`docker-compose.yml`**，**不會**啟動 MinIO。
-- **`MINIO_ENDPOINT`、`MINIO_ENDPOINT_CLIENT`、Delta 路徑、`WEB_PORT` 等**請在 **`.env`** 設定（複製 `.env.example`）；未設定時使用 compose 內建預設值（例如 `MINIO_ENDPOINT` 預設 `http://127.0.0.1:9000`，連外部 MinIO 時務必改成可連線的位址）。
-- 需有 **`.env`**（若無，請由 `.env.example` 複製），因 compose 使用 `env_file`。
+3. 開啟 **http://127.0.0.1:5000**，`dataset_id` 選 **drinks**
 
-#### 情境 B：本機一鍵 MinIO + Web（slim 映像）
+本機含 MinIO 一鍵示範：
 
 ```powershell
 docker compose -f "docker-compose(new_minio).yml" up --build
 ```
 
-- **Web**：`http://127.0.0.1:5000`（或 `WEB_PORT`）
-- **MinIO API**：`http://127.0.0.1:9000`
-- **MinIO Console**：`http://127.0.0.1:9001`（預設帳密見 compose / `.env`）
-- `minio-init` 會建立預設 bucket（`BUCKET_NAME`，預設 `data-lake`）。
-
-#### 情境 C：MinIO + Ubuntu/Spark 映像
-
-```powershell
-docker compose -f "docker-compose - ubuntu.yml" up --build
-```
-
-- 使用 **`Dockerfile - ubuntu`**；並掛載 `.:/app` 與 `./spark-warehouse`（本機改碼可反映進容器，依需求使用）。
-
-#### 僅建置／執行單一 Web 映像（自行連外部 MinIO）
-
-```powershell
-docker build -t car-rental-web .
-docker run --rm -p 5000:5000 `
-  -e MINIO_ENDPOINT=http://host.docker.internal:9000 `
-  -e MINIO_ACCESS_KEY=... `
-  -e MINIO_SECRET_KEY=... `
-  car-rental-web
-```
-
-（Linux 上將 `host.docker.internal` 改為宿主 IP 或 `--add-host=host.docker.internal:host-gateway`。）
+管線頁：`/pipeline/bronze` → `/pipeline/silver` → `/pipeline/gold`
 
 ---
 
-### 安全與治理（建議）
+## 主要 API（精選）
 
-- **`ADMIN_TOKEN`**：設定後，多數 **寫入／ETL／上傳／除錯** API 需帶 header `X-Admin-Token`；**未設定**時這些檢查不會生效（僅適合本機開發）。
-- **仍可能為公開的讀取**：例如 `GET /health`、`GET /api/gold/tfidf-keywords`、`POST /delta/read` 等（詳見 `app.py`）；若對外服務請評估是否再加網路隔離或反向代理。
-- **路徑白名單**：`ALLOWED_DELTA_PATH_PREFIXES`（逗號分隔）；未設定時預設僅 `s3a://<BUCKET_NAME>/`
-- **上傳**：`MAX_UPLOAD_MB`（預設 15）；Docker 埠是否只綁 `127.0.0.1` 請依部署決定。
+| 用途 | 方法 |
+|------|------|
+| 健康檢查 | `GET /health` |
+| Bronze OCR | `POST /delta/ocr/bronze/run` |
+| Silver ETL | `POST /delta/silver/ocr/run` |
+| Gold ETL | `POST /delta/gold/run?dataset_id=drinks` |
+| 一鍵至金層 | `POST /delta/pipeline/to-gold/run` |
+| PSM A/B（不寫 Bronze） | `GET /test/ocr-psm` |
 
-### Delta / 痛點快照（建議）
+完整路由見 `app.py`。寫入類 API 可設 `ADMIN_TOKEN`（見 `.env.example`）。
 
-- **寫入後驗證**：環境變數 **`GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE`**（預設 `true`）會在每次寫入 `topic_snapshot` 後以**不忽略缺檔**方式讀表驗證；失敗則 ETL 報錯，避免誤以為成功。表極大或除錯可設 `false`。
-- **勿手動刪除單一 parquet**：若需清空快照，應**整個 prefix（含 `_delta_log`）**處理，或先備份再刪；再執行 `POST /delta/gold/topic-snapshot/rebuild` 依 Silver 補寫。
+---
 
-### API 範例
+## 設計決策（公開摘要）
 
-Delta 預覽：
+OCR 封板參數、PSM A/B 結論、分層職責與變更檢查清單：
 
-```powershell
-$body = @{
-  table_path = "s3a://data-lake/bronze/raw_features/"
-  limit = 20
-} | ConvertTo-Json
+→ **[docs/OCR-決策紀錄.md](docs/OCR-決策紀錄.md)**
 
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/read" -ContentType "application/json" -Body $body
-```
+---
 
-Upsert（若啟用 `ADMIN_TOKEN` 請加 `-Headers @{ "X-Admin-Token"="..." }`）：
+## 專案結構（精選）
 
-```powershell
-$body = @{
-  target_path = "s3a://data-lake/silver/cleaned_features/"
-  key_col = "item_id"
-  records = @(
-    @{ item_id = "A1"; price = 100 }
-    @{ item_id = "A2"; price = 120 }
-  )
-} | ConvertTo-Json
+| 路徑 | 說明 |
+|------|------|
+| `app.py` | Flask 路由與 API |
+| `services/ocr_spark.py` | Bronze OCR 與前處理 |
+| `services/spark_service.py` | Spark / Delta ETL |
+| `services/pain_funnel.py` | 痛點漏斗 |
+| `services/text_tokens.py` | 銀層清洗與分詞 |
+| `dic/` | 領域辭典（停用詞、Jieba、OCR 詞） |
+| `tests/` | `pytest`（含 CI） |
 
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/upsert" -ContentType "application/json" -Body $body
-```
+---
 
-Cleanup（dry-run）：
+## 開發與測試
 
 ```powershell
-$body = @{
-  target_path = "s3a://data-lake/silver/ocr_features/"
-  timestamp_col = "ingestion_timestamp"
-  dry_run = $true
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/cleanup-latest-only" -ContentType "application/json" -Body $body
-```
-
-上傳圖片（可選跑 OCR）：
-
-```powershell
-curl.exe -s -X POST "http://127.0.0.1:5000/api/upload/images" `
-  -H "X-Admin-Token: YOUR_TOKEN" `
-  -F "file=@C:\path\to\photo.png" `
-  -F "dataset_id=invoice_ocr" `
-  -F "run_ocr=true" `
-  -F "write_mode=append"
-```
-
-Bronze OCR（dry-run）：
-
-```powershell
-$body = @{ dry_run = $true; dataset_id = "invoice_ocr" } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/ocr/bronze/run" -ContentType "application/json" -Body $body
-```
-
-金層 ETL（dry-run，建議用 `Invoke-RestMethod` 避免 JSON 引號問題）：
-
-```powershell
-$body = @{ dataset_id = "drinks"; dry_run = $true } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/run" `
-  -ContentType "application/json" -Body $body
-```
-
-痛點快照僅重建（需 Silver 已有資料；若啟用 `ADMIN_TOKEN` 請加 `-Headers`）：
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:5000/delta/gold/topic-snapshot/rebuild?dataset_id=drinks"
-```
-
-### 開發：測試與 CI
-
-本機：
-
-```powershell
-pip install -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
 
-GitHub：推送至 **`main` 或 `master`** 或開 PR 時，會執行 **`.github/workflows/ci.yml`**（Ubuntu、Python 3.11、JDK 17、`pytest tests/`）。不需另起「CI 服務」。
+Push / PR 至 `main` 或 `master` 時執行 GitHub Actions（`.github/workflows/ci.yml`）。
 
-### Requirements 檔案用途
+---
 
-| 檔案 | 用途 |
-|------|------|
-| `requirements.txt` | 主依賴（含 `opencv-python-headless`、`rapidfuzz`） |
-| `requirements-dev.txt` | 開發／測試（如 `pytest`） |
-| `requirements-lock.txt` | 鎖定版本；**`Dockerfile`（slim）建置時使用** |
-| `requirements.lock` | 舊版／備份鎖檔；若與 `requirements-lock.txt` 並存，**以 `requirements-lock.txt` + `Dockerfile` 為準** |
+## 授權
 
-```powershell
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-pip install -r requirements-lock.txt
-```
+個人作品集／學習專案；使用與再散布請自行評估依賴套件授權。

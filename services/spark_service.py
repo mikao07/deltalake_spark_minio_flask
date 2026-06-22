@@ -70,7 +70,7 @@ from config import (
     TESSERACT_CMD,
 )
 from services.domain_lexicons import resolve_local_jieba_userdict_path
-from services.lexicon import collect_gold_lexicon, filter_tokens_for_analytics, parse_stopwords_lines
+from services.lexicon import collect_gold_lexicon, filter_tokens_for_analytics, filter_tokens_for_tfidf_exploration, parse_stopwords_lines
 from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
 from services.silver_quality import evaluate_gold_downstream_quality, run_silver_quality_gate
 from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
@@ -694,6 +694,7 @@ _jieba_userdict_registered: str | None = None
 _topic_rule_version = TOPIC_RULE_VERSION
 _TOPIC_RULE_VERSION = TOPIC_RULE_VERSION
 _gold_filter_tokens_udf_cache: Dict[str, Any] = {}
+_gold_tfidf_filter_tokens_udf_cache: Dict[str, Any] = {}
 
 
 def _make_gold_filter_tokens_udf(effective_stopwords: List[str]):
@@ -701,6 +702,15 @@ def _make_gold_filter_tokens_udf(effective_stopwords: List[str]):
 
     def _filter_tokens(tokens):
         return filter_tokens_for_analytics(tokens, stop_set)
+
+    return udf(_filter_tokens, ArrayType(StringType()))
+
+
+def _make_gold_tfidf_filter_tokens_udf(tfidf_stopwords: List[str]):
+    stop_set = frozenset(tfidf_stopwords)
+
+    def _filter_tokens(tokens):
+        return filter_tokens_for_tfidf_exploration(tokens, stop_set)
 
     return udf(_filter_tokens, ArrayType(StringType()))
 
@@ -715,22 +725,44 @@ def _get_gold_filter_tokens_udf(effective_stopwords: List[str]):
     return created
 
 
+def _get_gold_tfidf_filter_tokens_udf(tfidf_stopwords: List[str]):
+    key = ",".join(sorted(tfidf_stopwords))
+    existing = _gold_tfidf_filter_tokens_udf_cache.get(key)
+    if existing is not None:
+        return existing
+    created = _make_gold_tfidf_filter_tokens_udf(tfidf_stopwords)
+    _gold_tfidf_filter_tokens_udf_cache[key] = created
+    return created
+
+
 def _with_gold_analytics_tokens(
     df_silver: DataFrame,
     spark: SparkSession,
     dataset_id: str | None,
 ) -> tuple[DataFrame, Dict[str, Any]]:
-    """Gold 專用：由銀層 tokens 產出 analytics_tokens（effective_stop 過濾）。"""
+    """Gold：analytics_tokens（漏斗）與 tfidf_exploration_tokens（Phase A）分流過濾。"""
     bundle = collect_gold_lexicon(spark, dataset_id)
     effective = bundle.get("effective_stopwords") or []
+    tfidf_stop = bundle.get("tfidf_exploration_stopwords") or []
     if "tokens" not in df_silver.columns:
         return df_silver, bundle
-    filter_udf = _get_gold_filter_tokens_udf(list(effective))
-    return df_silver.withColumn("analytics_tokens", filter_udf(col("tokens"))), bundle
+    analytics_udf = _get_gold_filter_tokens_udf(list(effective))
+    tfidf_udf = _get_gold_tfidf_filter_tokens_udf(list(tfidf_stop))
+    return (
+        df_silver.withColumn("analytics_tokens", analytics_udf(col("tokens")))
+        .withColumn("tfidf_exploration_tokens", tfidf_udf(col("tokens"))),
+        bundle,
+    )
 
 
 def _silver_token_column(df: DataFrame) -> str:
     return "analytics_tokens" if "analytics_tokens" in df.columns else "tokens"
+
+
+def _tfidf_token_column(df: DataFrame) -> str:
+    if "tfidf_exploration_tokens" in df.columns:
+        return "tfidf_exploration_tokens"
+    return _silver_token_column(df)
 
 
 def _normalize_dataset_id_or_none(dataset_id: str | None) -> str | None:
@@ -942,10 +974,11 @@ def _explode_silver_tokens_to_keywords(
     df_silver_ocr: DataFrame,
     *,
     dataset_id_for_log: str | None = None,
+    token_col: str | None = None,
 ) -> DataFrame:
-    """產出 (image_path, keyword) 列：explode Gold analytics_tokens（或銀層 tokens）。"""
-    token_col = _silver_token_column(df_silver_ocr)
-    if token_col not in df_silver_ocr.columns:
+    """產出 (image_path, keyword) 列：explode 指定 token 欄（預設 TF-IDF 探索欄）。"""
+    col_name = token_col or _tfidf_token_column(df_silver_ocr)
+    if col_name not in df_silver_ocr.columns:
         _logger.warning(
             "gold_keywords_missing_silver_tokens: dataset_id=%s — 請重跑 Silver ETL 以產出 cleaned_text / tokens",
             dataset_id_for_log,
@@ -958,7 +991,7 @@ def _explode_silver_tokens_to_keywords(
         )
 
     return (
-        df_silver_ocr.select("image_path", explode(col(token_col)).alias("keyword"))
+        df_silver_ocr.select("image_path", explode(col(col_name)).alias("keyword"))
         .filter(col("keyword").isNotNull() & (col("keyword") != ""))
     )
 
@@ -1119,6 +1152,7 @@ def run_gold_corpus_analytics_etl(
     df_exploded = _explode_silver_tokens_to_keywords(
         df_silver,
         dataset_id_for_log=ds,
+        token_col=_tfidf_token_column(df_silver),
     )
     df_tfidf = build_gold_tfidf_keywords_dataframe(df_exploded)
     df_phrases = build_gold_phrase_candidates_dataframe(df_silver, min_bigram_count=min_bigram_count)
@@ -1741,6 +1775,7 @@ def run_gold_etl(
         "gold_analytics_tokens_applied": bool(lexicon_bundle),
         "gold_lexicon_version": lexicon_bundle.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
         "gold_effective_stopwords_count": lexicon_bundle.get("effective_stopwords_count") or 0,
+        "gold_tfidf_exploration_stopwords_count": lexicon_bundle.get("tfidf_exploration_stopwords_count") or 0,
         "gold_protected_terms_count": lexicon_bundle.get("protected_terms_count") or 0,
         "topic_output_rows": topic_output_rows,
         "topic_snapshot_rows": topic_snapshot_rows,
