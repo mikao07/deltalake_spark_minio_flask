@@ -31,6 +31,11 @@
       <a class="btn btn-outline-secondary btn-sm" href="{{ pipeline_url('layers_preview_page') }}"
         >資料層除錯</a
       >
+      <a
+        class="btn btn-outline-secondary btn-sm {% if pipeline_step == 'ocr_ab' %}active{% endif %}"
+        href="{{ pipeline_url('test_ocr_psm_page') }}"
+        >OCR PSM 測試</a
+      >
     </div>
     {% if selected_dataset_id %}
       <span class="small text-muted"

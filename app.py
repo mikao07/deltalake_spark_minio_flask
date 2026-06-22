@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask import Flask, jsonify, redirect, render_template, request, url_for, Response
 from werkzeug.exceptions import HTTPException
 
 # 本機用 `python app.py` 啟動時，Python 不會自動載入 `.env`（Docker Compose 才會）。
@@ -25,6 +25,9 @@ from config import (
     GOLD_TFIDF_KEYWORDS_PATH,
     GOLD_PHRASE_CANDIDATES_PATH,
     MINIO_ENDPOINT,
+    OCR_AB_MAX_SAMPLE_SIZE,
+    OCR_AB_RESULTS_PATH,
+    OCR_AB_SAMPLE_SIZE,
     RAW_IMAGE_PREFIX,
     RAW_IMAGES_PATH,
     SILVER_OCR_TABLE_PATH,
@@ -39,7 +42,15 @@ from services.minio_upload import (
 from services.readiness import build_ready_payload, resolve_include_spark
 from services.async_jobs import job_registry, job_to_public_dict
 from services.etl_metrics import append_etl_metric, read_etl_metrics
-from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest
+from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest, normalize_psm
+from services.ocr_psm_ab import (
+    default_keyword_hints,
+    delete_test_results_prefix,
+    load_latest_ab_results,
+    list_sample_image_paths,
+    read_raw_image_bytes,
+    run_ocr_psm_ab,
+)
 from services.silver_quality import SilverQualityError
 from services.spark_service import (
     SparkManager,
@@ -73,6 +84,7 @@ app = Flask(__name__)
 TEMPLATE_INDEX = "index.html"
 TEMPLATE_LAYERS = "layers.html"
 TEMPLATE_PIPELINE_BRONZE = "pipeline_bronze.html"
+TEMPLATE_TEST_OCR_PSM = "test_ocr_psm.html"
 TEMPLATE_PIPELINE_SILVER = "pipeline_silver.html"
 TEMPLATE_PIPELINE_GOLD = "pipeline_gold.html"
 
@@ -653,6 +665,201 @@ def pipeline_gold_page():
         latest_gold_metric=_latest_etl_metric_for("gold_etl", selected),
         **ctx,
     )
+
+
+def _guess_image_mimetype(image_path: str) -> str:
+    p = str(image_path or "").lower()
+    if p.endswith(".png"):
+        return "image/png"
+    if p.endswith(".gif"):
+        return "image/gif"
+    if p.endswith(".webp"):
+        return "image/webp"
+    if p.endswith(".bmp"):
+        return "image/bmp"
+    if p.endswith((".tif", ".tiff")):
+        return "image/tiff"
+    return "image/jpeg"
+
+
+def _validate_raw_image_path(image_path: str):
+    err = _validate_delta_path(image_path)
+    if err:
+        return err
+    norm = str(image_path).replace("\\", "/").lower()
+    raw_prefix = RAW_IMAGES_PATH.replace("\\", "/").lower().rstrip("/") + "/"
+    if not norm.startswith(raw_prefix):
+        return _json_error("image_path 必須位於 RAW_IMAGES_PATH 底下。", 403)
+    return None
+
+
+@app.get("/test/ocr-psm")
+def test_ocr_psm_page():
+    ctx = _parse_pipeline_dataset_context("ocr_ab")
+    selected = ctx.get("selected_dataset_id")
+    latest_result: Dict[str, Any] | None = None
+    sample_paths: List[Dict[str, Any]] = []
+    sample_error: str | None = None
+    if selected:
+        try:
+            latest_result = load_latest_ab_results(selected)
+        except Exception as e:
+            _logger.warning("ocr_ab_latest_load_failed: %s", e)
+        try:
+            raw_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{selected}/"
+            err = _validate_delta_path(raw_path)
+            if err:
+                sample_error = "raw 路徑不在白名單"
+            else:
+                sample_paths = list_sample_image_paths(
+                    _get_spark_manager().spark,
+                    raw_path,
+                    limit=OCR_AB_SAMPLE_SIZE,
+                )
+        except Exception as e:
+            _logger.warning("ocr_ab_sample_list_failed: %s", e)
+            sample_error = str(e)
+
+    return render_template(
+        TEMPLATE_TEST_OCR_PSM,
+        results_path=OCR_AB_RESULTS_PATH,
+        sample_size_default=OCR_AB_SAMPLE_SIZE,
+        sample_size_max=OCR_AB_MAX_SAMPLE_SIZE,
+        default_psm_a="11",
+        default_psm_b="6",
+        psm_options=["3", "4", "6", "7", "11", "13"],
+        default_keywords=default_keyword_hints(),
+        raw_images_hint=f"{RAW_IMAGES_PATH.rstrip('/')}/{{dataset_id}}/",
+        latest_result=latest_result,
+        sample_paths=sample_paths,
+        sample_error=sample_error,
+        **ctx,
+    )
+
+
+@app.post("/api/test/ocr-psm/run")
+def api_test_ocr_psm_run():
+    """固定樣本影像 PSM A/B；結果寫入 test 路徑，不寫 Bronze。"""
+    auth_err = _require_admin_token_if_configured()
+    if auth_err:
+        return auth_err
+    body = _merge_missing_from_query(
+        _parse_request_json_object(),
+        ("dataset_id", "psm_a", "psm_b", "sample_size"),
+    )
+    dataset_raw = str(body.get("dataset_id") or "").strip()
+    if not dataset_raw:
+        return _json_error("dataset_id 必填。", 400)
+    try:
+        dataset_id = normalize_dataset_id(dataset_raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    try:
+        psm_a = normalize_psm(str(body.get("psm_a") or "11"), default="11")
+        psm_b = normalize_psm(str(body.get("psm_b") or "6"), default="6")
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    sample_size = OCR_AB_SAMPLE_SIZE
+    if "sample_size" in body and body.get("sample_size") is not None:
+        try:
+            sample_size = _body_get_int(body, "sample_size", OCR_AB_SAMPLE_SIZE)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+    keywords_raw = body.get("keywords")
+    keywords = None
+    if isinstance(keywords_raw, list):
+        keywords = [str(k).strip() for k in keywords_raw if str(k).strip()]
+    elif isinstance(keywords_raw, str) and keywords_raw.strip():
+        keywords = [ln.strip() for ln in keywords_raw.splitlines() if ln.strip()]
+
+    raw_images_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{dataset_id}/"
+    err = _validate_delta_path(raw_images_path)
+    if err:
+        return err
+    err = _validate_delta_path(OCR_AB_RESULTS_PATH)
+    if err:
+        return err
+
+    try:
+        payload = run_ocr_psm_ab(
+            _get_spark_manager().spark,
+            dataset_id=dataset_id,
+            raw_images_path=raw_images_path,
+            psm_a=psm_a,
+            psm_b=psm_b,
+            sample_size=sample_size,
+            keywords=keywords,
+            save_results=True,
+        )
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    except Exception as e:
+        _logger.exception("ocr_psm_ab_run_failed")
+        return _json_error(f"OCR PSM A/B 失敗：{e}", 500)
+
+    if int(payload.get("sample_size_actual") or 0) <= 0:
+        return _json_error("找不到可 OCR 的樣本影像。", 404, **payload)
+    return jsonify(payload), 200
+
+
+@app.get("/api/test/ocr-psm/latest")
+def api_test_ocr_psm_latest():
+    dataset_raw = request.args.get("dataset_id", "").strip()
+    if not dataset_raw:
+        return _json_error("dataset_id 必填。", 400)
+    try:
+        dataset_id = normalize_dataset_id(dataset_raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    try:
+        payload = load_latest_ab_results(dataset_id)
+    except Exception as e:
+        _logger.exception("ocr_psm_ab_latest_failed")
+        return _json_error(f"讀取失敗：{e}", 500)
+    if not payload:
+        return _json_error("尚無儲存的 A/B 結果。", 404, dataset_id=dataset_id)
+    return jsonify(payload), 200
+
+
+@app.delete("/api/test/ocr-psm/results")
+def api_test_ocr_psm_delete():
+    auth_err = _require_admin_token_if_configured()
+    if auth_err:
+        return auth_err
+    dataset_raw = request.args.get("dataset_id", "").strip()
+    dataset_id = None
+    if dataset_raw:
+        try:
+            dataset_id = normalize_dataset_id(dataset_raw)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+    err = _validate_delta_path(OCR_AB_RESULTS_PATH)
+    if err:
+        return err
+    try:
+        result = delete_test_results_prefix(dataset_id=dataset_id)
+    except Exception as e:
+        _logger.exception("ocr_psm_ab_delete_failed")
+        return _json_error(f"刪除失敗：{e}", 500)
+    return jsonify(result), 200
+
+
+@app.get("/api/test/ocr-psm/image")
+def api_test_ocr_psm_image():
+    image_path = (request.args.get("image_path") or "").strip()
+    if not image_path:
+        return _json_error("image_path 必填。", 400)
+    err = _validate_raw_image_path(image_path)
+    if err:
+        return err
+    try:
+        data = read_raw_image_bytes(image_path)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    except Exception as e:
+        _logger.exception("ocr_psm_ab_image_failed")
+        return _json_error(f"讀取影像失敗：{e}", 500)
+    return Response(data, mimetype=_guess_image_mimetype(image_path))
 
 
 @app.get("/")

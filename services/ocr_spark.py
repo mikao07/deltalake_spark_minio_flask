@@ -25,6 +25,16 @@ from services.domain_lexicons import (
 from services.minio_upload import ensure_bucket, get_minio_client
 
 _SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
+_VALID_PSM = frozenset(str(i) for i in range(14))
+
+
+def normalize_psm(psm: str | None, *, default: str | None = None) -> str:
+    """Tesseract PSM 0–13；無效值拋 ValueError。"""
+    fallback = (default or os.getenv("OCR_PSM", "11") or "11").strip() or "11"
+    s = str(psm).strip() if psm is not None and str(psm).strip() else fallback
+    if s not in _VALID_PSM:
+        raise ValueError(f"PSM 必須為 0–13 的整數字串（目前：{s!r}）。")
+    return s
 
 
 def _has_supported_image_extension(path: str) -> bool:
@@ -259,17 +269,26 @@ def _resolve_ocr_user_words_path_for_worker() -> str:
     return _ocr_user_words_worker_path
 
 
-def _build_tesseract_config(psm: str) -> str:
-    config = f"--psm {psm}"
-    words_path = _resolve_ocr_user_words_path_for_worker()
-    if words_path:
-        config += f' --user-words "{words_path}"'
+def _build_tesseract_config(psm: str, user_words_path: str | None = None) -> str:
+    psm_norm = normalize_psm(psm)
+    config = f"--psm {psm_norm}"
+    path = user_words_path
+    if not path:
+        path = _resolve_ocr_user_words_path_for_worker()
+    if path:
+        config += f' --user-words "{path}"'
     return config
 
 
-def _ocr_binary_to_text(image_content) -> Optional[str]:
+def ocr_image_bytes(
+    image_content,
+    *,
+    psm: str | None = None,
+    user_words_path: str | None = None,
+) -> Optional[str]:
     """
-    將影像二進位內容轉成文字（於 Spark Python UDF 內執行，需在 worker 上能呼叫 tesseract）。
+    將影像二進位內容轉成文字（driver 或 Spark UDF 皆可呼叫）。
+    psm 未指定時使用環境變數 OCR_PSM。
     """
     try:
         import pytesseract
@@ -282,7 +301,7 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
             pytesseract.pytesseract.tesseract_cmd = cmd
 
         ocr_lang = os.getenv("OCR_LANG", "chi_tra+eng")
-        ocr_psm = os.getenv("OCR_PSM", "11").strip() or "11"
+        ocr_psm = normalize_psm(psm)
 
         if image_content is None:
             return None
@@ -299,7 +318,7 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
         img = Image.open(buf)
         img = preprocess_image_for_ocr(img)
 
-        tesseract_config = _build_tesseract_config(ocr_psm)
+        tesseract_config = _build_tesseract_config(ocr_psm, user_words_path)
         text = pytesseract.image_to_string(img, lang=ocr_lang, config=tesseract_config)
         result = text.strip() or "OCR_EMPTY_RESULT"
         return result
@@ -308,6 +327,11 @@ def _ocr_binary_to_text(image_content) -> Optional[str]:
         return f"OCR_ERROR_IMPORT: {ie}"
     except Exception as e:
         return f"OCR_ERROR_REAL: {e}"
+
+
+def _ocr_binary_to_text(image_content) -> Optional[str]:
+    """Spark UDF 包裝：使用環境變數 OCR_PSM 與 worker 上已分發的 user-words。"""
+    return ocr_image_bytes(image_content)
 
 
 _ocr_udf = udf(_ocr_binary_to_text, StringType())
@@ -531,6 +555,7 @@ def preview_raw_images_sample(
             col("path").alias("image_path"),
             length(col("content")).alias("content_length"),
         )
+        .orderBy(col("path"))
         .limit(lim)
     )
     rows = [row.asDict(recursive=True) for row in df.collect()]

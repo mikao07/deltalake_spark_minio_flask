@@ -33,6 +33,11 @@ htmlcov/
 # Local git commit message drafts（git commit -F ...）
 commitmsg*.txt
 
+# 本機除錯筆記與 AB 暫存（公開 repo 不提交）
+docs/問題日誌.md
+docs/管線執行步驟.txt
+var/
+
 # IDE / editor
 .idea/
 .vscode/

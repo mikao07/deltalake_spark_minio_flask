@@ -33,6 +33,16 @@ def test_upload_page_ok(monkeypatch):
     assert b"result-table" in r.data
     r2 = c.get("/pipeline/bronze")
     assert r2.status_code == 200
+    r3 = c.get("/test/ocr-psm")
+    assert r3.status_code == 200
+    assert "OCR PSM A/B".encode("utf-8") in r3.data
+
+
+def test_ocr_psm_run_requires_dataset_id(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post("/api/test/ocr-psm/run", json={})
+    assert r.status_code == 400
+    assert "dataset_id" in r.get_json()["error"]
 
 
 def test_delta_read_requires_table_path(monkeypatch):

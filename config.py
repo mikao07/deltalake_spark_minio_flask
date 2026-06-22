@@ -129,7 +129,7 @@ RAW_IMAGES_PATH = os.getenv("RAW_IMAGES_PATH", f"s3a://{BUCKET_NAME}/{RAW_IMAGE_
 
 # OCR（Tesseract / pytesseract）：語言包需已安裝於系統；Windows 可設 TESSERACT_CMD 指向 tesseract.exe
 OCR_LANG = os.getenv("OCR_LANG", "chi_tra+eng")
-OCR_PSM = os.getenv("OCR_PSM", "11")
+OCR_PSM = os.getenv("OCR_PSM", "6")
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "")
 # 前處理：短邊放大（0=不放大）、對比度、銳利度
 OCR_SCALE_MIN_SIDE = os.getenv("OCR_SCALE_MIN_SIDE", "0")
@@ -146,6 +146,14 @@ PAIN_FUZZY_ENABLED = os.getenv("PAIN_FUZZY_ENABLED", "true")
 PAIN_FUZZY_MIN_RATIO = os.getenv("PAIN_FUZZY_MIN_RATIO", "0.78")
 PAIN_FUZZY_ANCHOR_RATIO = os.getenv("PAIN_FUZZY_ANCHOR_RATIO", "0.88")
 PAIN_FUZZY_MIN_CHARS = os.getenv("PAIN_FUZZY_MIN_CHARS", "3")
+
+# OCR PSM A/B 測試（獨立 test 路徑，不寫入正式 Bronze）
+OCR_AB_SAMPLE_SIZE = int(os.getenv("OCR_AB_SAMPLE_SIZE", "20"))
+OCR_AB_MAX_SAMPLE_SIZE = int(os.getenv("OCR_AB_MAX_SAMPLE_SIZE", "50"))
+OCR_AB_RESULTS_PATH = os.getenv(
+    "OCR_AB_RESULTS_PATH",
+    f"s3a://{BUCKET_NAME}/test/ocr_psm_ab/",
+)
 
 # 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
 UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()

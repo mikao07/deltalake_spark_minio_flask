@@ -1,0 +1,70 @@
+# OCR 與管線決策紀錄（公開摘要）
+
+本文件為專案對外可讀的**決策摘要**；完整除錯過程保留於本機，不納入版本庫。
+
+---
+
+## 分層職責
+
+| 層級 | 職責 |
+|------|------|
+| **Bronze** | Tesseract OCR 原文（`extracted_text`），保留稽核用完整輸出 |
+| **Silver** | 物理清洗（`cleaned_text`）→ Jieba 分詞（`tokens`）；版本由 `SILVER_TRANSFORM_VERSION` 驅動 MERGE 重算 |
+| **Gold** | 領域 lexicon（停用詞 − 痛點保護詞）與痛點分析 |
+
+原則：**token 被刪難以救回；錯字可在 Gold 模糊匹配補救。**
+
+---
+
+## 銅層 OCR 定案（drinks 深色 UI 截圖）
+
+### 前處理 profile：`dark_ui`
+
+| 參數 | 定案值 | 說明 |
+|------|--------|------|
+| `OCR_PSM` | **6** | 單一文字區塊；較少 emoji／圖示誤認垃圾 |
+| `OCR_SCALE_MIN_SIDE` | **0** | 不放大；強制放大易使深色 UI 字糊（例：燕麥→蒸座） |
+| `OCR_CONTRAST` | **1.5** | 灰階後對比 |
+| `OCR_SHARPNESS` | **1.0** | 預設 |
+| `OCR_BINARIZE` | **off** | 彩色／深色 UI 先不二值化 |
+| `OCR_PREPROCESS_VERSION` | **v1.1** | 寫入 `ocr_signature` |
+
+### PSM A/B 結論（各 20 張樣本，`scale=0`）
+
+| 對照 | 結果 |
+|------|------|
+| 11 vs **6** | 6 勝：關鍵詞 9 vs 7；PSM 11 易產生 `BARE` 等洋文垃圾 |
+| 4 vs **6** | 6 略優：關鍵詞平手，字數均值略高 |
+| 13 vs **6** | 6 壓倒性勝：PSM 13 不適用整張手機截圖 |
+
+**不再以 4、11、13 作為 drinks 主力 PSM。**
+
+---
+
+## 已知限制與後續方向
+
+| 項目 | 決策 |
+|------|------|
+| CJK 間 OCR 空格 | 計畫於銀層物理清洗（Jieba 前）以 lookaround 去除，bump `SILVER_TRANSFORM_VERSION` |
+| emoji／洋文 OCR 垃圾 | 計畫於銀層清洗，保留 `Line Pay` 等白名單 |
+| 銅層與 `.env` 脫節 | 變更 OCR 參數後須 Bronze `overwrite`，僅重跑銀層不會更新 `extracted_text` |
+| 前處理 preset 分流 | 第一次 Bronze 應為最終形態；若需依短邊／亮度分流，應合併於 `ocr_spark.py` 單次攝入，避免二次 overwrite |
+
+---
+
+## 變更 OCR 後檢查清單
+
+1. 確認或 bump `OCR_PREPROCESS_VERSION`（`ocr_signature` 變更）
+2. `docker compose up --build`
+3. `/test/ocr-psm` 抽樣驗證（若改 PSM 或前處理）
+4. Bronze OCR `overwrite`
+5. Silver ETL → Gold ETL
+
+---
+
+## 相關模組
+
+- `services/ocr_spark.py` — 前處理、OCR、`ocr_signature`
+- `services/ocr_psm_ab.py` — PSM A/B 測試（`test/ocr_psm_ab/`）
+- `services/text_tokens.py` — 銀層清洗與分詞
+- `docs/管線執行步驟.txt` — 內部執行 SOP（可選閱讀）

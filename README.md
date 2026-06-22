@@ -23,7 +23,7 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 
 ### 資料管線（摘要）
 
-- **Bronze**：`raw/images/{dataset_id}/` 影像 → **可調前處理**（放大、灰階、對比、銳化、**二值化**）→ **Tesseract**（預設 **`OCR_PSM=11`**，可載入 **user-words**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**領域辭典**。
+- **Bronze**：`raw/images/{dataset_id}/` 影像 → **可調前處理**（放大、灰階、對比、銳化、**二值化**）→ **Tesseract**（預設 **`OCR_PSM=6`**，可載入 **user-words**）→ Delta；可選擋掉 `OCR_ERROR_*` 不寫入。詳見 **OCR 調校**、**領域辭典**。
 - **Silver**：OCR 原文保留於 `extracted_text`；**`cleaned_text`** 物理清洗（去標點、剝純數字雜訊）；**Jieba + 內建虛詞停用詞** 產出冪等 `tokens`（`SILVER_TRANSFORM_VERSION`）。ETL 後執行**三道品質防線**（Schema／Token 分佈／留存率）。**不**套用領域停用詞。
 - **Gold**：讀銀層 `tokens` → 套用版本化 lexicon（`effective_stop = stop − 痛點保護詞`）→ 痛點漏斗、TF-IDF、PMI。規則 **`v1.4-drinks-funnel`**；辭典 **`STOPWORDS_LEXICON_VERSION`**。
 - **Gold（資料驅動）**：**Phase A** TF-IDF 痛點候選詞 → `GOLD_TFIDF_KEYWORDS_PATH`；**Phase B** PMI 片語候選 → `GOLD_PHRASE_CANDIDATES_PATH`（隨金層 ETL 一併執行）。
@@ -78,7 +78,7 @@ Flask 後端 + PySpark + Delta Lake：透過 **S3 相容 API（MinIO）** 讀寫
 | 變數 | 預設 | 說明 |
 |------|------|------|
 | `OCR_LANG` | `chi_tra+eng` | Tesseract 語言包；純中文評論可試 `chi_tra` |
-| `OCR_PSM` | `11` | Page Segmentation Mode；**11**＝稀疏文字；**6**＝單一文字區塊 |
+| `OCR_PSM` | `6` | Page Segmentation Mode；**6**＝單一文字區塊（AB 實測較少亂碼）；**11**＝稀疏文字 |
 | `OCR_SCALE_MIN_SIDE` | `0` | 短邊低於此像素時等比放大；手機截圖建議 **1400～1800** |
 | `OCR_CONTRAST` | `1.5` | 灰階後對比度倍率；可試 **1.8～2.0** |
 | `OCR_SHARPNESS` | `1.0` | 銳利度倍率；可試 **1.1～1.3** |

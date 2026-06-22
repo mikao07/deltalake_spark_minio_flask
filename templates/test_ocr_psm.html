@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OCR PSM A/B 測試</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      .ocr-cell {
+        font-family: ui-monospace, "Cascadia Code", "Segoe UI Mono", monospace;
+        font-size: 0.78rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+      .thumb {
+        max-width: 120px;
+        max-height: 90px;
+        object-fit: contain;
+        border: 1px solid #dee2e6;
+        border-radius: 4px;
+        background: #fff;
+      }
+      .metric-win {
+        font-weight: 600;
+        color: var(--bs-success);
+      }
+      .side-label-a {
+        color: #0d6efd;
+      }
+      .side-label-b {
+        color: #6f42c1;
+      }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container py-4" style="max-width: 1200px">
+      {% include 'includes/pipeline_nav.html' %}
+
+      <h1 class="h4 mb-2">OCR PSM A/B 測試</h1>
+      <p class="text-muted small mb-3">
+        固定取 <strong>依路徑排序的前 {{ sample_size_default }} 張</strong>原圖（<code>{{ raw_images_hint }}</code>），對同一批影像分別以
+        <strong>PSM A</strong> 與 <strong>PSM B</strong> 跑 Tesseract（含 user-words）。結果寫入獨立 test 路徑
+        <code>{{ results_path }}</code>，不寫入正式 Bronze。
+      </p>
+
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <div class="row g-3 align-items-end">
+            <div class="col-6 col-md-2">
+              <label class="form-label small mb-1">PSM A</label>
+              <select class="form-select form-select-sm" id="psm-a">
+                {% for p in psm_options %}
+                  <option value="{{ p }}" {% if p == default_psm_a %}selected{% endif %}>{{ p }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-6 col-md-2">
+              <label class="form-label small mb-1">PSM B</label>
+              <select class="form-select form-select-sm" id="psm-b">
+                {% for p in psm_options %}
+                  <option value="{{ p }}" {% if p == default_psm_b %}selected{% endif %}>{{ p }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-6 col-md-2">
+              <label class="form-label small mb-1">樣本數</label>
+              <input
+                class="form-control form-control-sm"
+                type="number"
+                id="sample-size"
+                min="1"
+                max="{{ sample_size_max }}"
+                value="{{ sample_size_default }}"
+              />
+            </div>
+            <div class="col-12 col-md-4">
+              <label class="form-label small mb-1">管理 Token（可選）</label>
+              <input class="form-control form-control-sm" type="password" id="admin-token" placeholder="ADMIN_TOKEN" />
+            </div>
+            <div class="col-12 col-md-2 d-grid">
+              <button type="button" class="btn btn-primary btn-sm" id="btn-run-ab">執行 A/B</button>
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="form-label small mb-1">關鍵詞命中檢查（每行一個，小寫比對）</label>
+            <textarea class="form-control form-control-sm" id="keywords" rows="3">{{ default_keywords | join('\n') }}</textarea>
+          </div>
+          <p class="small text-muted mb-0 mt-2" id="run-note">
+            {% if not selected_dataset_id %}請先在上方選擇 dataset_id。{% else %}就緒。{% endif %}
+          </p>
+        </div>
+      </div>
+
+      <div id="summary-panel" class="{% if not latest_result %}d-none{% endif %}">
+        <div class="row g-3 mb-4">
+          <div class="col-md-6">
+            <div class="card border-primary h-100">
+              <div class="card-header py-2 small fw-semibold side-label-a">PSM A 摘要</div>
+              <div class="card-body small" id="summary-a">
+                {% if latest_result and latest_result.summary %}
+                  {% set sa = latest_result.summary.a %}
+                  字數均值 {{ sa.avg_char_count }} · CJK 內空白均值 {{ sa.avg_cjk_internal_spaces }} · 關鍵詞命中 {{ sa.total_keyword_hits }} · 錯誤 {{ sa.error_rows }}
+                {% endif %}
+              </div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="card border-secondary h-100" style="border-color: #6f42c1 !important">
+              <div class="card-header py-2 small fw-semibold side-label-b">PSM B 摘要</div>
+              <div class="card-body small" id="summary-b">
+                {% if latest_result and latest_result.summary %}
+                  {% set sb = latest_result.summary.b %}
+                  字數均值 {{ sb.avg_char_count }} · CJK 內空白均值 {{ sb.avg_cjk_internal_spaces }} · 關鍵詞命中 {{ sb.total_keyword_hits }} · 錯誤 {{ sb.error_rows }}
+                {% endif %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h2 class="h6 mb-0">逐張對照</h2>
+        <button type="button" class="btn btn-outline-danger btn-sm" id="btn-clear-test">清除 test 結果</button>
+      </div>
+
+      <div class="card shadow-sm mb-3">
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-sm table-bordered mb-0 align-middle">
+              <thead class="table-light">
+                <tr>
+                  <th style="width: 130px">縮圖</th>
+                  <th style="width: 14%">檔案</th>
+                  <th style="width: 43%">
+                    <span class="side-label-a">PSM A</span>
+                    <span id="hdr-psm-a" class="text-muted"></span>
+                  </th>
+                  <th style="width: 43%">
+                    <span class="side-label-b">PSM B</span>
+                    <span id="hdr-psm-b" class="text-muted"></span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody id="ab-tbody">
+                {% if latest_result and latest_result.rows %}
+                  {% for row in latest_result.rows %}
+                    <tr>
+                      <td>
+                        <img
+                          class="thumb"
+                          alt="preview"
+                          src="{{ url_for('api_test_ocr_psm_image') }}?image_path={{ row.image_path | urlencode }}"
+                          loading="lazy"
+                        />
+                      </td>
+                      <td class="small text-break">{{ row.short_name or row.image_path }}</td>
+                      <td>
+                        <div class="small text-muted mb-1">
+                          {{ row.a.metrics.char_count }} 字 · CJK空 {{ row.a.metrics.cjk_internal_spaces }}
+                          {% if row.a.metrics.keyword_hits %} · 命中 {{ row.a.metrics.keyword_hits | join(', ') }}{% endif %}
+                        </div>
+                        <div class="ocr-cell">{{ row.a.text }}</div>
+                      </td>
+                      <td>
+                        <div class="small text-muted mb-1">
+                          {{ row.b.metrics.char_count }} 字 · CJK空 {{ row.b.metrics.cjk_internal_spaces }}
+                          {% if row.b.metrics.keyword_hits %} · 命中 {{ row.b.metrics.keyword_hits | join(', ') }}{% endif %}
+                        </div>
+                        <div class="ocr-cell">{{ row.b.text }}</div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr id="ab-empty-row">
+                    <td colspan="4" class="text-center text-muted small py-4">尚無結果；選擇 dataset 後按「執行 A/B」。</td>
+                  </tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {% if sample_paths %}
+        <details class="small text-muted">
+          <summary>本次固定樣本路徑（排序後前 {{ sample_paths | length }} 筆）</summary>
+          <ul class="mb-0 mt-2">
+            {% for p in sample_paths %}
+              <li><code>{{ p.image_path }}</code></li>
+            {% endfor %}
+          </ul>
+        </details>
+      {% endif %}
+    </div>
+
+    <script id="ocr-ab-dataset" type="application/json">{{ (selected_dataset_id or '') | tojson }}</script>
+    <script id="ocr-ab-initial" type="application/json">{{ (latest_result or none) | tojson }}</script>
+    <script>
+      const DATASET_ID = JSON.parse(document.getElementById("ocr-ab-dataset").textContent || '""');
+      let latestResult = JSON.parse(document.getElementById("ocr-ab-initial").textContent || "null");
+
+      function adminHeadersJson() {
+        const h = { "Content-Type": "application/json" };
+        const t = document.getElementById("admin-token").value.trim();
+        if (t) h["X-Admin-Token"] = t;
+        return h;
+      }
+
+      function parseKeywords() {
+        return document
+          .getElementById("keywords")
+          .value.split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+
+      function esc(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      function renderSummary(result) {
+        const panel = document.getElementById("summary-panel");
+        if (!result || !result.summary) {
+          panel.classList.add("d-none");
+          return;
+        }
+        panel.classList.remove("d-none");
+        const sa = result.summary.a;
+        const sb = result.summary.b;
+        document.getElementById("summary-a").textContent =
+          `字數均值 ${sa.avg_char_count} · CJK 內空白均值 ${sa.avg_cjk_internal_spaces} · 關鍵詞命中 ${sa.total_keyword_hits} · 錯誤 ${sa.error_rows} · 空結果 ${sa.empty_rows}`;
+        document.getElementById("summary-b").textContent =
+          `字數均值 ${sb.avg_char_count} · CJK 內空白均值 ${sb.avg_cjk_internal_spaces} · 關鍵詞命中 ${sb.total_keyword_hits} · 錯誤 ${sb.error_rows} · 空結果 ${sb.empty_rows}`;
+        document.getElementById("hdr-psm-a").textContent = result.psm_a ? ` (${result.psm_a})` : "";
+        document.getElementById("hdr-psm-b").textContent = result.psm_b ? ` (${result.psm_b})` : "";
+      }
+
+      function renderRows(result) {
+        const tbody = document.getElementById("ab-tbody");
+        if (!result || !result.rows || !result.rows.length) {
+          tbody.innerHTML =
+            '<tr><td colspan="4" class="text-center text-muted small py-4">無樣本或 OCR 結果為空。</td></tr>';
+          return;
+        }
+        tbody.innerHTML = result.rows
+          .map((row) => {
+            const imgUrl =
+              "/api/test/ocr-psm/image?image_path=" + encodeURIComponent(row.image_path || "");
+            const ma = row.a.metrics || {};
+            const mb = row.b.metrics || {};
+            const hitsA = (ma.keyword_hits || []).join(", ");
+            const hitsB = (mb.keyword_hits || []).join(", ");
+            return `<tr>
+              <td><img class="thumb" src="${imgUrl}" alt="preview" loading="lazy" /></td>
+              <td class="small text-break">${esc(row.short_name || row.image_path)}</td>
+              <td>
+                <div class="small text-muted mb-1">${ma.char_count || 0} 字 · CJK空 ${ma.cjk_internal_spaces || 0}${hitsA ? " · 命中 " + esc(hitsA) : ""}</div>
+                <div class="ocr-cell">${esc(row.a.text || "")}</div>
+              </td>
+              <td>
+                <div class="small text-muted mb-1">${mb.char_count || 0} 字 · CJK空 ${mb.cjk_internal_spaces || 0}${hitsB ? " · 命中 " + esc(hitsB) : ""}</div>
+                <div class="ocr-cell">${esc(row.b.text || "")}</div>
+              </td>
+            </tr>`;
+          })
+          .join("");
+      }
+
+      document.getElementById("btn-run-ab").addEventListener("click", async function () {
+        const note = document.getElementById("run-note");
+        if (!DATASET_ID) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "請先在上方導覽選擇 dataset_id。";
+          return;
+        }
+        const psmA = document.getElementById("psm-a").value;
+        const psmB = document.getElementById("psm-b").value;
+        const sampleSize = parseInt(document.getElementById("sample-size").value, 10) || 20;
+        note.className = "small text-muted mt-2 mb-0";
+        note.textContent = "A/B 執行中（約 20 張 × 2 次 OCR，請稍候）…";
+        try {
+          const res = await fetch("/api/test/ocr-psm/run", {
+            method: "POST",
+            headers: adminHeadersJson(),
+            body: JSON.stringify({
+              dataset_id: DATASET_ID,
+              psm_a: psmA,
+              psm_b: psmB,
+              sample_size: sampleSize,
+              keywords: parseKeywords(),
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            note.className = "small text-danger mt-2 mb-0";
+            note.textContent = "失敗：" + (data.error || res.statusText);
+            return;
+          }
+          latestResult = data;
+          renderSummary(data);
+          renderRows(data);
+          note.className = "small text-success mt-2 mb-0";
+          note.textContent =
+            `完成：${data.sample_size_actual} 張 · PSM ${data.psm_a} vs ${data.psm_b} · ${data.duration_ms} ms · 已存 ${data.results_path || ""}`;
+        } catch (err) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "失敗：" + String(err);
+        }
+      });
+
+      document.getElementById("btn-clear-test").addEventListener("click", async function () {
+        if (!DATASET_ID) return;
+        if (!confirm("刪除 test 路徑下此 dataset 的 A/B 結果 JSON？")) return;
+        const note = document.getElementById("run-note");
+        try {
+          const res = await fetch(
+            "/api/test/ocr-psm/results?dataset_id=" + encodeURIComponent(DATASET_ID),
+            { method: "DELETE", headers: adminHeadersJson() }
+          );
+          const data = await res.json();
+          if (!res.ok) {
+            note.className = "small text-danger mt-2 mb-0";
+            note.textContent = "清除失敗：" + (data.error || res.statusText);
+            return;
+          }
+          note.className = "small text-warning mt-2 mb-0";
+          note.textContent = `已刪除 ${data.deleted_objects || 0} 個物件（${data.prefix || ""}）`;
+        } catch (err) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "清除失敗：" + String(err);
+        }
+      });
+
+      if (latestResult) {
+        renderSummary(latestResult);
+      }
+    </script>
+  </body>
+</html>
