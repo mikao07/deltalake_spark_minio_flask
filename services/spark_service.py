@@ -56,7 +56,11 @@ from config import (
     OCR_BINARIZE,
     OCR_CONTRAST,
     OCR_LANG,
+    OCR_LIGHT_DOC_MEAN_LUMA,
+    OCR_LOW_RES_SHORT_SIDE,
+    OCR_LOW_RES_TARGET_SIDE,
     OCR_PREPROCESS_VERSION,
+    OCR_PRESET_ROUTER_ENABLED,
     OCR_PSM,
     OCR_SCALE_MIN_SIDE,
     OCR_SHARPNESS,
@@ -66,11 +70,18 @@ from config import (
     S3A_PATH_STYLE_ACCESS,
     SILVER_OCR_TABLE_PATH,
     SILVER_TRANSFORM_VERSION,
+    STOPWORDS_EXPLORATION_LEXICON_VERSION,
     STOPWORDS_LEXICON_VERSION,
     TESSERACT_CMD,
 )
 from services.domain_lexicons import resolve_local_jieba_userdict_path
-from services.lexicon import collect_gold_lexicon, filter_tokens_for_analytics, filter_tokens_for_tfidf_exploration, parse_stopwords_lines
+from services.lexicon import (
+    collect_gold_dual_lexicon,
+    collect_gold_lexicon,
+    filter_tokens_for_analytics,
+    filter_tokens_for_tfidf_exploration,
+    parse_stopwords_lines,
+)
 from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
 from services.silver_quality import evaluate_gold_downstream_quality, run_silver_quality_gate
 from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
@@ -150,6 +161,10 @@ class SparkManager:
             "OCR_SHARPNESS": OCR_SHARPNESS,
             "OCR_BINARIZE": OCR_BINARIZE,
             "OCR_PREPROCESS_VERSION": OCR_PREPROCESS_VERSION,
+            "OCR_PRESET_ROUTER_ENABLED": str(OCR_PRESET_ROUTER_ENABLED).lower(),
+            "OCR_LOW_RES_SHORT_SIDE": OCR_LOW_RES_SHORT_SIDE,
+            "OCR_LOW_RES_TARGET_SIDE": OCR_LOW_RES_TARGET_SIDE,
+            "OCR_LIGHT_DOC_MEAN_LUMA": OCR_LIGHT_DOC_MEAN_LUMA,
             "TESSERACT_CMD": TESSERACT_CMD or "",
         }
 
@@ -740,10 +755,12 @@ def _with_gold_analytics_tokens(
     spark: SparkSession,
     dataset_id: str | None,
 ) -> tuple[DataFrame, Dict[str, Any]]:
-    """Gold：analytics_tokens（漏斗）與 tfidf_exploration_tokens（Phase A）分流過濾。"""
-    bundle = collect_gold_lexicon(spark, dataset_id)
-    effective = bundle.get("effective_stopwords") or []
-    tfidf_stop = bundle.get("tfidf_exploration_stopwords") or []
+    """Gold：release lexicon → analytics_tokens；exploration lexicon → tfidf_exploration_tokens。"""
+    bundle = collect_gold_dual_lexicon(spark, dataset_id)
+    release = bundle.get("release") or {}
+    exploration = bundle.get("exploration") or {}
+    effective = release.get("effective_stopwords") or []
+    tfidf_stop = exploration.get("tfidf_exploration_stopwords") or []
     if "tokens" not in df_silver.columns:
         return df_silver, bundle
     analytics_udf = _get_gold_filter_tokens_udf(list(effective))
@@ -913,7 +930,32 @@ def get_dictionary_usage_status(
     """
     ds = _normalize_dataset_id_or_none(dataset_id)
     userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
-    lexicon = collect_gold_lexicon(spark, ds)
+    lexicon = collect_gold_dual_lexicon(spark, ds)
+    release = lexicon.get("release") or {}
+    exploration = lexicon.get("exploration") or {}
+    manifest_release_id = ""
+    manifest_approved_snapshot_at = ""
+    manifest_lexicon_content_hash = ""
+    manifest_dataset_id = ""
+    try:
+        from pathlib import Path
+
+        from services.pipeline_guardian import load_manifest, resolve_manifest_path
+
+        manifest_ds = ds or str(lexicon.get("dataset_id") or "").strip()
+        if manifest_ds:
+            manifest_dataset_id = manifest_ds
+            mpath = resolve_manifest_path(manifest_ds)
+            if mpath.is_file():
+                manifest = load_manifest(Path(mpath))
+                manifest_release_id = str(manifest.get("release_id") or "").strip()
+                gold_m = manifest.get("gold") or {}
+                manifest_approved_snapshot_at = str(gold_m.get("approved_snapshot_at") or "").strip()
+                if manifest_approved_snapshot_at.lower() == "none":
+                    manifest_approved_snapshot_at = ""
+                manifest_lexicon_content_hash = str(gold_m.get("lexicon_content_hash") or "").strip()
+    except Exception as e:
+        _logger.warning("manifest_status_load_failed: dataset_id=%s error=%s", ds, e)
     return {
         "dataset_id": ds,
         "jieba_userdict_used": bool(userdict_path),
@@ -922,16 +964,28 @@ def get_dictionary_usage_status(
         "silver_transform_version": SILVER_TRANSFORM_VERSION,
         "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
         "topic_rule_version": _TOPIC_RULE_VERSION,
-        "gold_lexicon_version": lexicon.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
-        "gold_stopwords_path": lexicon.get("stopwords_path") or "",
-        "gold_stopwords_merged_count": lexicon.get("stopwords_merged_count") or 0,
-        "gold_effective_stopwords_count": lexicon.get("effective_stopwords_count") or 0,
-        "gold_protected_terms_count": lexicon.get("protected_terms_count") or 0,
+        "gold_release_lexicon_version": release.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
+        "gold_release_stopwords_path": release.get("stopwords_path") or "",
+        "gold_release_lexicon_content_hash": release.get("lexicon_content_hash") or "",
+        "gold_exploration_lexicon_version": exploration.get("lexicon_version")
+        or STOPWORDS_EXPLORATION_LEXICON_VERSION,
+        "gold_exploration_stopwords_path": exploration.get("stopwords_path") or "",
+        "gold_exploration_lexicon_content_hash": exploration.get("lexicon_content_hash") or "",
+        "gold_exploration_merged_count": exploration.get("stopwords_merged_count") or 0,
+        "manifest_release_id": manifest_release_id,
+        "manifest_dataset_id": manifest_dataset_id,
+        "manifest_approved_snapshot_at": manifest_approved_snapshot_at,
+        "manifest_lexicon_content_hash": manifest_lexicon_content_hash,
+        "gold_lexicon_version": release.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
+        "gold_stopwords_path": release.get("stopwords_path") or "",
+        "gold_stopwords_merged_count": release.get("stopwords_merged_count") or 0,
+        "gold_effective_stopwords_count": release.get("effective_stopwords_count") or 0,
+        "gold_protected_terms_count": release.get("protected_terms_count") or 0,
         # 相容舊模板欄位
-        "stopwords_used": bool(lexicon.get("effective_stopwords_count")),
-        "stopwords_path": lexicon.get("stopwords_path") or "",
-        "stopwords_count": lexicon.get("effective_stopwords_count") or 0,
-        "domain_stopwords_count": lexicon.get("domain_stopwords_count") or 0,
+        "stopwords_used": bool(release.get("effective_stopwords_count")),
+        "stopwords_path": release.get("stopwords_path") or "",
+        "stopwords_count": release.get("effective_stopwords_count") or 0,
+        "domain_stopwords_count": release.get("domain_stopwords_count") or 0,
     }
 
 
@@ -1227,6 +1281,20 @@ def _make_topic_label_udf():
 _topic_label_udf = _make_topic_label_udf()
 
 
+def _topic_snapshot_lexicon_kwargs(lexicon_bundle: Dict[str, Any] | None) -> Dict[str, str]:
+    bundle = lexicon_bundle or {}
+    return {
+        "release_lexicon_version": str(
+            bundle.get("release_lexicon_version")
+            or bundle.get("lexicon_version")
+            or STOPWORDS_LEXICON_VERSION
+        ),
+        "lexicon_content_hash": str(
+            bundle.get("release_lexicon_content_hash") or bundle.get("lexicon_content_hash") or ""
+        ),
+    }
+
+
 def build_gold_pain_topic_frequency_dataframe(
     df_silver_ocr: DataFrame,
     *,
@@ -1267,17 +1335,24 @@ def write_gold_topic_snapshot_delta(
     gold_topic_snapshot_path: str,
     dataset_id: str | None = None,
     rule_version: str = _TOPIC_RULE_VERSION,
+    release_lexicon_version: str | None = None,
+    lexicon_content_hash: str | None = None,
 ) -> int:
     """
     將痛點主題頻率以 append 方式寫入 Gold 快照表，供歷史對照。
+    release_lexicon_version／lexicon_content_hash 記錄黃金發行停用詞版次。
     """
     ds = _normalize_dataset_id_or_none(dataset_id)
+    rel_ver = str(release_lexicon_version or STOPWORDS_LEXICON_VERSION).strip()
+    lex_hash = str(lexicon_content_hash or "").strip()
     out = (
         df_topic_count.withColumn(
             "dataset_id",
             lit(ds).cast(StringType()) if ds else lit(None).cast(StringType()),
         )
         .withColumn("rule_version", lit(str(rule_version).strip() or _TOPIC_RULE_VERSION))
+        .withColumn("release_lexicon_version", lit(rel_ver))
+        .withColumn("lexicon_content_hash", lit(lex_hash) if lex_hash else lit(None).cast(StringType()))
         .withColumn("snapshot_at", current_timestamp())
     )
     out.write.format("delta").mode("append").save(gold_topic_snapshot_path)
@@ -1403,6 +1478,99 @@ def _topic_snapshot_iso_from_cell(v: Any) -> str:
     if hasattr(v, "isoformat"):
         return str(v.isoformat())
     return str(v)
+
+
+def _filter_topic_snapshot_by_release(
+    df: DataFrame,
+    *,
+    dataset_id: str | None,
+    release_lexicon_version: str,
+    lexicon_content_hash: str,
+) -> DataFrame:
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if ds and "dataset_id" in df.columns:
+        df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+    rel_ver = str(release_lexicon_version or "").strip()
+    lex_hash = str(lexicon_content_hash or "").strip()
+    if rel_ver and "release_lexicon_version" in df.columns:
+        df = df.filter(trim(col("release_lexicon_version")) == lit(rel_ver))
+    if lex_hash and "lexicon_content_hash" in df.columns:
+        df = df.filter(trim(col("lexicon_content_hash")) == lit(lex_hash))
+    return df
+
+
+def find_latest_topic_snapshot_at_for_release(
+    spark: SparkSession,
+    *,
+    dataset_id: str | None = None,
+    release_lexicon_version: str,
+    lexicon_content_hash: str,
+) -> str | None:
+    """找出符合黃金發行 lexicon 的最新 topic_snapshot snapshot_at（ISO）。"""
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return None
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_find_latest_failed: %s", e)
+        return None
+    df = _filter_topic_snapshot_by_release(
+        df,
+        dataset_id=dataset_id,
+        release_lexicon_version=release_lexicon_version,
+        lexicon_content_hash=lexicon_content_hash,
+    )
+    if "snapshot_at" not in df.columns:
+        return None
+    try:
+        max_row = df.agg(spark_max(col("snapshot_at")).alias("max_snapshot_at")).collect()
+        max_snap = max_row[0]["max_snapshot_at"] if max_row else None
+        if max_snap is None:
+            return None
+        iso = _topic_snapshot_iso_from_cell(max_snap)
+        return iso or None
+    except Exception as e:
+        _logger.warning("topic_snapshot_find_latest_collect_failed: %s", e)
+        return None
+
+
+def verify_topic_snapshot_at_for_release(
+    spark: SparkSession,
+    *,
+    dataset_id: str | None,
+    snapshot_at_iso: str,
+    release_lexicon_version: str,
+    lexicon_content_hash: str,
+) -> bool:
+    """確認指定 snapshot_at 存在且 lexicon 欄位與 manifest 一致。"""
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return False
+    user_iso = str(snapshot_at_iso or "").strip()
+    if not user_iso:
+        return False
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_verify_read_failed: %s", e)
+        return False
+    df = _filter_topic_snapshot_by_release(
+        df,
+        dataset_id=dataset_id,
+        release_lexicon_version=release_lexicon_version,
+        lexicon_content_hash=lexicon_content_hash,
+    )
+    if "snapshot_at" not in df.columns:
+        return False
+    try:
+        for row in df.select("snapshot_at").distinct().collect():
+            if _topic_snapshot_iso_from_cell(row["snapshot_at"]) == user_iso:
+                return True
+        return False
+    except Exception as e:
+        _logger.warning("topic_snapshot_verify_collect_failed: %s", e)
+        return False
 
 
 def _parse_user_snapshot_at_iso(user_iso: str) -> Optional[datetime]:
@@ -1613,8 +1781,13 @@ def run_gold_topic_snapshot_rebuild_etl(
     df_silver = _filter_df_by_dataset_id(df_silver, ds)
     silver_filtered_rows = int(df_silver.count())
 
+    lexicon_bundle: Dict[str, Any] = {}
+    df_for_topic = df_silver
+    if silver_filtered_rows > 0 and "tokens" in df_silver.columns:
+        df_for_topic, lexicon_bundle = _with_gold_analytics_tokens(df_silver, spark, ds)
+
     df_topic = build_gold_pain_topic_frequency_dataframe(
-        df_silver,
+        df_for_topic,
         dataset_id_for_log=ds,
     )
     topic_snapshot_rows = write_gold_topic_snapshot_delta(
@@ -1622,6 +1795,7 @@ def run_gold_topic_snapshot_rebuild_etl(
         gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
         dataset_id=ds,
         rule_version=_TOPIC_RULE_VERSION,
+        **_topic_snapshot_lexicon_kwargs(lexicon_bundle),
     )
     topic_output_rows = int(df_topic.count())
     topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
@@ -1698,6 +1872,7 @@ def run_gold_etl(
                 gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
                 dataset_id=ds,
                 rule_version=_TOPIC_RULE_VERSION,
+                **_topic_snapshot_lexicon_kwargs(lexicon_bundle),
             )
             topic_output_rows = int(df_topic.count())
             topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
@@ -1714,6 +1889,7 @@ def run_gold_etl(
             gold_topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
             dataset_id=ds,
             rule_version=_TOPIC_RULE_VERSION,
+            **_topic_snapshot_lexicon_kwargs(lexicon_bundle),
         )
         topic_output_rows = int(df_topic.count())
         topic_frequency_top = [row.asDict() for row in df_topic.limit(10).collect()]
@@ -1773,7 +1949,17 @@ def run_gold_etl(
             else "silver_tokens_missing"
         ),
         "gold_analytics_tokens_applied": bool(lexicon_bundle),
-        "gold_lexicon_version": lexicon_bundle.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
+        "gold_release_lexicon_version": lexicon_bundle.get("release_lexicon_version")
+        or lexicon_bundle.get("lexicon_version")
+        or STOPWORDS_LEXICON_VERSION,
+        "gold_release_lexicon_content_hash": lexicon_bundle.get("release_lexicon_content_hash") or "",
+        "gold_exploration_lexicon_version": lexicon_bundle.get("exploration_lexicon_version")
+        or STOPWORDS_EXPLORATION_LEXICON_VERSION,
+        "gold_exploration_lexicon_content_hash": lexicon_bundle.get("exploration_lexicon_content_hash")
+        or "",
+        "gold_lexicon_version": lexicon_bundle.get("release_lexicon_version")
+        or lexicon_bundle.get("lexicon_version")
+        or STOPWORDS_LEXICON_VERSION,
         "gold_effective_stopwords_count": lexicon_bundle.get("effective_stopwords_count") or 0,
         "gold_tfidf_exploration_stopwords_count": lexicon_bundle.get("tfidf_exploration_stopwords_count") or 0,
         "gold_protected_terms_count": lexicon_bundle.get("protected_terms_count") or 0,

@@ -1,0 +1,76 @@
+{% if dictionary_status.error %}
+  <div class="alert alert-warning py-2 mb-2">檢查失敗：{{ dictionary_status.error }}</div>
+{% endif %}
+<div class="mb-2">
+  <strong>銀層分詞（冪等）：</strong>
+  <span class="text-success">Jieba + 內建虛詞</span>
+  <code class="ms-1">{{ dictionary_status.silver_transform_version or 'v2.0.0' }}</code>
+  <span class="text-muted ms-1">（{{ dictionary_status.builtin_stopwords_count or '—' }} 個虛詞）</span>
+</div>
+<div class="mb-2">
+  <strong>Jieba 自訂辭典（可選）：</strong>
+  {% if dictionary_status.jieba_userdict_used %}
+    <span class="text-success">已套用</span>
+    <code class="ms-1">{{ dictionary_status.jieba_userdict_path }}</code>
+  {% else %}
+    <span class="text-muted">未設定</span>
+  {% endif %}
+</div>
+<div class="mb-2 pb-2 border-bottom">
+  <strong>黃金發行停用詞</strong>
+  <span class="badge text-bg-warning text-dark ms-1">v1.0.0 軌</span>
+  {% if dictionary_status.gold_effective_stopwords_count %}
+    <span class="text-success ms-1">{{ dictionary_status.gold_release_lexicon_version or dictionary_status.gold_lexicon_version or '—' }}</span>
+    <span class="text-muted ms-1">
+      · merged {{ dictionary_status.gold_stopwords_merged_count or '—' }} 詞
+      · effective {{ dictionary_status.gold_effective_stopwords_count }} 詞
+      · 保護 {{ dictionary_status.gold_protected_terms_count or '—' }} 詞
+    </span>
+    {% if dictionary_status.gold_release_lexicon_content_hash %}
+      <br /><span class="text-muted">hash</span>
+      <code class="small">{{ dictionary_status.gold_release_lexicon_content_hash[:16] }}…</code>
+    {% endif %}
+    {% if dictionary_status.gold_release_stopwords_path or dictionary_status.gold_stopwords_path %}
+      <br /><code class="small">{{ dictionary_status.gold_release_stopwords_path or dictionary_status.gold_stopwords_path }}</code>
+    {% endif %}
+  {% else %}
+    <span class="text-muted ms-1">金層 ETL 時載入</span>
+  {% endif %}
+</div>
+<div class="mb-2">
+  <strong>探索測試停用詞</strong>
+  <span class="badge text-bg-secondary ms-1">dev 軌</span>
+  {% if dictionary_status.gold_exploration_lexicon_version %}
+    <span class="text-success ms-1">{{ dictionary_status.gold_exploration_lexicon_version }}</span>
+    <span class="text-muted ms-1">
+      · merged {{ dictionary_status.gold_exploration_merged_count or '—' }} 詞
+    </span>
+    {% if dictionary_status.gold_exploration_lexicon_content_hash %}
+      <br /><span class="text-muted">hash</span>
+      <code class="small">{{ dictionary_status.gold_exploration_lexicon_content_hash[:16] }}…</code>
+    {% endif %}
+    {% if dictionary_status.gold_exploration_stopwords_path %}
+      <br /><code class="small">{{ dictionary_status.gold_exploration_stopwords_path }}</code>
+    {% endif %}
+  {% else %}
+    <span class="text-muted ms-1">—</span>
+  {% endif %}
+</div>
+<div>
+  <strong>黃金發行 manifest</strong>
+  {% if dictionary_status.manifest_release_id %}
+    <code class="ms-1">{{ dictionary_status.manifest_release_id }}</code>
+    {% if dictionary_status.manifest_approved_snapshot_at %}
+      <br /><span class="text-muted">核准快照</span>
+      <code class="small">{{ dictionary_status.manifest_approved_snapshot_at }}</code>
+    {% else %}
+      <br /><span class="text-warning">尚未核准 topic_snapshot（可執行 pipeline_guardian --approve-snapshot）</span>
+    {% endif %}
+  {% else %}
+    {% if dictionary_status.dataset_id %}
+      <span class="text-muted ms-1">未載入 manifest（請確認 manifests/{{ dictionary_status.dataset_id }}.json 存在）</span>
+    {% else %}
+      <span class="text-muted ms-1">請在上方選擇 dataset_id（例如 drinks）後按「更新」</span>
+    {% endif %}
+  {% endif %}
+</div>

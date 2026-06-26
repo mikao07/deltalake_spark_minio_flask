@@ -253,6 +253,7 @@ def _execute_pipeline_to_gold_inner(
             raw_images_path=raw_images_path,
             bronze_path=BRONZE_TABLE_PATH,
             write_mode=write_mode,
+            dataset_id=dataset_id,
         )
         bronze_processed_rows = int(bronze_result.get("processed_rows") or 0)
         if skip_gold_if_no_new_ocr and bronze_processed_rows <= 0:
@@ -359,6 +360,7 @@ def _execute_bronze_ocr_inner(
     raw_images_path: str,
     bronze_path: str,
     write_mode: str,
+    image_paths: Optional[List[str]] = None,
     progress: Callable[[int, int, str], None],
 ) -> Dict[str, Any]:
     started = time.perf_counter()
@@ -370,6 +372,8 @@ def _execute_bronze_ocr_inner(
             raw_images_path=raw_images_path,
             bronze_path=bronze_path,
             write_mode=write_mode,
+            dataset_id=dataset_id,
+            image_paths=image_paths,
         )
         out = {
             "status": "ok",
@@ -947,6 +951,11 @@ def layers_preview_page():
         dataset_options = list_dataset_ids()
     except Exception as e:
         _logger.warning("list_dataset_ids_for_layers_failed: %s", e)
+
+    # 首次進入（網址未帶 dataset_id）預設 drinks，避免辭典／manifest 區塊空白。
+    if "dataset_id" not in request.args and not selected_dataset_id:
+        if "drinks" in dataset_options:
+            selected_dataset_id = "drinks"
 
     bronze_rows, bronze_error = _safe_bronze_preview(
         limit=preview_limit,
@@ -2140,7 +2149,8 @@ def delta_ocr_bronze_run():
         "preview_limit": 5
       }
 
-    - write_mode: \"overwrite\"（同 Notebook 全表覆寫）或 \"append\"
+    - write_mode: \"overwrite\"（全表覆寫）、\"append\"（追加）或 \"merge\"（依 image_path 子集 Upsert）
+    - image_paths: merge 時必填；可為 s3a 全路徑或檔名（相對於 raw_images_path）
     - dry_run: 僅驗證路徑；若 include_sample 為 true 會啟動 Spark 從 MinIO 取少量檔案預覽（需憑證）
     - async: true 時回傳 job_id（HTTP 202），以 GET /api/jobs/<job_id> 輪詢（來源預檢仍同步）
     """
@@ -2185,8 +2195,17 @@ def delta_ocr_bronze_run():
         return err
 
     write_mode = body.get("write_mode", "overwrite")
-    if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append"):
-        return _json_error('write_mode 必須是 \"overwrite\" 或 \"append\"。', 400)
+    if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append", "merge"):
+        return _json_error('write_mode 必須是 \"overwrite\"、\"append\" 或 \"merge\"。', 400)
+
+    image_paths_raw = body.get("image_paths")
+    image_paths: list[str] | None = None
+    if image_paths_raw is not None:
+        if not isinstance(image_paths_raw, list) or not all(isinstance(p, str) for p in image_paths_raw):
+            return _json_error("image_paths 必須是字串陣列。", 400)
+        image_paths = [p.strip() for p in image_paths_raw if str(p).strip()]
+    if write_mode == "merge" and not image_paths:
+        return _json_error('write_mode=\"merge\" 時必須提供 image_paths（至少一筆）。', 400)
 
     dry_run = bool(body.get("dry_run", False))
     if dry_run:
@@ -2196,6 +2215,7 @@ def delta_ocr_bronze_run():
             "raw_images_path": raw_images_path,
             "bronze_path": bronze_path,
             "write_mode": write_mode,
+            "image_paths": image_paths,
         }
         if bool(body.get("include_sample", False)):
             plim = body.get("preview_limit", 5)
@@ -2238,6 +2258,7 @@ def delta_ocr_bronze_run():
                 raw_images_path=raw_images_path,
                 bronze_path=bronze_path,
                 write_mode=write_mode,
+                image_paths=image_paths,
                 progress=progress,
             )
 
@@ -2260,6 +2281,7 @@ def delta_ocr_bronze_run():
             raw_images_path=raw_images_path,
             bronze_path=bronze_path,
             write_mode=write_mode,
+            image_paths=image_paths,
             progress=_noop_progress,
         )
         return jsonify(out)

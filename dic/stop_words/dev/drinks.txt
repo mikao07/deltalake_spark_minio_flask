@@ -1,7 +1,6 @@
-# drinks 黃金發行停用詞 lexicon v1.0.0（analytics_tokens／痛點快照；僅發版時修改）
-# 探索／測試請改 dic/stop_words/dev/drinks.txt
-# MinIO：s3a://data-lake/dic/stop_words/v1.0.0/drinks.txt
-# 與 services/domain_lexicons.py 內建詞表合併；發新版請 bump STOPWORDS_LEXICON_VERSION + manifest
+# drinks 探索／測試停用詞（tfidf_exploration_tokens；日常可改）
+# 黃金發行請改 v1.0.0 並 bump manifest；本檔不影響已凍結的 topic_snapshot
+# MinIO：s3a://data-lake/dic/stop_words/dev/drinks.txt
 
 好喝
 很好喝

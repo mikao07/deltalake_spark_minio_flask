@@ -88,7 +88,10 @@ JIEBA_USERDICT_DATASET_PATTERN = os.getenv("JIEBA_USERDICT_DATASET_PATTERN", "")
 # 可選：停用詞表（每行一詞；# 開頭為註解；與 jieba 詞典分開；僅 Gold 分析使用）
 STOPWORDS_PATH = os.getenv("STOPWORDS_PATH", "")
 STOPWORDS_DATASET_PATTERN = os.getenv("STOPWORDS_DATASET_PATTERN", "")
+# 黃金發行停用詞版本（analytics_tokens／痛點快照；僅發版時 bump）
 STOPWORDS_LEXICON_VERSION = os.getenv("STOPWORDS_LEXICON_VERSION", "v1.0.0")
+# 探索／測試停用詞版本（tfidf_exploration_tokens；日常可改 dic/stop_words/dev/）
+STOPWORDS_EXPLORATION_LEXICON_VERSION = os.getenv("STOPWORDS_EXPLORATION_LEXICON_VERSION", "dev")
 
 # 銀層轉換版本（冪等性：同版本 + 同 Bronze → 同 Silver）
 SILVER_TRANSFORM_VERSION = os.getenv("SILVER_TRANSFORM_VERSION", "v2.1.0")

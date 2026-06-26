@@ -27,6 +27,7 @@ COPY app.py config.py ./
 COPY services ./services
 COPY templates ./templates
 COPY dic ./dic
+COPY manifests ./manifests
 
 EXPOSE 5000
 

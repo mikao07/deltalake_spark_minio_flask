@@ -131,6 +131,33 @@ def test_delta_ocr_bronze_run_dry_run_with_dataset(monkeypatch):
     assert j["raw_images_path"].endswith("/invoice_ocr/")
 
 
+def test_delta_ocr_bronze_run_merge_requires_image_paths(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/ocr/bronze/run",
+        json={"dry_run": True, "dataset_id": "drinks", "write_mode": "merge"},
+    )
+    assert r.status_code == 400
+    assert "image_paths" in r.get_json()["error"]
+
+
+def test_delta_ocr_bronze_run_merge_dry_run_with_paths(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.post(
+        "/delta/ocr/bronze/run",
+        json={
+            "dry_run": True,
+            "dataset_id": "drinks",
+            "write_mode": "merge",
+            "image_paths": ["081401.png"],
+        },
+    )
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["write_mode"] == "merge"
+    assert j["image_paths"] == ["081401.png"]
+
+
 def test_delta_silver_ocr_run_dry_run_with_dataset(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(

@@ -14,6 +14,7 @@
 - **銅層封板**：`PSM 6` + `dark_ui`（`pre=v1.1`），經 20 張樣本 A/B 定案（例：PSM 6 vs 11 關鍵詞 **9 vs 7**）；`ocr_signature` 可追溯；OCR 參數經 **broadcast** 傳至 Spark executor
 - **銀層封板**：`SILVER_TRANSFORM_VERSION=v2.1.0`（CJK 去空格、emoji／洋文垃圾清洗）+ 三道品質閘門；**不**套用領域停用詞（留給 Gold）
 - **金層雙軌**：`analytics_tokens` → 痛點漏斗（商業輸出）；`tfidf_exploration_tokens` → Phase A 探索（避免虛詞淹沒 Top）
+- **管線守護神**：`python scripts/pipeline_guardian.py --dataset drinks` 比對銅銀簽名與金層辭典 hash（防改詞忘 bump）；詳見 `manifests/README.md`
 - **變更有代價**：改 OCR 須 Bronze `overwrite`；只重跑 Silver **不會**更新 `extracted_text`（見決策紀錄）
 
 **輸出怎麼看：** 首頁 **痛點主題快照** = 客訴結論；**TF-IDF** = 規則種子探索（非最終痛點）。
@@ -80,6 +81,7 @@ docker compose -f "docker-compose(new_minio).yml" up --build
 |------|------|
 | 健康檢查 | `GET /health` |
 | Bronze OCR | `POST /delta/ocr/bronze/run` |
+| Bronze 子集 OCR | 同上 · `write_mode=merge` · `image_paths` |
 | Silver ETL | `POST /delta/silver/ocr/run` |
 | Gold ETL | `POST /delta/gold/run?dataset_id=drinks` |
 | 一鍵至金層 | `POST /delta/pipeline/to-gold/run` |

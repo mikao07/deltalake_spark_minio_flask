@@ -6,6 +6,7 @@ Silver 不套用動態停用詞；本模組僅在 Gold 讀取銀層 tokens 後�
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -13,7 +14,12 @@ from typing import Any, Dict, Iterable, List, Sequence, Set
 
 from pyspark.sql import SparkSession
 
-from config import STOPWORDS_DATASET_PATTERN, STOPWORDS_LEXICON_VERSION, STOPWORDS_PATH
+from config import (
+    STOPWORDS_DATASET_PATTERN,
+    STOPWORDS_EXPLORATION_LEXICON_VERSION,
+    STOPWORDS_LEXICON_VERSION,
+    STOPWORDS_PATH,
+)
 from services.domain_lexicons import (
     get_builtin_domain_stopwords,
     get_builtin_tfidf_exploration_stopwords,
@@ -23,6 +29,13 @@ from services.pain_topic_rules import PAIN_TOPIC_POLARITY_RULES, PAIN_TOPIC_RULE
 
 _logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def compute_lexicon_content_hash(merged_stop: Iterable[str]) -> str:
+    """合併後停用詞列表的穩定 SHA256（小寫、排序、去重）。"""
+    words = sorted({str(w).strip().lower() for w in merged_stop if str(w).strip()})
+    payload = "\n".join(words).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def parse_stopwords_lines(lines: Iterable[str]) -> List[str]:
@@ -208,8 +221,9 @@ def collect_gold_lexicon(
     dataset_id: str | None,
     *,
     lexicon_version: str | None = None,
+    lexicon_role: str = "release",
 ) -> Dict[str, Any]:
-    """載入 Gold 辭典 bundle（停用詞、保護詞、effective_stop）。"""
+    """載入單一版本 Gold 辭典 bundle（停用詞、保護詞、effective_stop）。"""
     ds = _normalize_dataset_id(dataset_id)
     version = str(lexicon_version or STOPWORDS_LEXICON_VERSION or "v1.0.0").strip()
     path = resolve_stopwords_lexicon_path(spark, ds, lexicon_version=version)
@@ -221,11 +235,13 @@ def collect_gold_lexicon(
     tfidf_stop = build_tfidf_exploration_stopwords(merged_stop, ds)
     return {
         "dataset_id": ds,
+        "lexicon_role": lexicon_role,
         "lexicon_version": version,
         "stopwords_path": path or "",
         "stopwords_from_file_count": len(from_file),
         "domain_stopwords_count": len(builtin),
         "stopwords_merged_count": len(merged_stop),
+        "lexicon_content_hash": compute_lexicon_content_hash(merged_stop),
         "protected_terms_count": len(protected),
         "effective_stopwords_count": len(effective),
         "effective_stopwords": effective,
@@ -233,3 +249,64 @@ def collect_gold_lexicon(
         "tfidf_exploration_stopwords": tfidf_stop,
         "protected_terms": sorted(protected),
     }
+
+
+def collect_gold_dual_lexicon(
+    spark: SparkSession,
+    dataset_id: str | None,
+) -> Dict[str, Any]:
+    """
+    黃金發行 + 探索測試雙 lexicon：
+    - release（STOPWORDS_LEXICON_VERSION）→ analytics_tokens／痛點快照
+    - exploration（STOPWORDS_EXPLORATION_LEXICON_VERSION）→ tfidf_exploration_tokens
+    """
+    release = collect_gold_lexicon(
+        spark,
+        dataset_id,
+        lexicon_version=STOPWORDS_LEXICON_VERSION,
+        lexicon_role="release",
+    )
+    exp_ver = str(STOPWORDS_EXPLORATION_LEXICON_VERSION or "dev").strip()
+    exploration = collect_gold_lexicon(
+        spark,
+        dataset_id,
+        lexicon_version=exp_ver,
+        lexicon_role="exploration",
+    )
+    return {
+        "dataset_id": release.get("dataset_id"),
+        "release": release,
+        "exploration": exploration,
+        "release_lexicon_version": release.get("lexicon_version"),
+        "release_lexicon_content_hash": release.get("lexicon_content_hash"),
+        "release_stopwords_path": release.get("stopwords_path"),
+        "exploration_lexicon_version": exploration.get("lexicon_version"),
+        "exploration_lexicon_content_hash": exploration.get("lexicon_content_hash"),
+        "exploration_stopwords_path": exploration.get("stopwords_path"),
+        # 相容舊欄位（指向 release）
+        "lexicon_version": release.get("lexicon_version"),
+        "stopwords_path": release.get("stopwords_path"),
+        "stopwords_merged_count": release.get("stopwords_merged_count"),
+        "effective_stopwords_count": release.get("effective_stopwords_count"),
+        "effective_stopwords": release.get("effective_stopwords"),
+        "tfidf_exploration_stopwords": exploration.get("tfidf_exploration_stopwords"),
+        "tfidf_exploration_stopwords_count": exploration.get("tfidf_exploration_stopwords_count"),
+        "protected_terms_count": release.get("protected_terms_count"),
+    }
+
+
+def load_merged_stop_offline(
+    dataset_id: str,
+    *,
+    lexicon_version: str | None = None,
+) -> List[str]:
+    """無 Spark：本機 dic + 內建詞。"""
+    path = resolve_local_stopwords_lexicon_path(
+        dataset_id,
+        lexicon_version=lexicon_version or STOPWORDS_LEXICON_VERSION,
+    )
+    from_file: List[str] = []
+    if path:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        from_file = parse_stopwords_lines(lines)
+    return merge_stopword_lists(from_file, get_builtin_domain_stopwords(dataset_id))
