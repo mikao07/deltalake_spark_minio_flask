@@ -14,6 +14,8 @@
 | Gold 痛點漏斗 + TF-IDF 探索 token 分流 | ✅ 已完成 |
 | 停用詞雙版本（黃金 `v1.0.0` / 探索 `dev`） | ✅ 已完成 |
 | 管線守護神 + `manifests/drinks.json` | ✅ 已完成 |
+| `approved_snapshot_at` 核准快照 | ✅ 已完成 |
+| `/layers` 黃金／探索雙軌辭典 UI | ✅ 已完成 |
 | Compose 全檔 OCR 環境變數明列 | ✅ 三份 compose 已對齊 |
 | per-row `ocr_signature` | ✅ UDF 依實際 profile 產生 |
 | Bronze 子集 MERGE | ✅ `write_mode=merge` + `image_paths` |
@@ -38,7 +40,7 @@
 | `analytics_tokens` | **黃金發行** `v1.0.0/` | 痛點漏斗（`effective_stop = 停用詞 − 痛點保護詞`）→ 主題快照 |
 | `tfidf_exploration_tokens` | **探索測試** `dev/` | Phase A TF-IDF（探索停用詞 + 虛詞，**不**扣痛點保護） |
 
-**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版；探索軌可持續調詞，不必每次 bump 黃金版。
+**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版（`approved_snapshot_at` 對應的 `topic_snapshot`）；探索軌可持續調詞。
 
 ---
 
@@ -107,6 +109,7 @@
 | `SILVER_TRANSFORM_VERSION` | Silver → Gold |
 | 探索停用詞（`dev/`） | **Gold**（不更新 manifest） |
 | 黃金發行停用詞（`v1.0.0/`）／痛點規則 | **Gold** + 更新 `manifests/*.json` |
+| 核准痛點快照 | `pipeline_guardian.py --approve-snapshot`（寫入 `approved_snapshot_at`） |
 
 ---
 
@@ -117,4 +120,5 @@
 - `services/text_tokens.py` — 銀層清洗與分詞
 - `services/lexicon.py` — Gold 雙版本停用詞與 TF-IDF 探索過濾
 - `services/pipeline_guardian.py` — 管線守護神（銅銀品質、黃金 lexicon hash）
-- `manifests/drinks.json` — 黃金發行 manifest
+- `manifests/drinks.json` — 黃金發行 manifest（含 `approved_snapshot_at`）
+- `templates/includes/dictionary_status_panel.html` — `/layers` 雙軌辭典狀態
