@@ -34,6 +34,33 @@
                 {% endfor %}
               </select>
             </div>
+            <div class="col-12 col-md-4">
+              <label class="form-label mb-1">痛點快照顯示</label>
+              <div class="d-flex flex-wrap gap-3 pt-1">
+                <div class="form-check form-check-inline mb-0">
+                  <input
+                    class="form-check-input"
+                    type="radio"
+                    name="snapshot_mode"
+                    id="snapshot-mode-release"
+                    value="release"
+                    {% if snapshot_mode != "preview" %}checked{% endif %}
+                  />
+                  <label class="form-check-label small" for="snapshot-mode-release">發行版（預設）</label>
+                </div>
+                <div class="form-check form-check-inline mb-0">
+                  <input
+                    class="form-check-input"
+                    type="radio"
+                    name="snapshot_mode"
+                    id="snapshot-mode-preview"
+                    value="preview"
+                    {% if snapshot_mode == "preview" %}checked{% endif %}
+                  />
+                  <label class="form-check-label small" for="snapshot-mode-preview">最新預覽</label>
+                </div>
+              </div>
+            </div>
             <div class="col-12 col-md-5">
               <label class="form-label mb-1">痛點快照對照（可複選，Ctrl/Command + 點選）</label>
               <select class="form-select form-select-sm" name="topic_snapshot" multiple size="3">
@@ -48,6 +75,18 @@
           </div>
           <div class="small text-muted mt-2">
             目前篩選：{% if selected_dataset_id %}<code>{{ selected_dataset_id }}</code>{% else %}全部{% endif %}
+            · 痛點顯示：
+            {% if snapshot_mode == "preview" %}
+              <span class="badge text-bg-warning">最新預覽</span>
+              {% if latest_snapshot_at %}<code>{{ latest_snapshot_at }}</code>{% endif %}
+            {% else %}
+              <span class="badge text-bg-success">發行版</span>
+              {% if release_context and release_context.approved_snapshot_at %}
+                <code>{{ release_context.approved_snapshot_at }}</code>
+              {% else %}
+                <span class="text-warning">尚未核准</span>
+              {% endif %}
+            {% endif %}
             {% if selected_topic_snapshots and selected_topic_snapshots|length > 0 %}
               · 已選快照 {{ selected_topic_snapshots|length }} 個
             {% endif %}
@@ -236,12 +275,22 @@
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
             <h2 class="h5 mb-0">痛點主題分類（topic / frequency）</h2>
-            <span class="text-secondary small">
-              來源：Gold topic 快照表 <code>{{ topic_snapshot_path }}</code>
-            </span>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              {% if snapshot_mode == "preview" %}
+                <span class="badge text-bg-warning">最新預覽 · 非發行版</span>
+              {% else %}
+                <span class="badge text-bg-success">發行版</span>
+                {% if release_context and release_context.release_id %}
+                  <span class="text-secondary small"><code>{{ release_context.release_id }}</code></span>
+                {% endif %}
+              {% endif %}
+              <span class="text-secondary small">
+                來源：Gold topic 快照表 <code>{{ topic_snapshot_path }}</code>
+              </span>
+            </div>
           </div>
           {% if topic_hint %}
-            <div class="alert alert-warning py-2 small mb-2">{{ topic_hint }}</div>
+            <div class="alert {% if snapshot_mode == 'preview' %}alert-info{% elif topic_rows and topic_rows|length > 0 %}alert-success{% else %}alert-warning{% endif %} py-2 small mb-2">{{ topic_hint }}</div>
           {% endif %}
 
           {% if topic_rows and topic_rows|length > 0 %}
@@ -304,8 +353,13 @@
             {% endif %}
           {% else %}
             <div class="text-muted">
-              目前沒有痛點主題結果可顯示。請用目前 dataset 重新執行一次
-              <code>POST /delta/gold/run</code>。
+              {% if snapshot_mode == "preview" %}
+                目前沒有最新預覽可顯示。請用目前 dataset 重新執行一次
+                <code>POST /delta/gold/run</code>。
+              {% else %}
+                尚無發行版痛點資料。請先執行 Gold ETL 後以
+                <code>pipeline_guardian --approve-snapshot</code> 核准，或切換至「最新預覽」調參。
+              {% endif %}
             </div>
           {% endif %}
         </div>

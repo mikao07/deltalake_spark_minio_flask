@@ -323,6 +323,30 @@ def audit_runtime_config(manifest: Dict[str, Any]) -> List[AuditFinding]:
     return findings
 
 
+def _ocr_signature_matches_allowed(signature: str, allowed_entry: str) -> bool:
+    """
+    manifest 可用精簡鍵（例 psm=6|pre=v1.1|profile=dark_ui）；
+    Bronze 實際為 build_ocr_signature 完整字串（含 tesseract|lang=...|scale=...）。
+  允許：完全一致，或 allowed 每一段 key=value 皆出現在 signature 中。
+    """
+    sig = str(signature or "").strip()
+    allowed = str(allowed_entry or "").strip()
+    if not sig or not allowed:
+        return False
+    if sig == allowed:
+        return True
+    parts = [p.strip() for p in allowed.split("|") if p.strip()]
+    return bool(parts) and all(part in sig for part in parts)
+
+
+def _bronze_signatures_not_allowed(signatures: Set[str], allowed: List[str]) -> Set[str]:
+    unexpected: Set[str] = set()
+    for sig in signatures:
+        if not any(_ocr_signature_matches_allowed(sig, entry) for entry in allowed):
+            unexpected.add(sig)
+    return unexpected
+
+
 def audit_bronze_signatures(
     *,
     signatures: Set[str],
@@ -355,8 +379,7 @@ def audit_bronze_signatures(
         )
         return findings
 
-    allowed_set = set(allowed)
-    unexpected = signatures - allowed_set
+    unexpected = _bronze_signatures_not_allowed(signatures, allowed)
     if unexpected:
         findings.append(
             AuditFinding(
@@ -643,13 +666,44 @@ def stamp_approved_snapshot(
             )
 
     gold["approved_snapshot_at"] = approved_iso
+    from services.spark_service import count_silver_distinct_image_paths
+
+    gold["processed_image_count"] = count_silver_distinct_image_paths(spark, ds)
     save_manifest(path, manifest)
     return {
         "dataset_id": ds,
         "manifest_path": str(path),
         "approved_snapshot_at": approved_iso,
+        "processed_image_count": gold["processed_image_count"],
         "release_lexicon_version": rel_ver,
         "lexicon_content_hash": lex_hash,
+    }
+
+
+def revoke_approved_snapshot(
+    dataset_id: str,
+    *,
+    manifest_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    撤回發行版指標（開發期用）：清除 manifest 的 approved_snapshot_at 與 processed_image_count。
+    不刪除 Delta topic_snapshot 列；僅取消「對外發行」契約。
+    """
+    ds = _normalize_dataset_id(dataset_id)
+    path = resolve_manifest_path(ds, manifest_path)
+    manifest = load_manifest(path)
+    gold = manifest.setdefault("gold", {})
+    prev_approved = str(gold.get("approved_snapshot_at") or "").strip() or None
+    prev_count = gold.get("processed_image_count")
+    gold["approved_snapshot_at"] = None
+    gold["processed_image_count"] = None
+    save_manifest(path, manifest)
+    return {
+        "dataset_id": ds,
+        "manifest_path": str(path),
+        "revoked": True,
+        "previous_approved_snapshot_at": prev_approved,
+        "previous_processed_image_count": prev_count,
     }
 
 

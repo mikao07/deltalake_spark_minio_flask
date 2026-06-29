@@ -94,6 +94,36 @@ def list_dataset_ids(*, max_scan: int = 5000) -> list[str]:
     return sorted(out)
 
 
+_IMAGE_OBJECT_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+
+def count_raw_image_objects_for_dataset(
+    dataset_id: str,
+    *,
+    max_scan: int = 5000,
+) -> int:
+    """
+    統計 MinIO RAW_IMAGE_PREFIX 下指定 dataset 的影像物件數（依副檔名）。
+    用於新鮮度：上游原始圖 vs 銀層 distinct image_path。
+    """
+    ds = normalize_dataset_id(dataset_id)
+    client = get_minio_client()
+    ensure_bucket(client, BUCKET_NAME)
+    prefix = f"{RAW_IMAGE_PREFIX.strip().strip('/')}/{ds}/"
+    count = 0
+    scanned = 0
+    for obj in client.list_objects(BUCKET_NAME, prefix=prefix, recursive=True):
+        scanned += 1
+        if scanned > max_scan:
+            break
+        name = (getattr(obj, "object_name", "") or "").lower()
+        if not name.startswith(prefix):
+            continue
+        if any(name.endswith(ext) for ext in _IMAGE_OBJECT_SUFFIXES):
+            count += 1
+    return count
+
+
 def _object_exists(client: Minio, bucket: str, object_key: str) -> bool:
     try:
         client.stat_object(bucket, object_key)

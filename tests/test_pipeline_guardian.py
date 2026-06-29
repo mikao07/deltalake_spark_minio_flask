@@ -3,6 +3,7 @@
 from services.pipeline_guardian import (
     AuditLevel,
     audit_approved_topic_snapshot,
+    audit_bronze_signatures,
     audit_lexicon_bump_risk,
     audit_silver_transform_versions,
     compute_lexicon_content_hash,
@@ -132,3 +133,39 @@ def test_stamp_approved_snapshot_requires_spark():
 
     with pytest.raises(ValueError, match="SparkSession"):
         stamp_approved_snapshot("drinks", spark=None)
+
+
+def test_revoke_approved_snapshot_clears_manifest(tmp_path):
+    from services.pipeline_guardian import load_manifest, revoke_approved_snapshot, save_manifest
+
+    path = tmp_path / "drinks.json"
+    save_manifest(
+        path,
+        {
+            "dataset_id": "drinks",
+            "gold": {
+                "approved_snapshot_at": "2026-06-27T10:00:00",
+                "processed_image_count": 42,
+            },
+        },
+    )
+    result = revoke_approved_snapshot("drinks", manifest_path=path)
+    assert result["revoked"] is True
+    assert result["previous_approved_snapshot_at"] == "2026-06-27T10:00:00"
+    loaded = load_manifest(path)
+    assert loaded["gold"]["approved_snapshot_at"] is None
+    assert loaded["gold"]["processed_image_count"] is None
+
+
+def test_audit_bronze_signature_shorthand_matches_full():
+    full = (
+        "tesseract|lang=chi_tra+eng|psm=6|pre=v1.1|profile=dark_ui"
+        "|scale=0|ctr=1.5|shp=1.0|bin=off"
+    )
+    manifest = {"bronze": {"allowed_ocr_signatures": ["psm=6|pre=v1.1|profile=dark_ui"]}}
+    findings = audit_bronze_signatures(
+        signatures={full},
+        manifest=manifest,
+        row_count=50,
+    )
+    assert any(f.check_id == "bronze.ocr_signature" and f.level == AuditLevel.PASS for f in findings)

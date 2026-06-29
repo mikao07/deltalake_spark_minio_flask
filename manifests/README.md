@@ -36,4 +36,12 @@ python scripts/pipeline_guardian.py --dataset drinks --approve-snapshot
 
 `approved_snapshot_at` 為對外簡報／模型應使用的痛點快照時間戳；守護神會檢查其是否存在且 lexicon 與 manifest 一致。
 
+**開發期撤回發行**（僅清 manifest 指標，不刪 Delta 快照列）：
+
+```powershell
+python scripts/pipeline_guardian.py --dataset drinks --revoke-snapshot
+```
+
+或手動將 `manifests/drinks.json` 的 `gold.approved_snapshot_at`、`gold.processed_image_count` 改回 `null`。
+
 exit code：`0`=PASS，`1`=FAIL（含改動 v1.0.0 未更新 manifest），`2`=僅 WARN。

@@ -83,6 +83,9 @@ services:
       S3A_ENDPOINT_REGION: ${S3A_ENDPOINT_REGION:-us-east-1}
       ALLOWED_DELTA_PATH_PREFIXES: ${ALLOWED_DELTA_PATH_PREFIXES:-s3a://data-lake/}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    volumes:
+      - ./manifests:/app/manifests
+      - ./var:/app/var
     depends_on:
       minio:
         condition: service_started

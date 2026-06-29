@@ -1429,6 +1429,72 @@ def get_gold_topic_snapshot_latest_data(
         return []
 
 
+def get_gold_topic_snapshot_at_data(
+    snapshot_at_iso: str,
+    limit: int = 10,
+    dataset_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    讀取 Gold topic 快照表中指定 snapshot_at 的主題頻率。
+    snapshot_at_iso 須與 list_gold_topic_snapshots 回傳格式相容。
+    """
+    user_iso = str(snapshot_at_iso or "").strip()
+    if not user_iso:
+        return []
+
+    spark = SparkManager().spark
+    lim = max(1, min(int(limit), 200))
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    path = GOLD_TOPIC_SNAPSHOT_PATH
+    if not delta_table_exists(spark, path):
+        return []
+    try:
+        df = _read_delta_ignore_missing(spark, path)
+    except Exception as e:
+        _logger.warning("topic_snapshot_read_failed_at: %s", e)
+        return []
+    try:
+        if ds and "dataset_id" in df.columns:
+            df = df.filter(trim(lower(col("dataset_id"))) == lit(ds))
+        if "snapshot_at" not in df.columns:
+            return [row.asDict(recursive=True) for row in df.orderBy(col("frequency").desc()).limit(lim).collect()]
+        if not ds:
+            return []
+        resolved = _resolve_topic_snapshot_timestamp(df, ds, user_iso)
+        if resolved is None:
+            return []
+        df_at = (
+            df.filter(col("snapshot_at") == lit(resolved))
+            .orderBy(col("frequency").desc())
+            .limit(lim)
+        )
+        return [row.asDict(recursive=True) for row in df_at.collect()]
+    except Exception as e:
+        _logger.warning("topic_snapshot_collect_failed_at: %s", e)
+        return []
+
+
+def count_silver_distinct_image_paths(
+    spark,
+    dataset_id: str,
+) -> int:
+    """銀層 OCR 表內 distinct image_path 數（核准水位 processed_image_count 來源）。"""
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    if not ds:
+        return 0
+    if not delta_table_exists(spark, SILVER_OCR_TABLE_PATH):
+        return 0
+    try:
+        df = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
+        df = _filter_df_by_dataset_id(df, ds)
+        if not df.head(1):
+            return 0
+        return int(df.select("image_path").distinct().count())
+    except Exception as e:
+        _logger.warning("silver_distinct_image_count_failed: %s", e)
+        return 0
+
+
 def list_gold_topic_snapshots(
     *,
     dataset_id: str | None = None,

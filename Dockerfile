@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY app.py config.py ./
 COPY services ./services
+COPY scripts ./scripts
 COPY templates ./templates
 COPY dic ./dic
 COPY manifests ./manifests

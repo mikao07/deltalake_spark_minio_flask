@@ -40,6 +40,7 @@ from services.minio_upload import (
     upload_file_bytes,
 )
 from services.readiness import build_ready_payload, resolve_include_spark
+from services.release_contract import load_release_context
 from services.async_jobs import job_registry, job_to_public_dict
 from services.etl_metrics import append_etl_metric, read_etl_metrics
 from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest, normalize_psm
@@ -63,6 +64,7 @@ from services.spark_service import (
     get_gold_delta_table_preview,
     get_gold_topic_snapshot_comparison,
     list_gold_topic_snapshots,
+    get_gold_topic_snapshot_at_data,
     get_gold_topic_snapshot_latest_data,
     get_gold_tfidf_keywords_data,
     get_gold_phrase_candidates_data,
@@ -890,14 +892,59 @@ def index():
     topic_snapshot_options: List[str] = []
     selected_topic_snapshots = [s.strip() for s in request.args.getlist("topic_snapshot") if s and s.strip()]
     topic_hint: str | None = None
+    snapshot_mode_raw = request.args.get("snapshot_mode", "release").strip().lower()
+    snapshot_mode = "preview" if snapshot_mode_raw == "preview" else "release"
+    release_context: Dict[str, Any] = {}
+    latest_snapshot_at: str | None = None
+
+    if selected_dataset_id:
+        try:
+            release_context = load_release_context(selected_dataset_id)
+        except Exception as e:
+            _logger.warning("release_context_load_failed: %s", e)
+
     try:
         topic_snapshot_options = list_gold_topic_snapshots(dataset_id=selected_dataset_id, limit=30)
+        if topic_snapshot_options:
+            latest_snapshot_at = topic_snapshot_options[0]
         if selected_topic_snapshots:
             topic_compare_rows = get_gold_topic_snapshot_comparison(
                 dataset_id=selected_dataset_id,
                 snapshots=selected_topic_snapshots,
             )
-        topic_rows = get_gold_topic_snapshot_latest_data(limit=15, dataset_id=selected_dataset_id)
+        if snapshot_mode == "preview":
+            topic_rows = get_gold_topic_snapshot_latest_data(limit=15, dataset_id=selected_dataset_id)
+            topic_hint = "最新預覽：每次 Gold ETL 的最新 snapshot_at，未經核准，不可作為對外發行版。"
+            if latest_snapshot_at:
+                topic_hint += f" 快照時間：{latest_snapshot_at}"
+        elif not selected_dataset_id:
+            topic_rows = []
+            topic_hint = "發行版需選擇 dataset_id（勿選「全部資料」）。"
+        else:
+            approved = release_context.get("approved_snapshot_at")
+            if not approved:
+                topic_rows = []
+                topic_hint = (
+                    "尚無發行版：manifest 未設定 approved_snapshot_at。"
+                    "請執行 pipeline_guardian --approve-snapshot，或切換至「最新預覽」調參。"
+                )
+            else:
+                topic_rows = get_gold_topic_snapshot_at_data(
+                    approved,
+                    limit=15,
+                    dataset_id=selected_dataset_id,
+                )
+                if not topic_rows:
+                    topic_hint = (
+                        f"找不到核准快照資料（approved_snapshot_at={approved}），"
+                        "請重跑 Gold 或重新核准。"
+                    )
+                else:
+                    rid = release_context.get("release_id") or "-"
+                    topic_hint = f"發行版 release_id={rid}，核准快照 {approved}"
+                    pic = release_context.get("processed_image_count")
+                    if pic is not None:
+                        topic_hint += f"，發行水位 processed_image_count={pic}"
     except Exception as e:
         _logger.warning("topic_snapshot_preview_failed: %s", e)
         topic_rows = []
@@ -918,6 +965,9 @@ def index():
         topic_snapshot_options=topic_snapshot_options,
         selected_topic_snapshots=selected_topic_snapshots,
         topic_hint=topic_hint,
+        snapshot_mode=snapshot_mode,
+        release_context=release_context,
+        latest_snapshot_at=latest_snapshot_at,
         tfidf_table_path=GOLD_TFIDF_KEYWORDS_PATH,
         phrase_table_path=GOLD_PHRASE_CANDIDATES_PATH,
         topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,

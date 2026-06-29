@@ -16,6 +16,7 @@
     "exploration_lexicon_version": "dev",
     "exploration_lexicon_content_hash": "bdb17898adc2304ca9d6bbf6644407a939c4511692093c3730cd78c97eeb0078",
     "topic_rule_version": "v1.4.1-drinks-funnel-invoice",
-    "approved_snapshot_at": null
+    "approved_snapshot_at": "2026-06-23T05:29:04.667911",
+    "processed_image_count": 50
   }
 }

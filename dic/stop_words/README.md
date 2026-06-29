@@ -27,7 +27,8 @@ Silver tokens
 ## 維護節奏
 
 - **調 TF-IDF 雜詞**：只改 `dev/{dataset_id}.txt` → 重跑 Gold（不動 manifest 黃金 hash）
-- **升級黃金發行**：複製 dev → `v1.0.0` 或 bump 版本 → 更新 `manifests/{dataset}.json` 的 `lexicon_content_hash` → 重跑 Gold
+- **升級黃金發行**：複製 dev → `v1.0.0` 或 bump 版本 → 更新 `manifests/{dataset}.json` 的 `lexicon_content_hash` → 重跑 Gold → `--approve-snapshot`
+- **開發期撤回發行**：`--revoke-snapshot`（不刪 Delta；首頁改看「最新預覽」）
 - 守護神：`python scripts/pipeline_guardian.py --dataset drinks --offline`
 
 內建 fallback：`services/domain_lexicons.py`（兩版詞表皆會合併內建詞）。

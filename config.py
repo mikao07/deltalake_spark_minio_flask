@@ -167,3 +167,22 @@ OCR_AB_RESULTS_PATH = os.getenv(
 # 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
 UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()
 
+# 管線新鮮度／外部探針（cron：pipeline_freshness_check.py）
+PIPELINE_HEARTBEAT_FILE = os.getenv("PIPELINE_HEARTBEAT_FILE", "var/pipeline_heartbeat.json")
+PIPELINE_FRESHNESS_STATE_FILE = os.getenv(
+    "PIPELINE_FRESHNESS_STATE_FILE",
+    "var/pipeline_freshness_state.json",
+)
+FRESHNESS_STALE_HOURS = _env_float("FRESHNESS_STALE_HOURS", 12.0)
+
+# 管線探針／告警（cron：pipeline_probe.py）
+PIPELINE_PROBE_LAST_FILE = os.getenv("PIPELINE_PROBE_LAST_FILE", "var/pipeline_probe_last.json")
+PIPELINE_PROBE_READY_URL = os.getenv("PIPELINE_PROBE_READY_URL", "").strip()
+# none | discord | line_notify
+PIPELINE_NOTIFY_BACKEND = os.getenv("PIPELINE_NOTIFY_BACKEND", "none").strip().lower()
+PIPELINE_NOTIFY_WEBHOOK_URL = os.getenv("PIPELINE_NOTIFY_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# LINE Messaging API（Notify 已停服；Bot push 至指定 User ID）
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_PUSH_USER_ID = os.getenv("LINE_PUSH_USER_ID", "").strip()
+

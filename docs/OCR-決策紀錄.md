@@ -16,6 +16,11 @@
 | 管線守護神 + `manifests/drinks.json` | ✅ 已完成 |
 | `approved_snapshot_at` 核准快照 | ✅ 已完成 |
 | `/layers` 黃金／探索雙軌辭典 UI | ✅ 已完成 |
+| 首頁發行版｜最新預覽（發行契約閉環） | ✅ 已完成 |
+| 條件式新鮮度（圖片水位差）+ 外部 cron | ✅ 已完成 |
+| 開發期撤回發行 `--revoke-snapshot` | ✅ 已完成 |
+| 外部探針 + 可換通知後端（Discord／LINE Notify） | ✅ 已完成（`pipeline_probe.py`） |
+| Compose `manifests`／`var` volume 掛載 | ✅ 已完成 |
 | Compose 全檔 OCR 環境變數明列 | ✅ 三份 compose 已對齊 |
 | per-row `ocr_signature` | ✅ UDF 依實際 profile 產生 |
 | Bronze 子集 MERGE | ✅ `write_mode=merge` + `image_paths` |
@@ -40,7 +45,7 @@
 | `analytics_tokens` | **黃金發行** `v1.0.0/` | 痛點漏斗（`effective_stop = 停用詞 − 痛點保護詞`）→ 主題快照 |
 | `tfidf_exploration_tokens` | **探索測試** `dev/` | Phase A TF-IDF（探索停用詞 + 虛詞，**不**扣痛點保護） |
 
-**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版（`approved_snapshot_at` 對應的 `topic_snapshot`）；探索軌可持續調詞。
+**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版（`approved_snapshot_at` 對應的 `topic_snapshot`）；探索軌可持續調詞。首頁預設 **發行版**，可切換 **最新預覽**；無核准時不靜默 fallback 至 latest。
 
 ---
 
@@ -109,7 +114,10 @@
 | `SILVER_TRANSFORM_VERSION` | Silver → Gold |
 | 探索停用詞（`dev/`） | **Gold**（不更新 manifest） |
 | 黃金發行停用詞（`v1.0.0/`）／痛點規則 | **Gold** + 更新 `manifests/*.json` |
-| 核准痛點快照 | `pipeline_guardian.py --approve-snapshot`（寫入 `approved_snapshot_at`） |
+| 核准痛點快照 | `pipeline_guardian.py --approve-snapshot`（寫入 `approved_snapshot_at` + `processed_image_count`） |
+| 撤回發行（開發期） | `pipeline_guardian.py --revoke-snapshot`（清 manifest 指標；不刪 Delta 快照列） |
+| 新鮮度探針（cron） | `scripts/pipeline_freshness_check.py drinks` → `var/pipeline_heartbeat.json` |
+| 外部探針 + 通知 | `scripts/pipeline_probe.py drinks --strict`（`PIPELINE_NOTIFY_BACKEND`） |
 
 ---
 
@@ -120,5 +128,8 @@
 - `services/text_tokens.py` — 銀層清洗與分詞
 - `services/lexicon.py` — Gold 雙版本停用詞與 TF-IDF 探索過濾
 - `services/pipeline_guardian.py` — 管線守護神（銅銀品質、黃金 lexicon hash）
-- `manifests/drinks.json` — 黃金發行 manifest（含 `approved_snapshot_at`）
+- `services/pipeline_freshness.py` — 條件式新鮮度與 heartbeat
+- `services/pipeline_notify.py` — 可換後端告警（discord／line_messaging）
+- `scripts/pipeline_probe.py` — 外部探針（ready + guardian + freshness）
+- `manifests/drinks.json` — 黃金發行 manifest（含 `approved_snapshot_at`、`processed_image_count`）
 - `templates/includes/dictionary_status_panel.html` — `/layers` 雙軌辭典狀態
