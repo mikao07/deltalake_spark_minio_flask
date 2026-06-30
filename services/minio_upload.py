@@ -94,7 +94,9 @@ def list_dataset_ids(*, max_scan: int = 5000) -> list[str]:
     return sorted(out)
 
 
-_IMAGE_OBJECT_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+from services.media_validation import SUPPORTED_IMAGE_EXTENSIONS, validate_raw_image_upload
+
+_IMAGE_OBJECT_SUFFIXES = tuple(SUPPORTED_IMAGE_EXTENSIONS)
 
 
 def count_raw_image_objects_for_dataset(
@@ -217,6 +219,7 @@ def upload_file_bytes(
 
     on_duplicate: None 時使用 config.UPLOAD_ON_DUPLICATE（預設 suffix：同名已存在則改檔名加時間戳）。
     """
+    validate_raw_image_upload(filename, data, content_type=content_type)
 
     client = get_minio_client()
     ensure_bucket(client, BUCKET_NAME)

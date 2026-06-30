@@ -105,6 +105,31 @@ def test_upload_images_requires_dataset_id(monkeypatch):
     assert "dataset_id" in r.get_json()["error"]
 
 
+def test_upload_images_rejects_video(monkeypatch):
+    c = _client(monkeypatch)
+    mp4_head = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 16
+    data = {
+        "dataset_id": "drinks",
+        "file": (BytesIO(mp4_head), "clip.mp4"),
+    }
+    r = c.post("/api/upload/images", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert "影片" in r.get_json()["error"]
+
+
+def test_upload_images_rejects_renamed_video(monkeypatch):
+    c = _client(monkeypatch)
+    mp4_head = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 16
+    data = {
+        "dataset_id": "drinks",
+        "file": (BytesIO(mp4_head), "looks_like.png"),
+    }
+    r = c.post("/api/upload/images", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert "影片" in err or "圖片" in err
+
+
 def test_delta_ocr_bronze_run_dry_run_no_spark(monkeypatch):
     c = _client(monkeypatch)
     r = c.post(

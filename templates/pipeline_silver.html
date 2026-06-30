@@ -24,8 +24,13 @@
 
       <h1 class="h4 mb-2">銀層 Silver：物理清洗、分詞與 MERGE</h1>
       <p class="text-muted small mb-3">
-        從 Bronze OCR 讀取 → <code>cleaned_text</code>（物理清洗）→ Jieba + 內建虛詞 → 冪等 <code>tokens</code> → MERGE 至
-        <code>{{ silver_path }}</code>。ETL 完成後會跑<strong>品質閘門</strong>（領域停用詞在 Gold 套用）。
+        從 Bronze OCR 讀取 → <strong>Bronze 列級隔離</strong>（無效 OCR 寫入
+        <code>{{ bronze_quarantine_path }}</code>）→ <code>cleaned_text</code> → Jieba → MERGE 至
+        <code>{{ silver_path }}</code>。ETL 完成後另跑<strong>銀層品質閘門</strong>（領域停用詞在 Gold 套用）。
+      </p>
+      <p class="text-muted small mb-3">
+        <strong>三層熔斷</strong>（預設 soft）：≤10% 僅隔離；>10% 軟熔斷（好列仍進 Silver、擋核准、WARN 通知）；
+        ≥30% 硬熔斷（不進 Silver、ALERT）。門檻見 <code>BRONZE_QUARANTINE_*</code>。
       </p>
       <div class="alert alert-info small py-2 mb-4">
         <strong>建議下一步：</strong>
@@ -75,6 +80,43 @@
         <div class="card-header py-2"><strong>分詞與辭典狀態</strong></div>
         <div class="card-body small">
           {% include 'includes/dictionary_status_panel.html' %}
+        </div>
+      </section>
+
+      <section class="card shadow-sm mb-4">
+        <div class="card-header py-2"><strong>Bronze 隔離區預覽（quarantine）</strong></div>
+        <div class="card-body">
+          <p class="small text-muted mb-2">
+            路徑：<code>{{ bronze_quarantine_path }}</code> · 列級 <code>ocr_status</code> 非 ok 的資料（仍可稽核，不進 Silver）。
+          </p>
+          {% if quarantine_error %}
+            <div class="alert alert-warning py-2 small mb-0">讀取失敗：{{ quarantine_error }}</div>
+          {% elif quarantine_rows and quarantine_rows|length > 0 %}
+            <div class="table-scroll border rounded">
+              <table class="table table-sm table-striped mb-0 align-middle">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    {% for k in quarantine_rows[0].keys() %}
+                      <th class="small">{{ k }}</th>
+                    {% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in quarantine_rows %}
+                    <tr>
+                      {% for k, v in row.items() %}
+                        <td class="small text-break">
+                          {% if v is none %}-{% elif k == 'extracted_text' %}{% set s = v | string %}{{ s[:200] }}{% if s|length > 200 %}…{% endif %}{% else %}{{ v }}{% endif %}
+                        </td>
+                      {% endfor %}
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="text-muted small mb-0">目前無隔離列（或尚未執行過含隔離的 Silver ETL）。</p>
+          {% endif %}
         </div>
       </section>
 
@@ -270,7 +312,7 @@
           return;
         }
         note.className = "small text-muted mt-2 mb-0";
-        note.textContent = "Silver ETL 執行中（完成後會跑品質閘門）…";
+        note.textContent = "Silver ETL 執行中（Bronze 隔離 → 銀層品質閘門）…";
         try {
           const res = await fetch("/delta/silver/ocr/run", {
             method: "POST",
@@ -284,14 +326,20 @@
           } catch (_) {}
 
           const quality = data.silver_quality || null;
+          const bq = data.bronze_quarantine || null;
           if (quality) renderSilverQuality(quality);
 
           if (!res.ok) {
             note.className = "small text-danger mt-2 mb-0";
             const errMsg = (data && data.error) || txt || res.statusText;
             if (res.status === 422) {
-              note.textContent =
-                "Silver ETL 已寫入，但品質閘門未通過（見上方紅色面板）：" + errMsg;
+              if (data.status === "bronze_quarantine_failed") {
+                note.textContent =
+                  "Bronze 硬熔斷（隔離占比達紅線，未進 Silver）：" + errMsg;
+              } else {
+                note.textContent =
+                  "Silver ETL 已寫入，但品質閘門未通過（見上方紅色面板）：" + errMsg;
+              }
             } else {
               note.textContent = "Silver ETL 失敗：" + errMsg;
             }
@@ -302,7 +350,15 @@
             data.updated_rows !== undefined && data.updated_rows !== null ? data.updated_rows : "—";
           const warnCount = quality && quality.warnings ? quality.warnings.length : 0;
           const mergeNote = data.merge_note || "";
-          if (rows === 0 || rows === "0") {
+          const softMelt = data.status === "warning" || (bq && bq.melt_action === "soft");
+          if (softMelt) {
+            note.className = "small text-warning mt-2 mb-0 fw-semibold";
+            note.textContent =
+              (data.warning || bq.message || "Bronze 軟熔斷：隔離占比過高，不可核准發行版。") +
+              " updated_rows=" +
+              rows +
+              "。請檢查 quarantine 後再跑 Gold；核准發行版已暫時封鎖。";
+          } else if (rows === 0 || rows === "0") {
             note.className = "small text-warning mt-2 mb-0";
             note.textContent =
               mergeNote ||

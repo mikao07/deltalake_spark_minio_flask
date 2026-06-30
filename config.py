@@ -124,6 +124,20 @@ SILVER_TOP_TOKEN_DENYLIST = tuple(
     if w.strip()
 )
 
+# Bronze 列級隔離（Silver ETL 前；寫入 quarantine Delta）
+BRONZE_QUARANTINE_ENABLED = _env_bool("BRONZE_QUARANTINE_ENABLED", True)
+BRONZE_QUARANTINE_PATH = os.getenv(
+    "BRONZE_QUARANTINE_PATH",
+    "s3a://data-lake/bronze/quarantine/",
+)
+BRONZE_QUARANTINE_MAX_REJECT_RATE = _env_float("BRONZE_QUARANTINE_MAX_REJECT_RATE", 0.10)
+BRONZE_QUARANTINE_HARD_REJECT_RATE = _env_float("BRONZE_QUARANTINE_HARD_REJECT_RATE", 0.30)
+BRONZE_QUARANTINE_MIN_TEXT_LEN = int(os.getenv("BRONZE_QUARANTINE_MIN_TEXT_LEN", "4"))
+# soft：隔離占比高時好列仍進 Silver、擋核准；hard：>軟門檻即整批不進 Silver
+BRONZE_QUARANTINE_MELT_MODE = os.getenv("BRONZE_QUARANTINE_MELT_MODE", "soft").strip().lower()
+if BRONZE_QUARANTINE_MELT_MODE not in ("soft", "hard"):
+    BRONZE_QUARANTINE_MELT_MODE = "soft"
+
 # Notebook：RAW_IMAGE_PREFIX（用於拼 RAW_IMAGES_PATH）
 RAW_IMAGE_PREFIX = os.getenv("RAW_IMAGE_PREFIX", "raw/images/")
 

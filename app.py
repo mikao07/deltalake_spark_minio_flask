@@ -20,6 +20,7 @@ except Exception:
 
 from config import (
     BUCKET_NAME,
+    BRONZE_QUARANTINE_PATH,
     BRONZE_TABLE_PATH,
     GOLD_TOPIC_SNAPSHOT_PATH,
     GOLD_TFIDF_KEYWORDS_PATH,
@@ -33,6 +34,7 @@ from config import (
     SILVER_OCR_TABLE_PATH,
 )
 from services.minio_upload import (
+    count_raw_image_objects_for_dataset,
     ensure_bucket,
     get_minio_client,
     list_dataset_ids,
@@ -52,6 +54,7 @@ from services.ocr_psm_ab import (
     read_raw_image_bytes,
     run_ocr_psm_ab,
 )
+from services.bronze_quarantine import BronzeQuarantineError
 from services.silver_quality import SilverQualityError
 from services.spark_service import (
     SparkManager,
@@ -60,6 +63,7 @@ from services.spark_service import (
     deduplicate_bronze_table,
     delete_older_than_latest_batch,
     get_bronze_data,
+    get_bronze_quarantine_data,
     get_dictionary_usage_status,
     get_gold_delta_table_preview,
     get_gold_topic_snapshot_comparison,
@@ -78,6 +82,7 @@ from services.spark_service import (
     run_gold_corpus_analytics_etl,
     run_gold_topic_snapshot_rebuild_etl,
     delete_gold_topic_snapshot_rows,
+    count_silver_distinct_image_paths,
 )
 
 app = Flask(__name__)
@@ -466,6 +471,19 @@ def ready():
     return jsonify(body), code
 
 
+def _safe_bronze_quarantine_preview(
+    dataset_id: str | None = None,
+    *,
+    limit: int = 15,
+    newest_first: bool = True,
+):
+    try:
+        return get_bronze_quarantine_data(limit=limit, dataset_id=dataset_id, newest_first=newest_first), None
+    except Exception as e:
+        _logger.warning("bronze_quarantine_preview_failed: %s", e)
+        return [], str(e)
+
+
 def _safe_bronze_preview(
     dataset_id: str | None = None,
     *,
@@ -556,6 +574,51 @@ def _latest_etl_metric_for(etl_name: str, dataset_id: str | None) -> Dict[str, A
     return None
 
 
+def _bronze_quarantine_for_metric(payload: Any) -> Dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("skipped"):
+        return {
+            "skipped": True,
+            "reason": payload.get("reason"),
+            "passed": True,
+        }
+    return {
+        "passed": bool(payload.get("passed")),
+        "reject_rate": payload.get("reject_rate"),
+        "reject_rows": payload.get("reject_rows"),
+        "total_rows": payload.get("total_rows"),
+        "ok_rows": payload.get("ok_rows"),
+        "analyzed_rows": payload.get("analyzed_rows"),
+        "by_status": dict(payload.get("by_status") or {}),
+        "quarantined_rows_written": payload.get("quarantined_rows_written"),
+        "quarantine_path": payload.get("quarantine_path"),
+        "melted": payload.get("melted"),
+        "melt_action": payload.get("melt_action"),
+        "melt_reason": payload.get("melt_reason"),
+        "message": payload.get("message"),
+        "high_reject_rate": payload.get("high_reject_rate"),
+        "approve_blocked": payload.get("approve_blocked"),
+    }
+
+
+def _corpus_coverage_for_dataset(dataset_id: str | None) -> Dict[str, Any] | None:
+    """MinIO 原圖數 vs Silver 已分析圖數（母體完整度）。"""
+    if not dataset_id:
+        return None
+    try:
+        raw_count = count_raw_image_objects_for_dataset(dataset_id)
+        silver_count = count_silver_distinct_image_paths(_get_spark_manager().spark, dataset_id)
+        return {
+            "raw_image_count": raw_count,
+            "analyzed_image_count": silver_count,
+            "coverage_label": f"有效 OCR：{silver_count}/{raw_count}",
+        }
+    except Exception as e:
+        _logger.warning("corpus_coverage_failed: %s", e)
+        return {"error": str(e), "dataset_id": dataset_id}
+
+
 def _silver_quality_for_metric(quality: Any) -> Dict[str, Any] | None:
     """精簡 silver_quality 供 JSONL／頁面顯示。"""
     if not isinstance(quality, dict):
@@ -622,6 +685,11 @@ def pipeline_silver_page():
         newest_first=True,
     )
     bronze_rows, _ = _safe_bronze_preview(limit=1, dataset_id=selected, newest_first=True)
+    quarantine_rows, quarantine_error = _safe_bronze_quarantine_preview(
+        limit=preview_limit,
+        dataset_id=selected,
+        newest_first=True,
+    )
     dictionary_status: Dict[str, Any] = {}
     try:
         dictionary_status = get_dictionary_usage_status(_get_spark_manager().spark, selected)
@@ -644,6 +712,9 @@ def pipeline_silver_page():
         dictionary_status=dictionary_status,
         latest_silver_metric=_latest_etl_metric_for("silver_ocr_etl", selected),
         latest_silver_quality=_latest_silver_quality_for_dataset(selected),
+        bronze_quarantine_path=BRONZE_QUARANTINE_PATH,
+        quarantine_rows=quarantine_rows,
+        quarantine_error=quarantine_error,
         **ctx,
     )
 
@@ -950,6 +1021,8 @@ def index():
         topic_rows = []
         topic_compare_rows = []
 
+    corpus_coverage = _corpus_coverage_for_dataset(selected_dataset_id)
+
     return render_template(
         TEMPLATE_INDEX,
         cpu_percent=sys_status.get("cpu_percent"),
@@ -968,6 +1041,7 @@ def index():
         snapshot_mode=snapshot_mode,
         release_context=release_context,
         latest_snapshot_at=latest_snapshot_at,
+        corpus_coverage=corpus_coverage,
         tfidf_table_path=GOLD_TFIDF_KEYWORDS_PATH,
         phrase_table_path=GOLD_PHRASE_CANDIDATES_PATH,
         topic_snapshot_path=GOLD_TOPIC_SNAPSHOT_PATH,
@@ -1819,7 +1893,42 @@ def delta_silver_ocr_run():
                 "silver_ocr_path": silver_ocr_path,
                 "silver_transform_version": result.get("silver_transform_version"),
                 "silver_quality": _silver_quality_for_metric(result.get("silver_quality")),
+                "bronze_quarantine": _bronze_quarantine_for_metric(result.get("bronze_quarantine")),
             }
+        )
+        bq = _bronze_quarantine_for_metric(result.get("bronze_quarantine"))
+        response: Dict[str, Any] = {"status": "ok", **result}
+        if bq and bq.get("melt_action") == "soft":
+            response["status"] = "warning"
+            response["warning"] = bq.get("message") or (
+                "Bronze 軟熔斷：隔離占比過高，好列已進 Silver，但不可核准發行版。"
+            )
+        return jsonify(response)
+    except BronzeQuarantineError as e:
+        quarantine_payload = _bronze_quarantine_for_metric(getattr(e, "report", None)) or {
+            "passed": False,
+            "melted": True,
+            "reject_rate": None,
+        }
+        quarantine_payload["hard_failures"] = [str(e)]
+        _record_etl_metric(
+            {
+                "etl_name": "silver_ocr_etl",
+                "dataset_id": dataset_id,
+                "status": "bronze_quarantine_failed",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+                "bronze_quarantine": quarantine_payload,
+            }
+        )
+        _logger.error("bronze_quarantine_failed: %s", e)
+        return _json_error(
+            f"Bronze 隔離熔斷：{e}",
+            422,
+            status="bronze_quarantine_failed",
+            bronze_quarantine=quarantine_payload,
         )
     except SilverQualityError as e:
         quality_payload = _silver_quality_for_metric(getattr(e, "report", None)) or {
@@ -1861,7 +1970,6 @@ def delta_silver_ocr_run():
         )
         _logger.exception("silver_ocr_run_failed")
         return _json_error(f"Silver OCR ETL 失敗：{e}", 500)
-    return jsonify({"status": "ok", **result})
 
 
 @app.post("/delta/gold/topic-snapshot/rebuild")
@@ -2342,13 +2450,11 @@ def delta_ocr_bronze_run():
         return _json_error(f"OCR 攝入失敗：{e}", 500)
 
 
-_ALLOWED_IMAGE_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"})
-
-
 @app.post("/api/upload/images")
 def api_upload_images():
     """
     multipart/form-data 上傳圖片至 MinIO（bucket=BUCKET_NAME，前綴 RAW_IMAGE_PREFIX）。
+    僅接受靜態圖片；影片副檔名、video/* MIME、影片檔頭或假圖片一律拒絕（寫入前驗證）。
 
     表單欄位：
     - file：單檔，或
@@ -2365,8 +2471,6 @@ def api_upload_images():
     err = _require_admin_token_if_configured()
     if err:
         return err
-
-    from pathlib import Path
 
     dataset_id = (request.form.get("dataset_id") or "").strip().lower()
     if not dataset_id:
@@ -2397,9 +2501,6 @@ def api_upload_images():
         if not f or not f.filename:
             continue
         name = f.filename
-        ext = Path(name).suffix.lower()
-        if ext not in _ALLOWED_IMAGE_EXT:
-            return _json_error(f"不支援的副檔名：{ext}（允許：{sorted(_ALLOWED_IMAGE_EXT)}）", 400)
 
         data = f.read(max_bytes + 1)
         if len(data) > max_bytes:

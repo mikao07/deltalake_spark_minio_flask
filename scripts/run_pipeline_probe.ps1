@@ -1,5 +1,8 @@
 # 管線外部探針（供 Windows 工作排程器呼叫）
 #
+# 檢查：ready + guardian + freshness；FAIL 時經 pipeline_notify 發送。
+# 註：Bronze 軟／硬熔斷通知在 Silver ETL 當下即時發送，不由本探針取代。
+#
 # 用法：
 #   .\scripts\run_pipeline_probe.ps1
 #   .\scripts\run_pipeline_probe.ps1 -Dataset drinks

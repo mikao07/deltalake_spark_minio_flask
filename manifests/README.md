@@ -36,6 +36,8 @@ python scripts/pipeline_guardian.py --dataset drinks --approve-snapshot
 
 `approved_snapshot_at` 為對外簡報／模型應使用的痛點快照時間戳；守護神會檢查其是否存在且 lexicon 與 manifest 一致。
 
+**核准前 Bronze 熔斷檢查**：若最近一次 `silver_ocr_etl` 觸發 Bronze **軟熔斷**（隔離占比 >10%）或 **硬熔斷**，`--approve-snapshot` 會以繁中錯誤拒絕。請先處理 `bronze/quarantine/` 與資料問題、重跑 Silver，再核准。
+
 **開發期撤回發行**（僅清 manifest 指標，不刪 Delta 快照列）：
 
 ```powershell

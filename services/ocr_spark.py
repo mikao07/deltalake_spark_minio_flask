@@ -42,7 +42,13 @@ from services.domain_lexicons import (
 )
 from services.minio_upload import ensure_bucket, get_minio_client
 
-_SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
+from services.media_validation import (
+    SUPPORTED_IMAGE_EXTENSIONS,
+    has_supported_image_extension,
+    looks_like_image_bytes,
+)
+
+_SUPPORTED_IMAGE_EXTS = tuple(SUPPORTED_IMAGE_EXTENSIONS)
 _VALID_PSM = frozenset(str(i) for i in range(14))
 _OCR_RESULT_SCHEMA = StructType(
     [
@@ -62,27 +68,11 @@ def normalize_psm(psm: str | None, *, default: str | None = None) -> str:
 
 
 def _has_supported_image_extension(path: str) -> bool:
-    p = (path or "").strip().lower()
-    return any(p.endswith(ext) for ext in _SUPPORTED_IMAGE_EXTS)
+    return has_supported_image_extension(path)
 
 
 def _looks_like_image_bytes(data: bytes) -> bool:
-    """
-    以常見檔頭判斷是否為圖片，避免非圖片檔混入 OCR。
-    """
-    if not data:
-        return False
-    sig = bytes(data[:16])
-    return (
-        sig.startswith(b"\x89PNG\r\n\x1a\n")
-        or sig.startswith(b"\xff\xd8\xff")  # JPEG
-        or sig.startswith(b"GIF87a")
-        or sig.startswith(b"GIF89a")
-        or sig.startswith(b"BM")  # BMP
-        or (len(sig) >= 12 and sig[0:4] == b"RIFF" and sig[8:12] == b"WEBP")
-        or sig.startswith(b"II*\x00")  # TIFF little-endian
-        or sig.startswith(b"MM\x00*")  # TIFF big-endian
-    )
+    return looks_like_image_bytes(data)
 
 
 def _env_float(name: str, default: float) -> float:

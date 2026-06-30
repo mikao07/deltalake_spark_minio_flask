@@ -40,6 +40,7 @@ from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
 from config import (
+    BRONZE_QUARANTINE_PATH,
     BRONZE_TABLE_PATH,
     GOLD_TFIDF_KEYWORDS_PATH,
     GOLD_PHRASE_CANDIDATES_PATH,
@@ -83,6 +84,7 @@ from services.lexicon import (
     parse_stopwords_lines,
 )
 from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
+from services.bronze_quarantine import BronzeQuarantineError, apply_bronze_quarantine_gate
 from services.silver_quality import evaluate_gold_downstream_quality, run_silver_quality_gate
 from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
 
@@ -353,6 +355,26 @@ def _silver_cleaned_text_expr(source_col: str = "extracted_text"):
     )
 
 
+def prepare_bronze_deduped_for_silver(
+    df_bronze: DataFrame,
+    *,
+    dataset_id: str | None = None,
+) -> DataFrame:
+    """Bronze 去重（每 image_path 取最新 ingestion）並 trim extracted_text。"""
+    ds = _normalize_dataset_id_or_none(dataset_id)
+    df = df_bronze.filter(col("extracted_text").isNotNull())
+    if ds:
+        df = _filter_df_by_dataset_id(df, ds)
+
+    w = Window.partitionBy(col("image_path")).orderBy(col("ingestion_timestamp").desc())
+    df = df.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
+    df = df.withColumn("extracted_text", trim(col("extracted_text")))
+    df = _extract_dataset_id_col(df)
+    if ds:
+        df = df.withColumn("dataset_id", lit(ds))
+    return df.withColumnRenamed("ingestion_timestamp", "latest_ingestion_timestamp")
+
+
 def build_silver_ocr_updates_from_bronze(
     df_bronze: DataFrame,
     *,
@@ -362,30 +384,14 @@ def build_silver_ocr_updates_from_bronze(
     Bronze OCR -> Silver 更新集（去重、保留原文）。
     標點清理與分詞在 enrich_silver_dataframe_with_tokens 產出 cleaned_text / tokens。
     """
-    ds = _normalize_dataset_id_or_none(dataset_id)
-    df = df_bronze.filter(col("extracted_text").isNotNull())
-    if ds:
-        df = _filter_df_by_dataset_id(df, ds)
-
-    w = Window.partitionBy(col("image_path")).orderBy(col("ingestion_timestamp").desc())
-    df = (
-        df.withColumn("rn", row_number().over(w))
-        .filter(col("rn") == 1)
-        .drop("rn")
-        .select(
-            "image_path",
-            "extracted_text",
-            "source_bucket",
-            col("ingestion_timestamp").alias("latest_ingestion_timestamp"),
-        )
+    df = prepare_bronze_deduped_for_silver(df_bronze, dataset_id=dataset_id)
+    return df.select(
+        "image_path",
+        "extracted_text",
+        "source_bucket",
+        col("latest_ingestion_timestamp"),
+        "dataset_id",
     )
-
-    # Bronze 原文僅 trim；勿用 Java \W 剝首尾（會誤刪 CJK 正文）。
-    df = df.withColumn("extracted_text", trim(col("extracted_text")))
-    df = _extract_dataset_id_col(df)
-    if ds:
-        df = df.withColumn("dataset_id", lit(ds))
-    return df
 
 
 def _make_silver_tokens_udf(
@@ -501,7 +507,21 @@ def run_silver_ocr_etl(
     ds = _normalize_dataset_id_or_none(dataset_id)
 
     df_bronze = read_delta_table(spark, bronze)
-    df_updates = build_silver_ocr_updates_from_bronze(df_bronze, dataset_id=ds)
+    df_prep = prepare_bronze_deduped_for_silver(df_bronze, dataset_id=ds)
+    df_prep, bronze_quarantine = apply_bronze_quarantine_gate(
+        spark,
+        df_prep,
+        quarantine_path=BRONZE_QUARANTINE_PATH,
+        bronze_path=bronze,
+        dataset_id=ds,
+    )
+    df_updates = df_prep.select(
+        "image_path",
+        "extracted_text",
+        "source_bucket",
+        col("latest_ingestion_timestamp"),
+        "dataset_id",
+    )
 
     active_userdict_path = _resolve_existing_jieba_userdict_path(spark, ds)
     register_jieba_pyfile_if_needed(
@@ -532,6 +552,7 @@ def run_silver_ocr_etl(
             "cleaned_text_column_written": True,
             "builtin_stopwords_count": len(BUILTIN_STOPWORDS),
             "silver_transform_version": SILVER_TRANSFORM_VERSION,
+            "bronze_quarantine": bronze_quarantine,
         }
 
     batch_ts = datetime.utcnow()
@@ -625,6 +646,7 @@ def run_silver_ocr_etl(
                 "silver_transform_version": SILVER_TRANSFORM_VERSION,
                 "silver_quality": silver_quality,
                 "merge_note": "所有列與目前轉換版本一致，未寫入",
+                "bronze_quarantine": bronze_quarantine,
             }
         inserted_rows = int(df_cmp.filter(col("t._t_image_path").isNull()).count())
         updated_existing_rows = max(0, update_count - inserted_rows)
@@ -698,6 +720,7 @@ def run_silver_ocr_etl(
         "jieba_userdict_used": bool(active_userdict_path),
         "jieba_userdict_path": active_userdict_path or "",
         "silver_quality": silver_quality,
+        "bronze_quarantine": bronze_quarantine,
     }
 
 
@@ -2078,6 +2101,30 @@ def add_etl_timestamp(df: DataFrame, col_name: str = "etl_update_timestamp") -> 
 # ---------------------------------------------------------------------------
 # 核心功能
 # ---------------------------------------------------------------------------
+def get_bronze_quarantine_data(
+    limit: int = 20,
+    dataset_id: str | None = None,
+    *,
+    newest_first: bool = True,
+) -> List[Dict[str, Any]]:
+    """讀取 Bronze quarantine Delta 表（隔離列，可稽核查詢）。"""
+    spark = SparkManager().spark
+    if not delta_table_exists(spark, BRONZE_QUARANTINE_PATH):
+        return []
+    lim = max(1, min(int(limit), 200))
+    df = read_delta_table(spark, BRONZE_QUARANTINE_PATH)
+    df = _filter_df_by_dataset_id(df, dataset_id)
+    if "quarantined_at" in df.columns:
+        df = df.orderBy(
+            col("quarantined_at").desc_nulls_last()
+            if newest_first
+            else col("quarantined_at").asc_nulls_last()
+        )
+    else:
+        df = _order_df_by_time_if_present(df, newest_first=newest_first)
+    return [row.asDict(recursive=True) for row in df.limit(lim).collect()]
+
+
 def get_bronze_data(
     limit: int = 10,
     dataset_id: str | None = None,

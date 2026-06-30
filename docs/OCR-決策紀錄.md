@@ -24,6 +24,8 @@
 | Compose 全檔 OCR 環境變數明列 | ✅ 三份 compose 已對齊 |
 | per-row `ocr_signature` | ✅ UDF 依實際 profile 產生 |
 | Bronze 子集 MERGE | ✅ `write_mode=merge` + `image_paths` |
+| Bronze 列級隔離 + 三層熔斷 | ✅ `bronze_quarantine.py` → `bronze/quarantine/` |
+| 上傳源頭禁止影片 | ✅ `media_validation.py`（副檔名 + MIME + 檔頭） |
 | preset router 子集調校（階段 4） | ❌ 未執行（可選；需子集 AB） |
 
 ---
@@ -90,6 +92,30 @@
 
 **CJK 去空格實作注意**：必須使用 **Lookaround** 正則 `(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])`，且須在 **洋文白名單保護之後** 執行；不可用「刪除所有空白」，否則會誤殺 `line pay` 中間空格。
 
+### Bronze 列級隔離與三層熔斷（Silver ETL 前）
+
+| 項目 | 說明 |
+|------|------|
+| 模組 | `services/bronze_quarantine.py` |
+| 列級規則 | `ocr_status`：empty｜ocr_error｜too_short｜noise（`BARE`）｜ok |
+| 隔離表 | `BRONZE_QUARANTINE_PATH`（預設 `bronze/quarantine/`） |
+| ≤10% | 壞列 quarantine，好列進 Silver |
+| >10% 且 <30%（軟熔斷） | 好列仍進 Silver；擋 `--approve-snapshot`；WARN 通知 |
+| ≥30%（硬熔斷） | 不進 Silver；ALERT 通知 |
+| `MELT_MODE` | 預設 `soft`；`hard` 時 >10% 即硬停 |
+
+與 `silver_quality` 分工：Bronze 擋單張 OCR 無效；Silver 擋整批語料健康度。
+
+### 影像上傳（僅靜態圖、禁影片）
+
+| 項目 | 說明 |
+|------|------|
+| 模組 | `services/media_validation.py`（`upload_file_bytes` 寫入前呼叫） |
+| 允許 | PNG／JPEG／GIF／BMP／WEBP／TIFF |
+| 禁止 | 影片副檔名、`video/*`、影片檔頭、假圖片檔頭 |
+| 大小 | `MAX_UPLOAD_MB`（預設 15） |
+| 繞過 | MinIO Console／CLI 直傳不經 API；日常請走 `/api/upload/images` |
+
 ---
 
 ## 已知限制與後續方向
@@ -102,6 +128,7 @@
 | per-row `ocr_signature` | ✅ 已實作 |
 | 前處理 preset 分流 | 預設關閉；開啟前需子集 AB |
 | PaddleOCR | 架構可接；ROI 偏低時維持 Tesseract 封板 |
+| 影片上傳 | **不支援**；API 源頭拒絕；非經 API 直傳 MinIO 仍可能占空間 |
 
 ---
 
@@ -114,22 +141,28 @@
 | `SILVER_TRANSFORM_VERSION` | Silver → Gold |
 | 探索停用詞（`dev/`） | **Gold**（不更新 manifest） |
 | 黃金發行停用詞（`v1.0.0/`）／痛點規則 | **Gold** + 更新 `manifests/*.json` |
-| 核准痛點快照 | `pipeline_guardian.py --approve-snapshot`（寫入 `approved_snapshot_at` + `processed_image_count`） |
+| 核准痛點快照 | `pipeline_guardian.py --approve-snapshot`（寫入 `approved_snapshot_at` + `processed_image_count`；**Bronze 軟／硬熔斷期間拒絕**） |
 | 撤回發行（開發期） | `pipeline_guardian.py --revoke-snapshot`（清 manifest 指標；不刪 Delta 快照列） |
 | 新鮮度探針（cron） | `scripts/pipeline_freshness_check.py drinks` → `var/pipeline_heartbeat.json` |
 | 外部探針 + 通知 | `scripts/pipeline_probe.py drinks --strict`（`PIPELINE_NOTIFY_BACKEND`） |
+| Bronze 列級隔離 | Silver ETL 前；`BRONZE_QUARANTINE_PATH`；≤10% 僅隔離；>10% 軟熔斷（擋核准）；≥30% 硬熔斷 |
+| 影像上傳 | `POST /api/upload/images`；僅靜態圖；影片／假圖片在寫入 MinIO 前拒絕 |
 
 ---
 
 ## 相關模組
 
 - `services/ocr_spark.py` — 前處理、OCR、`ocr_signature`、router、broadcast
+- `services/media_validation.py` — 上傳／OCR 共用媒體驗證（僅靜態圖、禁影片）
+- `services/minio_upload.py` — 寫入 `raw/images/{dataset_id}/`
 - `services/ocr_psm_ab.py` — PSM A/B 測試（`test/ocr_psm_ab/`）
 - `services/text_tokens.py` — 銀層清洗與分詞
+- `services/bronze_quarantine.py` — Bronze 列級隔離與三層熔斷（Silver ETL 前）
+- `services/silver_quality.py` — 銀層整批品質閘門（Silver ETL 後）
 - `services/lexicon.py` — Gold 雙版本停用詞與 TF-IDF 探索過濾
-- `services/pipeline_guardian.py` — 管線守護神（銅銀品質、黃金 lexicon hash）
+- `services/pipeline_guardian.py` — 管線守護神（銅銀品質、黃金 lexicon hash、核准前熔斷檢查）
 - `services/pipeline_freshness.py` — 條件式新鮮度與 heartbeat
-- `services/pipeline_notify.py` — 可換後端告警（discord／line_messaging）
+- `services/pipeline_notify.py` — 可換後端告警（Bronze 軟／硬熔斷、探針 FAIL；discord／line_messaging）
 - `scripts/pipeline_probe.py` — 外部探針（ready + guardian + freshness）
 - `manifests/drinks.json` — 黃金發行 manifest（含 `approved_snapshot_at`、`processed_image_count`）
 - `templates/includes/dictionary_status_panel.html` — `/layers` 雙軌辭典狀態

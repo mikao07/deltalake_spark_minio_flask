@@ -624,12 +624,14 @@ def stamp_approved_snapshot(
     if spark is None:
         raise ValueError("stamp_approved_snapshot 需要 SparkSession（請勿使用 --offline）")
 
+    from services.bronze_quarantine import assert_approve_snapshot_allowed
     from services.spark_service import (
         find_latest_topic_snapshot_at_for_release,
         verify_topic_snapshot_at_for_release,
     )
 
     ds = _normalize_dataset_id(dataset_id)
+    assert_approve_snapshot_allowed(ds)
     path = resolve_manifest_path(ds, manifest_path)
     manifest = load_manifest(path)
     gold = manifest.setdefault("gold", {})

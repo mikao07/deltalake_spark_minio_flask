@@ -292,6 +292,21 @@
           {% if topic_hint %}
             <div class="alert {% if snapshot_mode == 'preview' %}alert-info{% elif topic_rows and topic_rows|length > 0 %}alert-success{% else %}alert-warning{% endif %} py-2 small mb-2">{{ topic_hint }}</div>
           {% endif %}
+          {% if corpus_coverage %}
+            <div class="alert alert-secondary py-2 small mb-2">
+              <strong>母體完整度</strong>（MinIO 原圖 vs Silver 已分析）：
+              {% if corpus_coverage.error %}
+                <span class="text-warning">無法讀取：{{ corpus_coverage.error }}</span>
+              {% else %}
+                <code>{{ corpus_coverage.coverage_label }}</code>
+                <span class="text-muted">
+                  （raw={{ corpus_coverage.raw_image_count }}，analyzed={{ corpus_coverage.analyzed_image_count }}）
+                </span>
+              {% endif %}
+            </div>
+          {% elif selected_dataset_id %}
+            <div class="alert alert-secondary py-2 small mb-2 text-muted">母體完整度：讀取中或尚無資料。</div>
+          {% endif %}
 
           {% if topic_rows and topic_rows|length > 0 %}
             <h3 class="h6 text-secondary mb-2">痛點主題分析（長條圖）</h3>

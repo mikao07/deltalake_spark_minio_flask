@@ -135,6 +135,23 @@ def test_stamp_approved_snapshot_requires_spark():
         stamp_approved_snapshot("drinks", spark=None)
 
 
+def test_stamp_approved_snapshot_blocks_soft_melt(monkeypatch):
+    import pytest
+
+    def _blocked(_ds: str) -> None:
+        raise ValueError(
+            "最近一次 Silver ETL 隔離占比過高（12.0%，軟熔斷），"
+            "有效樣本尚未完整；請修復後重跑 Silver，再執行 --approve-snapshot。"
+        )
+
+    monkeypatch.setattr(
+        "services.bronze_quarantine.assert_approve_snapshot_allowed",
+        _blocked,
+    )
+    with pytest.raises(ValueError, match="軟熔斷"):
+        stamp_approved_snapshot("drinks", spark=object())
+
+
 def test_revoke_approved_snapshot_clears_manifest(tmp_path):
     from services.pipeline_guardian import load_manifest, revoke_approved_snapshot, save_manifest
 
