@@ -221,6 +221,18 @@ flowchart TB
 | **Docker `cpus`／Spark `local[N]`** | ❌ | 曾討論，尚未制度化 |
 | **Guard 拒絕時 LINE + 冷卻**（可選） | ❌ | 非 OOM 主因 |
 
+### P4 營運調校（⚠️ 未實測）
+
+> **程式已接入**；下列數值因設備／圖量而異，**預設不改現況行為**，擴量前請在目標環境手動 smoke。
+
+| 變數 | 預設 | 調校時機 |
+|------|------|----------|
+| `OCR_TIMEOUT_SECONDS` | 30（**0=關**） | 單張 OCR 過慢或逾時誤殺 |
+| `SPARK_JOB_TIMEOUT_SECONDS` | 300（**0=關**） | 整段 ETL 掛死占滿 `ETL_MAX_CONCURRENT_JOBS` |
+| `OCR_REPARTITION` | **0** | 並行 OCR 吃滿 CPU、擴量前 |
+
+**手動 smoke（可選）**：暫設 `SPARK_JOB_TIMEOUT_SECONDS=10` 跑會卡住的 ETL → 應 HTTP 400；設 `OCR_REPARTITION=4` 跑 Bronze OCR → API `ocr_repartition_applied` 應為 4；完成後恢復 `.env` 預設。
+
 ### 系統維護 — 未完成（建議順序）
 
 | 優先 | 項目 | 說明 |
