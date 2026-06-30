@@ -52,7 +52,8 @@ def test_evaluate_schema_hard_fail_on_duplicate_keys():
     assert any("重複" in msg for msg in report.hard_failures)
 
 
-def test_evaluate_top_denylist_hard_fail():
+def test_evaluate_silver_passes_with_domain_top_tokens():
+    """銀層不應因珍珠等領域高頻詞霸 Top 而 hard fail（探索停用詞屬 Gold）。"""
     report = evaluate_silver_quality_metrics(
         {
             "total_rows": 5,
@@ -65,13 +66,14 @@ def test_evaluate_top_denylist_hard_fail():
             "total_token_instances": 50,
             "len1_token_instances": 0,
             "long_token_instances": 0,
-            "top_tokens": ["2222", "珍珠", "外送"],
+            "top_tokens": ["珍珠", "店員", "自己", "外送"],
             "empty_cleaned_text_ratio": 0.0,
             "nonempty_tokens_ratio": 0.8,
             "avg_char_retention": 0.4,
         }
     )
-    assert not report.passed
+    assert report.passed
+    assert not any(c.name == "top_token_denylist" for c in report.checks)
 
 
 def test_run_silver_quality_gate_raises_on_hard_fail(monkeypatch):

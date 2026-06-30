@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.timezone_policy import utc_now_iso
+
 _LOCK = threading.Lock()
 
 
@@ -19,7 +21,7 @@ def _metrics_file_path() -> Path:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def append_etl_metric(payload: Dict[str, Any]) -> None:

@@ -57,14 +57,19 @@
   {% endif %}
 </div>
 <div>
-  <strong>黃金發行 manifest</strong>
+  <strong>正式版登記</strong>
   {% if dictionary_status.manifest_release_id %}
-    <code class="ms-1">{{ dictionary_status.manifest_release_id }}</code>
+    <br /><span class="text-muted">版本編號</span>
+    <code class="small">{{ dictionary_status.manifest_release_id }}</code>
     {% if dictionary_status.manifest_approved_snapshot_at %}
-      <br /><span class="text-muted">核准快照</span>
-      <code class="small">{{ dictionary_status.manifest_approved_snapshot_at }}</code>
+      <br /><span class="text-muted">核准時間</span>
+      <span class="small">{{ dictionary_status.manifest_approved_snapshot_at | display_time }}</span>
+      {% if dictionary_status.manifest_processed_image_count is not none %}
+        <br /><span class="text-muted">納入截圖</span>
+        <span class="small">{{ dictionary_status.manifest_processed_image_count }} 張</span>
+      {% endif %}
     {% else %}
-      <br /><span class="text-warning">尚未核准 topic_snapshot（可執行 pipeline_guardian --approve-snapshot）</span>
+      <br /><span class="text-warning">尚未核准正式版（需執行管線守護神核准）</span>
     {% endif %}
   {% else %}
     {% if dictionary_status.dataset_id %}

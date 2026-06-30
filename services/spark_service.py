@@ -39,6 +39,8 @@ from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 
+from services.timezone_policy import format_rows_for_display, format_storage_iso, utc_now_iso
+
 from config import (
     BRONZE_QUARANTINE_PATH,
     BRONZE_TABLE_PATH,
@@ -73,6 +75,9 @@ from config import (
     SILVER_TRANSFORM_VERSION,
     STOPWORDS_EXPLORATION_LEXICON_VERSION,
     STOPWORDS_LEXICON_VERSION,
+    SPARK_DRIVER_MAX_RESULT_SIZE,
+    SPARK_DRIVER_MEMORY,
+    SPARK_EXECUTOR_MEMORY,
     TESSERACT_CMD,
 )
 from services.domain_lexicons import resolve_local_jieba_userdict_path
@@ -85,7 +90,8 @@ from services.lexicon import (
 )
 from services.pain_topic_rules import TOPIC_RULE_VERSION, label_pain_topics
 from services.bronze_quarantine import BronzeQuarantineError, apply_bronze_quarantine_gate
-from services.silver_quality import evaluate_gold_downstream_quality, run_silver_quality_gate
+from services.gold_quality import evaluate_gold_downstream_quality
+from services.silver_quality import run_silver_quality_gate
 from services.text_tokens import BUILTIN_STOPWORDS, SILVER_CLEAN_TEXT_SPARK_PATTERN
 
 _logger = logging.getLogger(__name__)
@@ -192,6 +198,10 @@ class SparkManager:
             .config("spark.driver.extraJavaOptions", "-Dfile.encoding=UTF-8")
             .config("spark.executor.extraJavaOptions", "-Dfile.encoding=UTF-8")
             .config("spark.sql.execution.python.udf.inPandas.parent.env", "PYTHONIOENCODING=UTF-8")
+            .config("spark.driver.memory", SPARK_DRIVER_MEMORY)
+            .config("spark.executor.memory", SPARK_EXECUTOR_MEMORY)
+            .config("spark.driver.maxResultSize", SPARK_DRIVER_MAX_RESULT_SIZE)
+            .config("spark.sql.session.timeZone", "UTC")
         )
         for key, value in ocr_executor_env.items():
             builder = builder.config(f"spark.executorEnv.{key}", str(value))
@@ -201,6 +211,7 @@ class SparkManager:
         # 對齊 Notebook：後續呼叫時再確保一致行為
         self.spark.conf.set("spark.executorEnv.PYTHONIOENCODING", "UTF-8")
         self.spark.conf.set("spark.sql.execution.python.udf.inPandas.parent.env", "PYTHONIOENCODING=UTF-8")
+        self.spark.conf.set("spark.sql.session.timeZone", "UTC")
         self._initialized = True
 
 
@@ -555,9 +566,6 @@ def run_silver_ocr_etl(
             "bronze_quarantine": bronze_quarantine,
         }
 
-    batch_ts = datetime.utcnow()
-    batch_ts_lit = lit(batch_ts)
-
     if delta_table_exists(spark, silver):
         # 先補 schema，再建立 DeltaTable（否則 MERGE 仍用舊欄位清單）
         _ensure_delta_columns(
@@ -654,7 +662,7 @@ def run_silver_ocr_etl(
             "extracted_text": col("source.extracted_text"),
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
-            "etl_update_timestamp": batch_ts_lit,
+            "etl_update_timestamp": current_timestamp(),
             "tokens": col("source.tokens"),
             "silver_transform_version": col("source.silver_transform_version"),
         }
@@ -663,7 +671,7 @@ def run_silver_ocr_etl(
             "extracted_text": col("source.extracted_text"),
             "source_bucket": col("source.source_bucket"),
             "ingestion_timestamp": col("source.latest_ingestion_timestamp"),
-            "etl_update_timestamp": batch_ts_lit,
+            "etl_update_timestamp": current_timestamp(),
             "tokens": col("source.tokens"),
             "silver_transform_version": col("source.silver_transform_version"),
         }
@@ -692,7 +700,7 @@ def run_silver_ocr_etl(
         update_count = update_count_raw
         (
             df_updates.withColumnRenamed("latest_ingestion_timestamp", "ingestion_timestamp")
-            .withColumn("etl_update_timestamp", batch_ts_lit)
+            .withColumn("etl_update_timestamp", current_timestamp())
             .write.format("delta")
             .mode("overwrite")
             .save(silver)
@@ -709,7 +717,7 @@ def run_silver_ocr_etl(
         "updated_rows": update_count,
         "inserted_rows": inserted_rows,
         "updated_existing_rows": updated_existing_rows,
-        "silver_batch_ts": batch_ts.isoformat(),
+        "silver_batch_ts": utc_now_iso(),
         "dataset_id": ds,
         "silver_ocr_path": silver,
         "bronze_path": bronze,
@@ -958,6 +966,7 @@ def get_dictionary_usage_status(
     exploration = lexicon.get("exploration") or {}
     manifest_release_id = ""
     manifest_approved_snapshot_at = ""
+    manifest_processed_image_count: int | None = None
     manifest_lexicon_content_hash = ""
     manifest_dataset_id = ""
     try:
@@ -976,6 +985,12 @@ def get_dictionary_usage_status(
                 manifest_approved_snapshot_at = str(gold_m.get("approved_snapshot_at") or "").strip()
                 if manifest_approved_snapshot_at.lower() == "none":
                     manifest_approved_snapshot_at = ""
+                raw_pic = gold_m.get("processed_image_count")
+                if raw_pic is not None:
+                    try:
+                        manifest_processed_image_count = int(raw_pic)
+                    except (TypeError, ValueError):
+                        manifest_processed_image_count = None
                 manifest_lexicon_content_hash = str(gold_m.get("lexicon_content_hash") or "").strip()
     except Exception as e:
         _logger.warning("manifest_status_load_failed: dataset_id=%s error=%s", ds, e)
@@ -998,6 +1013,7 @@ def get_dictionary_usage_status(
         "manifest_release_id": manifest_release_id,
         "manifest_dataset_id": manifest_dataset_id,
         "manifest_approved_snapshot_at": manifest_approved_snapshot_at,
+        "manifest_processed_image_count": manifest_processed_image_count,
         "manifest_lexicon_content_hash": manifest_lexicon_content_hash,
         "gold_lexicon_version": release.get("lexicon_version") or STOPWORDS_LEXICON_VERSION,
         "gold_stopwords_path": release.get("stopwords_path") or "",
@@ -1378,7 +1394,7 @@ def write_gold_topic_snapshot_delta(
         .withColumn("lexicon_content_hash", lit(lex_hash) if lex_hash else lit(None).cast(StringType()))
         .withColumn("snapshot_at", current_timestamp())
     )
-    out.write.format("delta").mode("append").save(gold_topic_snapshot_path)
+    out.write.format("delta").mode("append").option("mergeSchema", "true").save(gold_topic_snapshot_path)
     if GOLD_TOPIC_SNAPSHOT_VERIFY_AFTER_WRITE:
         spark = out.sparkSession
         _verify_topic_snapshot_delta_readable_strict(spark, gold_topic_snapshot_path)
@@ -1564,9 +1580,8 @@ def list_gold_topic_snapshots(
 def _topic_snapshot_iso_from_cell(v: Any) -> str:
     if v is None:
         return ""
-    if hasattr(v, "isoformat"):
-        return str(v.isoformat())
-    return str(v)
+    iso = format_storage_iso(v)
+    return iso or (str(v.isoformat()) if hasattr(v, "isoformat") else str(v))
 
 
 def _filter_topic_snapshot_by_release(
@@ -2010,6 +2025,7 @@ def run_gold_etl(
         tfidf_output_rows=int(corpus_analytics.get("tfidf_output_rows") or 0),
         topic_output_rows=topic_output_rows,
         tfidf_top=corpus_analytics.get("tfidf_top"),
+        tfidf_exploration_stopwords=lexicon_bundle.get("tfidf_exploration_stopwords"),
     )
 
     tfidf_output_rows = int(corpus_analytics.get("tfidf_output_rows") or 0)
@@ -2122,7 +2138,7 @@ def get_bronze_quarantine_data(
         )
     else:
         df = _order_df_by_time_if_present(df, newest_first=newest_first)
-    return [row.asDict(recursive=True) for row in df.limit(lim).collect()]
+    return format_rows_for_display([row.asDict(recursive=True) for row in df.limit(lim).collect()])
 
 
 def get_bronze_data(
@@ -2140,7 +2156,7 @@ def get_bronze_data(
     df = read_delta_table(spark, BRONZE_TABLE_PATH)
     df = _filter_df_by_dataset_id(df, dataset_id)
     df = _order_df_by_time_if_present(df, newest_first=newest_first).limit(lim)
-    return [row.asDict(recursive=True) for row in df.collect()]
+    return format_rows_for_display([row.asDict(recursive=True) for row in df.collect()])
 
 
 def get_silver_ocr_data(
@@ -2158,7 +2174,7 @@ def get_silver_ocr_data(
     df = read_delta_table(spark, SILVER_OCR_TABLE_PATH)
     df = _filter_df_by_dataset_id(df, dataset_id)
     df = _order_df_by_time_if_present(df, newest_first=newest_first).limit(lim)
-    return [row.asDict(recursive=True) for row in df.collect()]
+    return format_rows_for_display([row.asDict(recursive=True) for row in df.collect()])
 
 
 def get_gold_delta_table_preview(
@@ -2188,7 +2204,7 @@ def get_gold_delta_table_preview(
         elif "total_tf" in df.columns:
             df = df.orderBy(col("total_tf").desc_nulls_last())
     df = df.limit(lim)
-    return [row.asDict(recursive=True) for row in df.collect()]
+    return format_rows_for_display([row.asDict(recursive=True) for row in df.collect()])
 
 
 def get_system_status() -> Dict[str, Any]:

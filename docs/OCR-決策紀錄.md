@@ -24,9 +24,204 @@
 | Compose 全檔 OCR 環境變數明列 | ✅ 三份 compose 已對齊 |
 | per-row `ocr_signature` | ✅ UDF 依實際 profile 產生 |
 | Bronze 子集 MERGE | ✅ `write_mode=merge` + `image_paths` |
+| Bronze merge 前 history 懶歸檔 | ✅ `BRONZE_HISTORY_ON_MERGE`（第一次 merge 才建表） |
 | Bronze 列級隔離 + 三層熔斷 | ✅ `bronze_quarantine.py` → `bronze/quarantine/` |
 | 上傳源頭禁止影片 | ✅ `media_validation.py`（副檔名 + MIME + 檔頭） |
-| preset router 子集調校（階段 4） | ❌ 未執行（可選；需子集 AB） |
+| Resource Guard（P3 三層資源保護） | ✅ `resource_guard.py` |
+| 儲存健康（SDK vs S3A） | ✅ `/api/health/storage`、`/api/debug/storage-check` |
+| raw 缺口列表 + 銅層 UI 對照 | ✅ `GET /api/bronze/raw-ingest-status` |
+| **一鍵金自動補 raw 缺口 OCR** | ✅ `POST /delta/pipeline/to-gold/run`（`collect_missing_raw_image_paths`） |
+| 上傳檔名剝前導 `_`（binaryFile 相容） | ✅ `minio_upload._sanitize_upload_basename` |
+| Gold `topic_snapshot` mergeSchema | ✅ 欄位演進時自動合併 schema |
+| preset router 子集調校（階段 4） | ❌ 未執行（**可選**；見下方待實作） |
+| 執行期節流（P4） | ⚠️ 部分 | MinIO fallback 分批 ✅；逾時／repartition 等見下方 |
+
+> **待完成項** → 見 **[治理體系（兩大區塊）](#治理體系兩大區塊)** 與各區塊「未完成」表。
+
+---
+
+## 治理體系（兩大區塊）
+
+<a id="治理體系兩大區塊"></a>
+
+對話中將防線拆成兩套**互補、不重複**的治理；完整流程圖見本機手冊 **§6**。
+
+| 區塊 | 管什麼 | 時機 |
+|------|--------|------|
+| **[資料治理](#一資料治理-data-governance)** | 資料對不對、能不能當**正式發行**、壞列去哪 | ETL **前後**與**讀取端** |
+| **[系統維護](#二系統維護-system-operations)** | 會不會 OOM、能不能開工、執行中並行與逾時 | **開工前**與**執行中** |
+
+> **用語**：討論時曾以「廚房／牛排排隊」比喻 OCR 記憶體與並行；**正式文件稱系統維護**（P3 資源准入 + P4 執行期節流）。
+
+```mermaid
+flowchart TB
+  subgraph data [資料治理]
+    D0[P0 發行／可追蹤]
+    D1[P1 失敗可發現]
+    D2[P2 壞資料隔離]
+  end
+  subgraph ops [系統維護]
+    K3[P3 資源准入]
+    K4[P4 執行期節流]
+  end
+  IN[上傳／觸發 ETL] --> K3
+  K3 --> K4
+  K4 --> D2
+  D2 --> D0
+  D1 -.->|探針／通知| D0
+```
+
+**勿混**：Bronze **熔斷 WARN**（資料治理）≠ Resource Guard **400**（系統維護／P3）≠ **OOM 137**（P4 未節流時仍可能發生）。
+
+---
+
+## 一、資料治理（Data Governance）
+
+<a id="一資料治理-data-governance"></a>
+
+> **定位**：回答「這批資料可信嗎？對外該讀哪一版？壞列有沒有被隔離？」  
+> **原則**：先補 **決策正確**（核准版、可追溯），再談叢集調優。
+
+### 路線圖總表
+
+| 階段 | 主題 | 狀態 | 摘要 |
+|:----:|------|:----:|------|
+| **P0** | 發行版／ETL 可追蹤 | ✅ 已完成 | 發行契約、核准快照、雙軌詞表、快照寫入 lexicon hash |
+| **P1** | 失敗可發現 | ✅ 已完成 | 外部探針、條件式新鮮度、熔斷／探針通知 |
+| **P2** | 壞資料隔離 | ✅ 已完成 | Bronze quarantine、三層熔斷、銀層品質閘門、merge history |
+| **—** | 持續上傳閉環 | ✅ 已完成 | raw 缺口偵測 ✅；**一鍵金自動補 OCR** ✅ |
+| **—** | 正式發行收尾 | ❌ 待做 | drinks 缺口圖驗收、黃金停用詞 v2（營運／詞表） |
+
+### P0 — 發行版與可追溯（✅）
+
+| 項目 | 狀態 | 模組／端點 |
+|------|:----:|------------|
+| 首頁 **發行版**｜**最新預覽**；無核准不靜默 fallback | ✅ | `release_contract.py`、`/` Dashboard |
+| `approved_snapshot_at` + `--approve-snapshot`／`--revoke-snapshot` | ✅ | `pipeline_guardian.py`、`manifests/*.json` |
+| 雙軌停用詞（黃金 `v1.0.0`／探索 `dev`） | ✅ | `lexicon.py`、`collect_gold_dual_lexicon()` |
+| `topic_snapshot` 寫入 `release_lexicon_version`、`lexicon_content_hash` | ✅ | Gold ETL |
+| 守護神：銅 `ocr_signature`、銀 `SILVER_TRANSFORM_VERSION`、金 lexicon hash | ✅ | `pipeline_guardian.py` |
+| `mergeSchema` 支援 Gold 欄位演進 | ✅ | `topic_snapshot` 寫入 |
+| ETL 指標可追溯 | ✅ | `etl_metrics.jsonl`、`GET /api/metrics/etl` |
+| **ETL API 在守護神 FAIL 時硬擋** | ❌ **刻意不做** | 調參期須能跑「最新預覽」；發行靠核准版＋探針，見對話 Phase 1 決策 |
+| **模型／訓練匯出硬閘門** | ❌ 未做 | 管線止于 Gold；下游訓練尚未接入 |
+
+### P1 — 失敗可發現（✅）
+
+| 項目 | 狀態 | 模組／端點 |
+|------|:----:|------------|
+| `GET /ready`、storage 健康 | ✅ | 部署／探針前置 |
+| 外部探針 `pipeline_probe.py --strict` | ✅ | ready + guardian + freshness |
+| 條件式新鮮度（圖片水位差） | ✅ | `pipeline_freshness_check.py`、`var/pipeline_heartbeat.json` |
+| 探針／新鮮度 FAIL → Discord／LINE | ✅ | `PIPELINE_NOTIFY_BACKEND` |
+| Bronze 軟／硬熔斷 → WARN／ALERT 通知 | ✅ | `pipeline_notify.py`（與 cron 探針互補） |
+| Windows 排程包裝 | ✅ | `scripts/run_pipeline_probe.ps1` |
+| 3am 自動排程 ETL | ❌ **不採用** | 本專案手動觸發；靠探針發現「忘了跑／跑掛」 |
+
+### P2 — 壞資料隔離（✅）
+
+| 項目 | 狀態 | 模組／端點 |
+|------|:----:|------------|
+| Bronze 列級隔離 → `bronze/quarantine/` | ✅ | `bronze_quarantine.py`（Silver ETL 前） |
+| 三層熔斷（≤10%／軟>10%／硬≥30%）；軟熔斷擋核准 | ✅ | `BRONZE_QUARANTINE_*` |
+| 銀層品質閘門（Schema／token 分佈／留存） | ✅ | `silver_quality.py` → 422 |
+| merge 前 Bronze history 歸檔 | ✅ | `BRONZE_HISTORY_ON_MERGE`、`ocr_spark.py` |
+| 上傳禁影片、檔名 sanitize | ✅ | `media_validation.py`、`minio_upload.py` |
+| raw 缺口列表與 UI 對照 | ✅ | `raw_ingest_status.py` |
+| **一鍵金自動補 raw 缺口** | ✅ | `collect_missing_raw_image_paths` → `to-gold` 內 `append` + `image_paths` |
+| **Schema 突變 → Bad Data Path（整批不斷線）** | ❌ 未做 | 面試題提及；現況靠 Delta `mergeSchema`（Gold）與銀層 Schema 硬檢 |
+| **Delta TIME TRAVEL／一鍵 Rollback** | ❌ 未做 | 發行撤回用 `--revoke-snapshot`（清 manifest，不刪 Delta 列） |
+
+### 資料治理 — 未完成（必要優先）
+
+| 優先 | 項目 | 為何必要 | 現況 |
+|:----:|------|----------|------|
+| **P1** | **drinks 缺口圖營運驗收** | 母體 N/50 與發行敘事 | ❌ 營運未跑（merge 能力已有） |
+| **P2** | **黃金停用詞 v2 發行** | dev 滿意後正式 bump + manifest | ❌ 仍 `v1.0.0` |
+
+---
+
+## 二、系統維護（System Operations）
+
+<a id="二系統維護-system-operations"></a>
+
+> **定位**：回答「現在能不能啟動 ETL？執行中會不會把 JVM 撐爆、任務會不會掛死？」  
+> **分工**：**P3 資源准入**＝開工前檢查；**P4 執行期節流**＝執行中容量控制（與 P3 **疊加**，非重複）。
+
+| | **P3 資源准入** | **P4 執行期節流** |
+|---|----------------|------------------|
+| **時機** | HTTP 請求／ETL **開工前** | OCR／Spark **執行中** |
+| **主要防** | 一次太多圖、併發疊加、環境已滿還開工 | 單 job 並行過高、fallback 整批進 driver、無逾時 |
+| **失敗** | HTTP **400** 繁中 | OOM 風險／任務掛死占槽 |
+
+### P3 — 資源准入（Resource Guard，✅）
+
+| 項目 | 狀態 | 變數／模組 |
+|------|:----:|------------|
+| Request：單次檔案數、單檔 ≤15MB | ✅ | `MAX_UPLOAD_FILES_PER_REQUEST`、`MAX_UPLOAD_MB` |
+| Pipeline：Bronze 圖片數上限、ETL 併發槽 | ✅ | `MAX_BRONZE_OCR_IMAGES`、`ETL_MAX_CONCURRENT_JOBS` |
+| Runtime：記憶體 % + 可用 MB 下限 | ✅ | `ETL_MEMORY_*`、`resource_guard.py` |
+| Spark driver／executor 記憶體進 builder | ✅ | `SPARK_DRIVER_MEMORY` 等 |
+| 總開關 | ✅ | `ETL_RESOURCE_GUARD_ENABLED` |
+| Guard 拒絕時 **不發** LINE（刻意） | ✅ | 僅 HTTP 400；與熔斷通知分工 |
+
+### P3.1／P4 — 執行期節流（⚠️ 部分）
+
+| 項目 | 狀態 | 說明 |
+|------|:----:|------|
+| MinIO SDK **分批** fallback（degraded 時） | ✅ | `OCR_MINIO_BATCH_SIZE`；修「整批 50 張進 driver」 |
+| `write_mode=merge` + `image_paths` 點讀 | ✅ | 子集不 list 全目錄 |
+| API 回 `image_source`、`minio_batches_processed` | ✅ | 除錯用 |
+| **執行逾時** | ❌ | `OCR_TIMEOUT_SECONDS`、`SPARK_JOB_TIMEOUT_SECONDS` 在 `config.py`，**未接入** |
+| **OCR `repartition(N)`** | ❌ | 對齊 CPU／限制同時 OCR 並行；`OCR_REPARTITION` 未定義 |
+| **Docker `cpus`／Spark `local[N]`** | ❌ | 曾討論，尚未制度化 |
+| **Guard 拒絕時 LINE + 冷卻**（可選） | ❌ | 非 OOM 主因 |
+
+### 系統維護 — 未完成（建議順序）
+
+| 優先 | 項目 | 說明 |
+|:----:|------|------|
+| **P1** | **執行逾時接入** | 掛死 job 占滿 `ETL_MAX_CONCURRENT_JOBS=1`；與資料治理無關但阻塞營運 |
+| **P2** | **OCR repartition** | 本機 50 張若未 OOM 可延後；擴量前建議做 |
+| **P3** | Guard LINE 通知 | 可選；營運可先看 400 訊息 |
+
+---
+
+## 跨區塊待辦（討論用優先序）
+
+<a id="待實作-backlog"></a>
+
+| 順序 | 項目 | 歸屬 | 類型 |
+|:----:|------|------|------|
+| 1 | 執行逾時接入 | 系統維護 | 程式 |
+| 2 | drinks 缺口圖驗收 | 資料治理 | 營運 |
+| 3 | 黃金停用詞 v2 | 資料治理 | 詞表／manifest |
+| 4 | OCR repartition | 系統維護 | 程式 |
+| 5 | 銅層 merge UI（指定範圍自動帶 path） | 資料治理 | 程式 |
+| — | preset router 子集 AB | 銅層品質 | **可選** |
+| — | 操作 `SOP.md` | 文件 | 可選 |
+
+**可選／延後**：preset router AB、PaddleOCR 評估、Schema Bad Data Path、Delta Rollback、模型訓練閘門、Guard LINE。
+
+---
+
+## 防錯與治理體系（摘要）
+
+> 完整對照表、流程圖、通知矩陣 → 本機 **`docs/架構與維運手冊.md` §6**。  
+> **兩大區塊詳表** → 上方 **[資料治理](#一資料治理-data-governance)**、**[系統維護](#二系統維護-system-operations)**。
+
+由外而內：**就緒／儲存 → P3 資源准入 → 上傳／讀圖 → 資料 P2 隔離熔斷 → 銀層閘門 → merge history → 資料 P0 發行／守護神 → 資料 P1 探針**。
+
+| 層級 | 機制 | 失敗時 |
+|------|------|--------|
+| 運維 | `/ready`、外部 `pipeline_probe` | 503／排程告警 |
+| 儲存 | SDK vs S3A（`degraded`＝易走 OCR fallback） | 除錯 API |
+| P3 資源准入 | 檔數、圖片數、併發、記憶體 | HTTP 400 |
+| 攝入 | 禁影片、binaryFile／MinIO fallback | 400／OOM 風險（fallback） |
+| 管線 | Bronze quarantine 三層熔斷、Silver 品質閘門 | warning／422 |
+| 發行 | `pipeline_guardian`、核准快照、發行版 Dashboard | FAIL／WARN |
+
+**術語勿混**：「OCR 設定三層」（broadcast）≠「原圖讀取雙路徑」（binaryFile／SDK）。詳手冊 §6「術語辨析」。
 
 ---
 
@@ -79,6 +274,7 @@
 - **全量 `overwrite` 只做一次**（2026-06-22，drinks 50 列）；此後視為封板。
 - **preset router** 骨架已在 `ocr_spark.py`；`OCR_PRESET_ROUTER_ENABLED=false` 時一律 `dark_ui`。
 - 封板後若少數爛圖需 `low_res` 等 profile：**禁止**第二次全表 overwrite；使用 **`write_mode=merge`** + **`image_paths`** 子集 Upsert。
+- **merge 前自動歸檔**（`BRONZE_HISTORY_ON_MERGE=true`，預設開）：將被覆寫的舊列 append 至 `BRONZE_HISTORY_PATH`（懶建立；封板後若不 merge 則不佔空間）。純新增列不寫 history。API 回 `history_archived_rows`、`bronze_history_path`。
 - `ocr_signature` 為 **per-row**（依 UDF 內實際 profile／前處理參數）。
 - OCR 參數傳遞以 **`sc.broadcast(ocr_config)`** 為準；容器 `environment` 與 `spark.executorEnv` 為一致化備援。
 
@@ -125,6 +321,7 @@
 | TF-IDF Top 雜詞 | 改 **`dic/stop_words/dev/`** 探索詞表；滿意後再合併進黃金 `v1.0.0/` + manifest |
 | 銅層與 `.env` 脫節 | 變更 OCR 參數後須 Bronze 重寫 `extracted_text`；僅重跑銀層無效 |
 | 銅層第二次全表 overwrite | **已取消**為預設路徑；改以 `merge` + `image_paths` |
+| Bronze merge history | ✅ 懶建立；僅 merge 且 `image_path` 已存在時歸檔舊列 |
 | per-row `ocr_signature` | ✅ 已實作 |
 | 前處理 preset 分流 | 預設關閉；開啟前需子集 AB |
 | PaddleOCR | 架構可接；ROI 偏低時維持 Tesseract 封板 |
@@ -138,6 +335,7 @@
 |----------|------|
 | OCR 參數 / PSM / 前處理（**整批**，罕見） | Bronze **overwrite** → Silver → Gold |
 | 少數圖需換 profile（封板後） | Bronze **merge**（`image_paths`）→ Silver → Gold |
+| merge 覆寫前舊 OCR 留存 | 自動 append **`bronze/history/`**（`archived_at`、`archive_reason=pre_merge`） |
 | `SILVER_TRANSFORM_VERSION` | Silver → Gold |
 | 探索停用詞（`dev/`） | **Gold**（不更新 manifest） |
 | 黃金發行停用詞（`v1.0.0/`）／痛點規則 | **Gold** + 更新 `manifests/*.json` |
@@ -158,6 +356,7 @@
 - `services/ocr_psm_ab.py` — PSM A/B 測試（`test/ocr_psm_ab/`）
 - `services/text_tokens.py` — 銀層清洗與分詞
 - `services/bronze_quarantine.py` — Bronze 列級隔離與三層熔斷（Silver ETL 前）
+- `services/resource_guard.py` — P3 三層資源保護（Request／Pipeline／Runtime）
 - `services/silver_quality.py` — 銀層整批品質閘門（Silver ETL 後）
 - `services/lexicon.py` — Gold 雙版本停用詞與 TF-IDF 探索過濾
 - `services/pipeline_guardian.py` — 管線守護神（銅銀品質、黃金 lexicon hash、核准前熔斷檢查）

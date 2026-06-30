@@ -25,6 +25,7 @@ from config import (
     GOLD_TOPIC_SNAPSHOT_PATH,
     GOLD_TFIDF_KEYWORDS_PATH,
     GOLD_PHRASE_CANDIDATES_PATH,
+    MAX_UPLOAD_MB,
     MINIO_ENDPOINT,
     OCR_AB_MAX_SAMPLE_SIZE,
     OCR_AB_RESULTS_PATH,
@@ -41,11 +42,25 @@ from services.minio_upload import (
     normalize_dataset_id,
     upload_file_bytes,
 )
+from services.raw_ingest_status import collect_missing_raw_image_paths, list_raw_ingest_status
+from services.timezone_policy import enrich_rows_timestamps_for_ui, format_display_timestamp
 from services.readiness import build_ready_payload, resolve_include_spark
-from services.release_contract import load_release_context
+from services.release_contract import (
+    build_topic_hint,
+    format_release_card_subtitle,
+    format_release_filter_summary,
+    load_release_context,
+)
 from services.async_jobs import job_registry, job_to_public_dict
 from services.etl_metrics import append_etl_metric, read_etl_metrics
-from services.ocr_spark import preview_raw_images_sample, run_bronze_ocr_ingest, normalize_psm
+from services.ocr_spark import (
+    count_binaryfile_images,
+    preview_raw_images_sample,
+    run_bronze_ocr_ingest,
+    normalize_psm,
+    resolve_bronze_image_source,
+    resolve_ocr_minio_batch_size,
+)
 from services.ocr_psm_ab import (
     default_keyword_hints,
     delete_test_results_prefix,
@@ -55,6 +70,14 @@ from services.ocr_psm_ab import (
     run_ocr_psm_ab,
 )
 from services.bronze_quarantine import BronzeQuarantineError
+from services.resource_guard import (
+    ResourceGuardError,
+    check_bronze_ocr_batch,
+    check_request_upload,
+    check_runtime_for_etl,
+    pipeline_etl_slot,
+    resolve_bronze_ocr_image_count,
+)
 from services.silver_quality import SilverQualityError
 from services.spark_service import (
     SparkManager,
@@ -86,6 +109,11 @@ from services.spark_service import (
 )
 
 app = Flask(__name__)
+
+
+@app.template_filter("display_time")
+def _jinja_display_time(value: Any) -> str:
+    return format_display_timestamp(value)
 
 # 僅使用此目錄下單一檔名，避免 Windows 路徑別名造成「兩份 index」誤改。
 TEMPLATE_INDEX = "index.html"
@@ -242,6 +270,30 @@ def _noop_progress(_step: int, _total: int, _msg: str) -> None:
     return None
 
 
+def _bronze_gap_backfill_result(*, missing_count: int) -> Dict[str, Any]:
+    """一鍵金：無 raw 缺口時略過 Bronze OCR 的占位結果。"""
+    return {
+        "input_rows": 0,
+        "processed_rows": 0,
+        "skipped_rows": 0,
+        "write_mode": "append",
+        "image_paths": [],
+        "raw_backfill_skipped": True,
+        "raw_backfill_count": missing_count,
+        "summary": "無 raw 缺口，略過 Bronze OCR。",
+    }
+
+
+def _resolve_raw_backfill_gap(dataset_id: str) -> Dict[str, Any]:
+    gap = collect_missing_raw_image_paths(dataset_id)
+    if gap.get("truncated"):
+        raise ValueError(
+            f"MinIO 原圖掃描超過上限 max_scan={gap.get('max_scan')}，"
+            "請提高掃描上限或分批處理後再執行一鍵金層。"
+        )
+    return gap
+
+
 def _execute_pipeline_to_gold_inner(
     *,
     dataset_id: str,
@@ -250,24 +302,90 @@ def _execute_pipeline_to_gold_inner(
     coalesce_partitions: int,
     skip_gold_if_no_new_ocr: bool,
     progress: Callable[[int, int, str], None],
+    image_paths: list[str] | None = None,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     spark = _get_spark_manager().spark
+    gap = _resolve_raw_backfill_gap(dataset_id)
+    missing_paths: list[str] = list(gap.get("missing_paths") or [])
+    raw_backfill_count = int(gap.get("missing_count") or 0)
     try:
-        progress(1, 3, "銅層 Bronze OCR…")
-        bronze_result = run_bronze_ocr_ingest(
-            spark,
-            raw_images_path=raw_images_path,
-            bronze_path=BRONZE_TABLE_PATH,
-            write_mode=write_mode,
-            dataset_id=dataset_id,
-        )
-        bronze_processed_rows = int(bronze_result.get("processed_rows") or 0)
-        if skip_gold_if_no_new_ocr and bronze_processed_rows <= 0:
+        with pipeline_etl_slot(operation="pipeline_to_gold"):
+            if raw_backfill_count > 0:
+                progress(1, 3, f"銅層 Bronze OCR（補 raw 缺口 {raw_backfill_count} 張）…")
+                check_bronze_ocr_batch(raw_backfill_count)
+                bronze_result = run_bronze_ocr_ingest(
+                    spark,
+                    raw_images_path=raw_images_path,
+                    bronze_path=BRONZE_TABLE_PATH,
+                    write_mode="append",
+                    dataset_id=dataset_id,
+                    image_paths=missing_paths,
+                )
+                bronze_result["raw_backfill_count"] = raw_backfill_count
+                bronze_result["raw_backfill_skipped"] = False
+            else:
+                progress(1, 3, "銅層：無 raw 缺口，略過 OCR…")
+                bronze_result = _bronze_gap_backfill_result(missing_count=0)
+            bronze_processed_rows = int(bronze_result.get("processed_rows") or 0)
+            if skip_gold_if_no_new_ocr and bronze_processed_rows <= 0:
+                out = {
+                    "status": "ok",
+                    "dataset_id": dataset_id,
+                    "steps": ["bronze_ocr"],
+                    "raw_images_path": raw_images_path,
+                    "bronze_path": BRONZE_TABLE_PATH,
+                    "silver_ocr_path": SILVER_OCR_TABLE_PATH,
+                    "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+                    "write_mode": write_mode,
+                    "coalesce_partitions": coalesce_partitions,
+                    "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
+                    "raw_backfill_count": raw_backfill_count,
+                    "is_incremental_short_circuit": True,
+                    "summary": "本次沒有新增 OCR 資料，已跳過 Silver/Gold 重算。",
+                    "bronze_result": bronze_result,
+                    "silver_result": {"updated_rows": 0, "skipped": True},
+                    "gold_result": {
+                        "tfidf_output_rows": 0,
+                        "is_gold_written": False,
+                        "skipped": True,
+                        "summary": "本次沒有新增 OCR 資料，已跳過 Gold 重算。",
+                    },
+                }
+                _record_etl_metric(
+                    {
+                        "etl_name": "pipeline_to_gold",
+                        "dataset_id": dataset_id,
+                        "status": "ok",
+                        "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                        "bronze_processed_rows": bronze_processed_rows,
+                        "silver_updated_rows": 0,
+                        "gold_output_rows": 0,
+                        "tfidf_output_rows": 0,
+                        "is_gold_written": False,
+                        "is_incremental_short_circuit": True,
+                    }
+                )
+                return out
+            progress(2, 3, "銀層 Silver ETL…")
+            silver_result = run_silver_ocr_etl(
+                bronze_path=BRONZE_TABLE_PATH,
+                silver_ocr_path=SILVER_OCR_TABLE_PATH,
+                dataset_id=dataset_id,
+            )
+            progress(3, 3, "金層 Gold ETL…")
+            gold_result = run_gold_etl(
+                silver_ocr_path=SILVER_OCR_TABLE_PATH,
+                dataset_id=dataset_id,
+                coalesce_partitions=coalesce_partitions,
+                silver_batch_ts=silver_result.get("silver_batch_ts"),
+                prefer_incremental=bool(silver_result.get("inserted_rows", 0) > 0),
+                force_full_recompute=bool(silver_result.get("updated_existing_rows", 0) > 0),
+            )
             out = {
                 "status": "ok",
                 "dataset_id": dataset_id,
-                "steps": ["bronze_ocr"],
+                "steps": ["bronze_ocr", "silver_ocr", "gold_etl"],
                 "raw_images_path": raw_images_path,
                 "bronze_path": BRONZE_TABLE_PATH,
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
@@ -275,16 +393,10 @@ def _execute_pipeline_to_gold_inner(
                 "write_mode": write_mode,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
-                "is_incremental_short_circuit": True,
-                "summary": "本次沒有新增 OCR 資料，已跳過 Silver/Gold 重算。",
+                "raw_backfill_count": raw_backfill_count,
                 "bronze_result": bronze_result,
-                "silver_result": {"updated_rows": 0, "skipped": True},
-                "gold_result": {
-                    "tfidf_output_rows": 0,
-                    "is_gold_written": False,
-                    "skipped": True,
-                    "summary": "本次沒有新增 OCR 資料，已跳過 Gold 重算。",
-                },
+                "silver_result": silver_result,
+                "gold_result": gold_result,
             }
             _record_etl_metric(
                 {
@@ -292,62 +404,17 @@ def _execute_pipeline_to_gold_inner(
                     "dataset_id": dataset_id,
                     "status": "ok",
                     "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                    "bronze_processed_rows": bronze_processed_rows,
-                    "silver_updated_rows": 0,
-                    "gold_output_rows": 0,
-                    "tfidf_output_rows": 0,
-                    "is_gold_written": False,
-                    "is_incremental_short_circuit": True,
+                    "bronze_processed_rows": bronze_result.get("processed_rows"),
+                    "silver_updated_rows": silver_result.get("updated_rows"),
+                    "gold_output_rows": gold_result.get("tfidf_output_rows"),
+                    "tfidf_output_rows": gold_result.get("tfidf_output_rows"),
+                    "is_gold_written": gold_result.get("is_gold_written"),
+                    "topic_output_rows": gold_result.get("topic_output_rows"),
+                    "topic_frequency_top": gold_result.get("topic_frequency_top"),
+                    "gold_recompute_mode": gold_result.get("gold_recompute_mode"),
                 }
             )
             return out
-        progress(2, 3, "銀層 Silver ETL…")
-        silver_result = run_silver_ocr_etl(
-            bronze_path=BRONZE_TABLE_PATH,
-            silver_ocr_path=SILVER_OCR_TABLE_PATH,
-            dataset_id=dataset_id,
-        )
-        progress(3, 3, "金層 Gold ETL…")
-        gold_result = run_gold_etl(
-            silver_ocr_path=SILVER_OCR_TABLE_PATH,
-            dataset_id=dataset_id,
-            coalesce_partitions=coalesce_partitions,
-            silver_batch_ts=silver_result.get("silver_batch_ts"),
-            prefer_incremental=bool(silver_result.get("inserted_rows", 0) > 0),
-            force_full_recompute=bool(silver_result.get("updated_existing_rows", 0) > 0),
-        )
-        out = {
-            "status": "ok",
-            "dataset_id": dataset_id,
-            "steps": ["bronze_ocr", "silver_ocr", "gold_etl"],
-            "raw_images_path": raw_images_path,
-            "bronze_path": BRONZE_TABLE_PATH,
-            "silver_ocr_path": SILVER_OCR_TABLE_PATH,
-            "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
-            "write_mode": write_mode,
-            "coalesce_partitions": coalesce_partitions,
-            "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
-            "bronze_result": bronze_result,
-            "silver_result": silver_result,
-            "gold_result": gold_result,
-        }
-        _record_etl_metric(
-            {
-                "etl_name": "pipeline_to_gold",
-                "dataset_id": dataset_id,
-                "status": "ok",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "bronze_processed_rows": bronze_result.get("processed_rows"),
-                "silver_updated_rows": silver_result.get("updated_rows"),
-                "gold_output_rows": gold_result.get("tfidf_output_rows"),
-                "tfidf_output_rows": gold_result.get("tfidf_output_rows"),
-                "is_gold_written": gold_result.get("is_gold_written"),
-                "topic_output_rows": gold_result.get("topic_output_rows"),
-                "topic_frequency_top": gold_result.get("topic_frequency_top"),
-                "gold_recompute_mode": gold_result.get("gold_recompute_mode"),
-            }
-        )
-        return out
     except Exception as e:
         _record_etl_metric(
             {
@@ -373,34 +440,35 @@ def _execute_bronze_ocr_inner(
     started = time.perf_counter()
     spark = _get_spark_manager().spark
     try:
-        progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
-        bronze_result = run_bronze_ocr_ingest(
-            spark,
-            raw_images_path=raw_images_path,
-            bronze_path=bronze_path,
-            write_mode=write_mode,
-            dataset_id=dataset_id,
-            image_paths=image_paths,
-        )
-        out = {
-            "status": "ok",
-            "dataset_id": dataset_id,
-            "raw_images_path": raw_images_path,
-            "bronze_path": bronze_path,
-            "write_mode": write_mode,
-            "bronze_result": bronze_result,
-        }
-        _record_etl_metric(
-            {
-                "etl_name": "bronze_ocr",
-                "dataset_id": dataset_id,
+        with pipeline_etl_slot(operation="bronze_ocr"):
+            progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
+            bronze_result = run_bronze_ocr_ingest(
+                spark,
+                raw_images_path=raw_images_path,
+                bronze_path=bronze_path,
+                write_mode=write_mode,
+                dataset_id=dataset_id,
+                image_paths=image_paths,
+            )
+            out = {
                 "status": "ok",
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "input_rows": bronze_result.get("input_rows"),
-                "output_rows": bronze_result.get("processed_rows"),
+                "dataset_id": dataset_id,
+                "raw_images_path": raw_images_path,
+                "bronze_path": bronze_path,
+                "write_mode": write_mode,
+                "bronze_result": bronze_result,
             }
-        )
-        return out
+            _record_etl_metric(
+                {
+                    "etl_name": "bronze_ocr",
+                    "dataset_id": dataset_id,
+                    "status": "ok",
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                    "input_rows": bronze_result.get("input_rows"),
+                    "output_rows": bronze_result.get("processed_rows"),
+                }
+            )
+            return out
     except Exception as e:
         _record_etl_metric(
             {
@@ -657,12 +725,42 @@ def upload_page():
     return redirect(target)
 
 
+def _safe_raw_ingest_status(
+    dataset_id: str | None,
+    *,
+    limit: int = 10,
+    only_missing: bool = False,
+):
+    if not dataset_id:
+        return [], None
+    try:
+        return (
+            enrich_rows_timestamps_for_ui(
+                list_raw_ingest_status(
+                    dataset_id,
+                    limit=limit,
+                    only_missing=only_missing,
+                )
+            ),
+            None,
+        )
+    except Exception as e:
+        _logger.warning("raw_ingest_status_failed: %s", e)
+        return [], str(e)
+
+
 @app.get("/pipeline/bronze")
 def pipeline_bronze_page():
     ctx = _parse_pipeline_dataset_context("bronze")
+    selected = ctx.get("selected_dataset_id")
+    raw_ingest_limit = 10
+    raw_ingest_rows, raw_ingest_error = _safe_raw_ingest_status(
+        selected,
+        limit=raw_ingest_limit,
+    )
     bronze_rows, bronze_error = _safe_bronze_preview(
-        limit=10,
-        dataset_id=ctx.get("selected_dataset_id"),
+        limit=raw_ingest_limit,
+        dataset_id=selected,
         newest_first=True,
     )
     return render_template(
@@ -670,6 +768,9 @@ def pipeline_bronze_page():
         bronze_path=BRONZE_TABLE_PATH,
         bronze_rows=bronze_rows,
         bronze_error=bronze_error,
+        raw_ingest_rows=raw_ingest_rows,
+        raw_ingest_error=raw_ingest_error,
+        raw_ingest_limit=raw_ingest_limit,
         **ctx,
     )
 
@@ -967,6 +1068,7 @@ def index():
     snapshot_mode = "preview" if snapshot_mode_raw == "preview" else "release"
     release_context: Dict[str, Any] = {}
     latest_snapshot_at: str | None = None
+    approved: str | None = None
 
     if selected_dataset_id:
         try:
@@ -985,37 +1087,26 @@ def index():
             )
         if snapshot_mode == "preview":
             topic_rows = get_gold_topic_snapshot_latest_data(limit=15, dataset_id=selected_dataset_id)
-            topic_hint = "最新預覽：每次 Gold ETL 的最新 snapshot_at，未經核准，不可作為對外發行版。"
-            if latest_snapshot_at:
-                topic_hint += f" 快照時間：{latest_snapshot_at}"
         elif not selected_dataset_id:
             topic_rows = []
-            topic_hint = "發行版需選擇 dataset_id（勿選「全部資料」）。"
         else:
             approved = release_context.get("approved_snapshot_at")
             if not approved:
                 topic_rows = []
-                topic_hint = (
-                    "尚無發行版：manifest 未設定 approved_snapshot_at。"
-                    "請執行 pipeline_guardian --approve-snapshot，或切換至「最新預覽」調參。"
-                )
             else:
                 topic_rows = get_gold_topic_snapshot_at_data(
                     approved,
                     limit=15,
                     dataset_id=selected_dataset_id,
                 )
-                if not topic_rows:
-                    topic_hint = (
-                        f"找不到核准快照資料（approved_snapshot_at={approved}），"
-                        "請重跑 Gold 或重新核准。"
-                    )
-                else:
-                    rid = release_context.get("release_id") or "-"
-                    topic_hint = f"發行版 release_id={rid}，核准快照 {approved}"
-                    pic = release_context.get("processed_image_count")
-                    if pic is not None:
-                        topic_hint += f"，發行水位 processed_image_count={pic}"
+        topic_hint = build_topic_hint(
+            snapshot_mode=snapshot_mode,
+            selected_dataset_id=selected_dataset_id,
+            release_context=release_context,
+            latest_snapshot_at=latest_snapshot_at,
+            topic_rows=topic_rows,
+            approved=approved,
+        )
     except Exception as e:
         _logger.warning("topic_snapshot_preview_failed: %s", e)
         topic_rows = []
@@ -1040,6 +1131,8 @@ def index():
         topic_hint=topic_hint,
         snapshot_mode=snapshot_mode,
         release_context=release_context,
+        release_filter_summary=format_release_filter_summary(release_context),
+        release_card_subtitle=format_release_card_subtitle(release_context),
         latest_snapshot_at=latest_snapshot_at,
         corpus_coverage=corpus_coverage,
         tfidf_table_path=GOLD_TFIDF_KEYWORDS_PATH,
@@ -1096,7 +1189,9 @@ def layers_preview_page():
         dataset_id=selected_dataset_id,
         newest_first=newest_first,
     )
-    etl_metrics_rows = read_etl_metrics(limit=12, dataset_id=selected_dataset_id or None)
+    etl_metrics_rows = enrich_rows_timestamps_for_ui(
+        read_etl_metrics(limit=12, dataset_id=selected_dataset_id or None)
+    )
     latest_etl_metric = etl_metrics_rows[0] if etl_metrics_rows else None
     dictionary_status: Dict[str, Any] = {}
     try:
@@ -1363,7 +1458,7 @@ def api_health_storage():
     spark_error: str | None = None
     try:
         spark = _get_spark_manager().spark
-        spark_count = len(preview_raw_images_sample(spark, spark_raw_path, limit=limit))
+        spark_count = count_binaryfile_images(spark, spark_raw_path, limit=limit)
     except Exception as e:
         spark_error = str(e)
 
@@ -1378,7 +1473,10 @@ def api_health_storage():
             hint = "one check failed; OCR may rely on fallback path"
     elif sdk_count > 0 and spark_count == 0:
         status = "degraded"
-        hint = "MinIO SDK can list objects but Spark S3A cannot; using fallback is recommended"
+        hint = (
+            "MinIO SDK can list objects but Spark binaryFile sees none "
+            "(often legacy filenames starting with '_'); OCR will use minio_sdk fallback"
+        )
 
     http_code = 200 if status == "ok" else 503 if status == "down" else 200
     return (
@@ -1396,6 +1494,114 @@ def api_health_storage():
             }
         ),
         http_code,
+    )
+
+
+@app.get("/api/bronze/raw-ingest-status")
+def api_bronze_raw_ingest_status():
+    """
+    MinIO 原圖最新 N 筆 vs Bronze 攝入狀態（不 OCR、不寫 Delta）。
+    query: dataset_id（必填）、limit（預設 10）、only_missing（1/true 僅未進 Bronze）
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    raw = request.args.get("dataset_id", "").strip().lower()
+    if not raw:
+        return _json_error("dataset_id 必填。", 400)
+    try:
+        dataset_id = normalize_dataset_id(raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    lim_raw = request.args.get("limit", "10")
+    try:
+        limit = int(lim_raw)
+    except (TypeError, ValueError):
+        return _json_error("limit 必須是整數。", 400)
+    limit = max(1, min(limit, 50))
+
+    only_missing = request.args.get("only_missing", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    try:
+        rows = enrich_rows_timestamps_for_ui(
+            list_raw_ingest_status(
+                dataset_id,
+                limit=limit,
+                only_missing=only_missing,
+            )
+        )
+    except Exception as e:
+        _logger.warning("raw_ingest_status_api_failed: %s", e)
+        return _json_error(f"讀取原圖狀態失敗：{e}", 500)
+
+    missing_count = sum(1 for r in rows if not r.get("in_bronze"))
+    return jsonify(
+        {
+            "dataset_id": dataset_id,
+            "limit": limit,
+            "only_missing": only_missing,
+            "items": rows,
+            "missing_in_preview": missing_count,
+            "hint": "「已上傳，尚未辨識」表示檔案已在雲端，但還沒跑銅層文字辨識；需執行辨識後才會進銀層／金層。",
+        }
+    )
+
+
+@app.get("/api/bronze/image-source")
+def api_bronze_image_source():
+    """
+    檢測 Bronze OCR 將使用的原圖讀取路徑（不 OCR、不寫 Delta）。
+    query: dataset_id（必填）
+    """
+    err = _require_admin_token_if_configured()
+    if err:
+        return err
+
+    raw = request.args.get("dataset_id", "").strip().lower()
+    if not raw:
+        return _json_error("dataset_id 必填。", 400)
+    try:
+        dataset_id = normalize_dataset_id(raw)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+
+    raw_images_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{dataset_id}/"
+    batch_size = resolve_ocr_minio_batch_size()
+
+    try:
+        spark = _get_spark_manager().spark
+        source = resolve_bronze_image_source(spark, raw_images_path)
+    except Exception as e:
+        _logger.warning("bronze_image_source_check_failed: %s", e)
+        return _json_error(f"檢測讀圖路徑失敗：{e}", 500)
+
+    labels = {
+        "binaryFile": "Spark binaryFile + S3A（主路徑，分散讀取）",
+        "minio_sdk": f"MinIO SDK 分批 fallback（每批最多 {batch_size} 張）",
+    }
+    notes = {
+        "binaryFile": "未寫入 Bronze；僅偵測路徑。",
+        "minio_sdk": "Spark S3A 讀不到圖時啟用；正式 OCR 會分批讀進 driver。",
+    }
+
+    return jsonify(
+        {
+            "status": "ok",
+            "dataset_id": dataset_id,
+            "raw_images_path": raw_images_path,
+            "image_source": source,
+            "image_source_label": labels.get(source, source),
+            "ocr_minio_batch_size": batch_size,
+            "will_use_fallback": source == "minio_sdk",
+            "note": notes.get(source, ""),
+        }
     )
 
 
@@ -1475,11 +1681,12 @@ def delta_gold_run():
     _get_spark_manager()
     started = time.perf_counter()
     try:
-        gold_result = run_gold_etl(
-            silver_ocr_path=silver_ocr_path,
-            dataset_id=dataset_id,
-            coalesce_partitions=coalesce_partitions,
-        )
+        with pipeline_etl_slot(operation="gold_etl"):
+            gold_result = run_gold_etl(
+                silver_ocr_path=silver_ocr_path,
+                dataset_id=dataset_id,
+                coalesce_partitions=coalesce_partitions,
+            )
         _record_etl_metric(
             {
                 "etl_name": "gold_etl",
@@ -1495,6 +1702,19 @@ def delta_gold_run():
                 "topic_frequency_top": gold_result.get("topic_frequency_top"),
             }
         )
+    except ResourceGuardError as e:
+        _record_etl_metric(
+            {
+                "etl_name": "gold_etl",
+                "dataset_id": dataset_id,
+                "status": "resource_guard_rejected",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "silver_ocr_path": silver_ocr_path,
+                "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
+                "error": str(e),
+            }
+        )
+        return _json_error(str(e), 400)
     except Exception as e:
         _record_etl_metric(
             {
@@ -1877,11 +2097,12 @@ def delta_silver_ocr_run():
 
     started = time.perf_counter()
     try:
-        result = run_silver_ocr_etl(
-            bronze_path=bronze_path,
-            silver_ocr_path=silver_ocr_path,
-            dataset_id=dataset_id,
-        )
+        with pipeline_etl_slot(operation="silver_ocr_etl"):
+            result = run_silver_ocr_etl(
+                bronze_path=bronze_path,
+                silver_ocr_path=silver_ocr_path,
+                dataset_id=dataset_id,
+            )
         _record_etl_metric(
             {
                 "etl_name": "silver_ocr_etl",
@@ -1904,6 +2125,19 @@ def delta_silver_ocr_run():
                 "Bronze 軟熔斷：隔離占比過高，好列已進 Silver，但不可核准發行版。"
             )
         return jsonify(response)
+    except ResourceGuardError as e:
+        _record_etl_metric(
+            {
+                "etl_name": "silver_ocr_etl",
+                "dataset_id": dataset_id,
+                "status": "resource_guard_rejected",
+                "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "error": str(e),
+                "bronze_path": bronze_path,
+                "silver_ocr_path": silver_ocr_path,
+            }
+        )
+        return _json_error(str(e), 400)
     except BronzeQuarantineError as e:
         quarantine_payload = _bronze_quarantine_for_metric(getattr(e, "report", None)) or {
             "passed": False,
@@ -2144,7 +2378,10 @@ def delta_gold_topic_snapshot_delete():
 @app.post("/delta/pipeline/to-gold/run")
 def delta_pipeline_to_gold_run():
     """
-    一鍵執行完整流程：Bronze OCR -> Silver OCR -> Gold ETL（同一個 dataset_id）。
+    一鍵執行完整流程：補 raw 缺口 Bronze OCR -> Silver OCR -> Gold ETL（同一個 dataset_id）。
+
+    銅層階段會先掃描 MinIO 原圖路徑與 Bronze 差集，以 append + image_paths 一次補齊缺口；
+    無缺口則略過 Bronze OCR。UI 的 write_mode / image_paths 不影響此補缺口步驟。
 
     body:
       {
@@ -2191,8 +2428,17 @@ def delta_pipeline_to_gold_run():
         return _json_error(str(e), 400)
 
     write_mode = body.get("write_mode", "append")
-    if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append"):
-        return _json_error('write_mode 必須是 "overwrite" 或 "append"。', 400)
+    if not isinstance(write_mode, str) or write_mode not in ("overwrite", "append", "merge"):
+        return _json_error('write_mode 必須是 "overwrite"、"append" 或 "merge"。', 400)
+
+    image_paths: list[str] | None = None
+    raw_paths = body.get("image_paths")
+    if raw_paths is not None:
+        if not isinstance(raw_paths, list):
+            return _json_error("image_paths 必須是 array。", 400)
+        image_paths = [str(p).strip() for p in raw_paths if str(p).strip()]
+    if write_mode == "merge" and not image_paths:
+        return _json_error('write_mode="merge" 時必須提供 image_paths（至少一筆）。', 400)
 
     try:
         coalesce_partitions = _body_get_int(body, "coalesce_partitions", 1)
@@ -2217,6 +2463,10 @@ def delta_pipeline_to_gold_run():
 
     dry_run = _body_get_bool(body, "dry_run", False)
     if dry_run:
+        try:
+            gap = _resolve_raw_backfill_gap(dataset_id)
+        except ValueError as e:
+            return _json_error(str(e), 400)
         return jsonify(
             {
                 "status": "dry_run",
@@ -2227,24 +2477,37 @@ def delta_pipeline_to_gold_run():
                 "silver_ocr_path": SILVER_OCR_TABLE_PATH,
                 "tfidf_path": GOLD_TFIDF_KEYWORDS_PATH,
                 "write_mode": write_mode,
+                "image_paths": image_paths,
                 "coalesce_partitions": coalesce_partitions,
                 "skip_gold_if_no_new_ocr": skip_gold_if_no_new_ocr,
+                "raw_backfill_count": int(gap.get("missing_count") or 0),
+                "raw_backfill_truncated": bool(gap.get("truncated")),
             }
         )
 
     spark = _get_spark_manager().spark
-    # 前置檢查：來源路徑至少有 1 張圖
+    if not (write_mode == "merge" and image_paths):
+        try:
+            sample = preview_raw_images_sample(spark, raw_images_path, limit=1)
+        except Exception as e:
+            return _json_error(f"檢查來源路徑失敗：{e}", 400)
+        if not sample:
+            return _json_error(
+                "來源 dataset_id 沒有可處理圖片。",
+                400,
+                dataset_id=dataset_id,
+                raw_images_path=raw_images_path,
+            )
+
     try:
-        sample = preview_raw_images_sample(spark, raw_images_path, limit=1)
-    except Exception as e:
-        return _json_error(f"檢查來源路徑失敗：{e}", 400)
-    if not sample:
-        return _json_error(
-            "來源 dataset_id 沒有可處理圖片。",
-            400,
-            dataset_id=dataset_id,
-            raw_images_path=raw_images_path,
-        )
+        gap = _resolve_raw_backfill_gap(dataset_id)
+        backfill_count = int(gap.get("missing_count") or 0)
+        if backfill_count > 0:
+            check_bronze_ocr_batch(backfill_count)
+    except ValueError as e:
+        return _json_error(str(e), 400)
+    except ResourceGuardError as e:
+        return _json_error(str(e), 400)
 
     if _body_get_bool(body, "async", False):
         jid = job_registry.create("pipeline_to_gold", step_total=3)
@@ -2257,6 +2520,7 @@ def delta_pipeline_to_gold_run():
                 coalesce_partitions=coalesce_partitions,
                 skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
                 progress=progress,
+                image_paths=image_paths,
             )
 
         job_registry.run_async(jid, work)
@@ -2280,8 +2544,11 @@ def delta_pipeline_to_gold_run():
             coalesce_partitions=coalesce_partitions,
             skip_gold_if_no_new_ocr=skip_gold_if_no_new_ocr,
             progress=_noop_progress,
+            image_paths=image_paths,
         )
         return jsonify(payload)
+    except ResourceGuardError as e:
+        return _json_error(str(e), 400)
     except ValueError as e:
         return _json_error(str(e), 400)
     except Exception as e:
@@ -2375,6 +2642,14 @@ def delta_ocr_bronze_run():
             "write_mode": write_mode,
             "image_paths": image_paths,
         }
+        try:
+            spark_dr = _get_spark_manager().spark
+            src = resolve_bronze_image_source(spark_dr, raw_images_path)
+            payload["image_source"] = src
+            payload["ocr_minio_batch_size"] = resolve_ocr_minio_batch_size()
+            payload["will_use_fallback"] = src == "minio_sdk"
+        except Exception as e:
+            _logger.warning("ocr_bronze_dry_run_image_source_failed: %s", e)
         if bool(body.get("include_sample", False)):
             plim = body.get("preview_limit", 5)
             try:
@@ -2406,6 +2681,16 @@ def delta_ocr_bronze_run():
             dataset_id=dataset_id,
             raw_images_path=raw_images_path,
         )
+
+    try:
+        img_count = resolve_bronze_ocr_image_count(
+            dataset_id=dataset_id,
+            image_paths=image_paths,
+            raw_images_path=raw_images_path,
+        )
+        check_bronze_ocr_batch(img_count)
+    except ResourceGuardError as e:
+        return _json_error(str(e), 400)
 
     if bool(body.get("async", False)):
         jid = job_registry.create("bronze_ocr", step_total=1)
@@ -2443,6 +2728,8 @@ def delta_ocr_bronze_run():
             progress=_noop_progress,
         )
         return jsonify(out)
+    except ResourceGuardError as e:
+        return _json_error(str(e), 400)
     except ValueError as e:
         return _json_error(str(e), 400)
     except Exception as e:
@@ -2480,7 +2767,7 @@ def api_upload_images():
     if subfolder is not None:
         subfolder = subfolder.strip() or None
 
-    max_mb = int(os.getenv("MAX_UPLOAD_MB", "15"))
+    max_mb = int(MAX_UPLOAD_MB)
     max_bytes = max(1, max_mb) * 1024 * 1024
 
     file_list = request.files.getlist("files")
@@ -2490,6 +2777,12 @@ def api_upload_images():
 
     if not file_list:
         return _json_error("請提供檔案：欄位名 file 或 files。", 400)
+
+    valid_files = [f for f in file_list if f and f.filename]
+    try:
+        check_request_upload(file_count=len(valid_files), max_upload_mb=max_mb)
+    except ResourceGuardError as e:
+        return _json_error(str(e), 400)
 
     dup_policy = request.form.get("on_duplicate", "").strip().lower()
     if dup_policy and dup_policy not in ("suffix", "overwrite"):
@@ -2528,24 +2821,44 @@ def api_upload_images():
     ocr_payload: Dict[str, Any] | None = None
     if run_ocr:
         wm = request.form.get("write_mode", "append").strip().lower()
-        if wm not in ("overwrite", "append"):
-            return _json_error('write_mode 必須是 \"overwrite\" 或 \"append\"。', 400)
+        if wm not in ("overwrite", "append", "merge"):
+            return _json_error('write_mode 必須是 \"overwrite\"、\"append\" 或 \"merge\"。', 400)
+        ocr_image_paths = [str(u.get("s3a_uri") or "").strip() for u in uploaded]
+        ocr_image_paths = [p for p in ocr_image_paths if p]
+        if wm == "merge" and not ocr_image_paths:
+            return _json_error("merge 模式需要上傳成功的 s3a 路徑。", 400)
+        norm_ds = normalize_dataset_id(dataset_id)
+        raw_path = f"{RAW_IMAGES_PATH.rstrip('/')}/{norm_ds}/"
+        try:
+            img_count = resolve_bronze_ocr_image_count(
+                dataset_id=norm_ds,
+                image_paths=ocr_image_paths if wm == "merge" else None,
+                raw_images_path=raw_path,
+            )
+            check_bronze_ocr_batch(img_count)
+        except ResourceGuardError as e:
+            return _json_error(str(e), 400)
         spark = _get_spark_manager().spark
         try:
-            bronze_result = run_bronze_ocr_ingest(
-                spark,
-                raw_images_path=f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
-                bronze_path=BRONZE_TABLE_PATH,
-                write_mode=wm,
-            )
+            with pipeline_etl_slot(operation="upload_then_bronze_ocr"):
+                bronze_result = run_bronze_ocr_ingest(
+                    spark,
+                    raw_images_path=raw_path,
+                    bronze_path=BRONZE_TABLE_PATH,
+                    write_mode=wm,
+                    dataset_id=norm_ds,
+                    image_paths=ocr_image_paths if wm == "merge" else None,
+                )
+        except ResourceGuardError as e:
+            return _json_error(str(e), 400)
         except ValueError as e:
             return _json_error(str(e), 400)
         except Exception as e:
             _logger.exception("upload_then_ocr_failed")
             return _json_error(f"OCR 執行失敗：{e}", 500)
         ocr_payload = {
-            "dataset_id": normalize_dataset_id(dataset_id),
-            "raw_images_path": f"{RAW_IMAGES_PATH.rstrip('/')}/{normalize_dataset_id(dataset_id)}/",
+            "dataset_id": norm_ds,
+            "raw_images_path": raw_path,
             "bronze_path": BRONZE_TABLE_PATH,
             "write_mode": wm,
             "bronze_result": bronze_result,

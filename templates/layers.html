@@ -74,13 +74,15 @@
           <p class="small text-muted mt-2 mb-0">
             目前：{% if selected_dataset_id %}<code>{{ selected_dataset_id }}</code>{% else %}全部 path{% endif %}
             · 每表最多 {{ preview_limit }} 列（非全表）· 時間排序：
-            {% if sort_time == 'asc' %}最舊在前{% else %}最新在前{% endif %}。
+            {% if sort_time == 'asc' %}最舊在前{% else %}最新在前{% endif %}
+            · 表內時間欄為<strong>台北時間</strong>（庫存 UTC）。
           </p>
         </div>
       </form>
 
       <div class="alert alert-light border small mb-4 py-2">
         <strong>說明：</strong><br />
+        · <strong>時間</strong>：Delta／指標以 UTC 寫入；本頁表格與 ETL 指標以<strong>台北時間</strong>顯示。<br />
         · <strong>金層（TF-IDF 落盤）</strong>：讀 Delta 表 <code>{{ gold_path }}</code>，為 ETL 寫入結果。<br />
         · 若「銀層列數遠少於你的圖片張數」，請先確認該 id 的 Bronze OCR 與 Silver ETL 是否已跑完。
       </div>
@@ -113,7 +115,7 @@
               <table class="table table-sm table-striped mb-0 align-middle">
                 <thead class="table-light sticky-top">
                   <tr>
-                    <th class="small">recorded_at</th>
+                    <th class="small">recorded_at（台北）</th>
                     <th class="small">etl_name</th>
                     <th class="small">dataset_id</th>
                     <th class="small">status</th>
@@ -126,7 +128,7 @@
                 <tbody>
                   {% for r in etl_metrics_rows %}
                     <tr>
-                      <td class="small text-break">{{ r.recorded_at or '-' }}</td>
+                      <td class="small text-break">{{ r.recorded_at_display or (r.recorded_at | display_time) or '-' }}</td>
                       <td class="small">{{ r.etl_name or '-' }}</td>
                       <td class="small">{{ r.dataset_id or '全部' }}</td>
                       <td class="small">{{ r.status or '-' }}</td>

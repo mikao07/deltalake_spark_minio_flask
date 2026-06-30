@@ -17,7 +17,10 @@
       <p class="text-muted small mb-3">
         此頁透過瀏覽器呼叫 <code>POST /api/upload/images</code>，檔案會寫入 MinIO
         <code>raw/images</code>。若已設定 <code>ADMIN_TOKEN</code>，請在下方填寫後再上傳。
-        <strong>write_mode</strong> 僅影響 Bronze 表（append／overwrite）。
+        <strong>處理範圍</strong> 決定 Bronze 要處理多少張圖：
+        <strong>全體</strong>＝整個資料夾掃一遍；
+        <strong>指定範圍</strong>＝只處理你這次上傳或選定的圖（補新圖建議）；
+        <strong>整表重寫</strong> 會清掉舊資料，請慎用。
       </p>
       <div class="alert alert-info small py-2 mb-4">
         <strong>建議下一步：</strong> OCR 完成後 →
@@ -114,11 +117,13 @@
             </select>
           </div>
           <div class="mb-3">
-            <label class="form-label">寫入模式（勾選上傳後 Bronze／一鍵金層 時使用）</label>
+            <label class="form-label">處理範圍（勾選上傳後 Bronze／一鍵金層 時使用）</label>
             <select class="form-select" id="write_mode" name="write_mode">
-              <option value="append" selected>append（追加至 Bronze，不覆寫整表）</option>
-              <option value="overwrite">overwrite（覆寫整張 Bronze 表，慎用）</option>
+              <option value="append" selected>全體（整個資料夾的圖都處理）</option>
+              <option value="merge">指定範圍（只處理這次上傳的圖，補新圖建議）</option>
+              <option value="overwrite">整表重寫（會清掉舊資料，慎用）</option>
             </select>
+            <div class="form-text">補 1～2 張新圖請選「指定範圍」，系統只辨識你剛上傳的檔案，不會把資料夾裡幾十張舊圖再跑一遍。</div>
           </div>
           <div class="mb-3">
             <label class="form-label">管理 Token（可選）</label>
@@ -138,14 +143,19 @@
       <div class="card shadow-sm mt-3">
         <div class="card-body">
           <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap">
-            <h2 class="h6 mb-0">Storage Health（MinIO SDK vs Spark S3A）</h2>
+            <h2 class="h6 mb-0">Storage Health 與 OCR 讀圖路徑</h2>
             <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-check-health">檢查健康狀態</button>
           </div>
           <div class="mt-2 small" id="health-status-wrap">
             <span class="badge text-bg-secondary" id="health-badge">未檢查</span>
             <span class="ms-2 text-muted" id="health-text">輸入 dataset_id 後可檢查。</span>
           </div>
-          <div class="small text-muted mt-2" id="health-detail"></div>
+          <div class="mt-2 small" id="health-detail"></div>
+          <div class="mt-2 small border-top pt-2" id="image-source-wrap">
+            <strong>OCR 讀圖路徑：</strong>
+            <span class="badge text-bg-secondary" id="image-source-badge">未檢測</span>
+            <div class="text-muted mt-1" id="image-source-text">輸入 dataset_id 後按「檢查健康狀態」；不執行 OCR、不寫 Bronze。</div>
+          </div>
         </div>
       </div>
 
@@ -181,9 +191,59 @@
         </div>
       </div>
 
+      {% if raw_ingest_rows is defined %}
+      <div class="card shadow-sm mt-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <strong>原圖最新 {{ raw_ingest_limit }} 筆（MinIO → Bronze 狀態）</strong>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btn-refresh-ingest-status">重新整理</button>
+        </div>
+        <div class="card-body">
+          <p class="small text-muted mb-2">
+            依上傳時間排序。「已上傳，尚未辨識」= 檔案在雲端但還沒跑文字辨識；跑完 Bronze 後才會進銀層／金層。
+          </p>
+          {% if raw_ingest_error %}
+            <div class="alert alert-warning py-2 small mb-0">讀取失敗：{{ raw_ingest_error }}</div>
+          {% elif raw_ingest_rows and raw_ingest_rows|length > 0 %}
+            <div class="table-responsive border rounded" style="max-height: 320px; overflow: auto">
+              <table class="table table-sm table-striped mb-0" id="raw-ingest-table">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    <th class="small">上傳時間（台北）</th>
+                    <th class="small">檔名</th>
+                    <th class="small">Bronze</th>
+                    <th class="small">OCR 摘要</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in raw_ingest_rows %}
+                    <tr>
+                      <td class="small text-nowrap">{{ row.last_modified_display or (row.last_modified | display_time) or '—' }}</td>
+                      <td class="small text-break">{{ row.filename }}</td>
+                      <td class="small">
+                        {% if row.in_bronze %}
+                          <span class="badge text-bg-success">已辨識入庫</span>
+                        {% else %}
+                          <span class="badge text-bg-warning">已上傳，尚未辨識</span>
+                        {% endif %}
+                      </td>
+                      <td class="small text-break">{{ row.extracted_text_preview or '—' }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% elif selected_dataset_id %}
+            <p class="text-muted small mb-0">此 dataset 在 MinIO 尚無原圖。</p>
+          {% else %}
+            <p class="text-muted small mb-0">請在上方選擇 dataset_id 以預覽。</p>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+
       {% if bronze_rows is defined %}
       <div class="card shadow-sm mt-3">
-        <div class="card-header py-2"><strong>Bronze 預覽（最多 10 列）</strong></div>
+        <div class="card-header py-2"><strong>Bronze Delta 預覽（最多 {{ raw_ingest_limit|default(10) }} 列）</strong></div>
         <div class="card-body">
           <p class="small text-muted mb-2">{{ bronze_path }}</p>
           {% if bronze_error %}
@@ -264,14 +324,20 @@
               <input class="form-control" id="ocr_dataset_id" placeholder="留空則使用上方 dataset_id" />
             </div>
             <div class="col-12 col-md-4">
-              <label class="form-label">write_mode（僅 Bronze）</label>
+              <label class="form-label">處理範圍（僅 Bronze 辨識）</label>
               <select class="form-select" id="ocr_write_mode">
-                <option value="append" selected>append</option>
-                <option value="overwrite">overwrite</option>
+                <option value="append" selected>全體</option>
+                <option value="merge">指定範圍</option>
+                <option value="overwrite">整表重寫（慎用）</option>
               </select>
             </div>
             <div class="col-12 col-md-2 d-grid">
-              <button type="button" class="btn btn-outline-primary" id="btn-run-ocr">執行 OCR</button>
+              <button type="button" class="btn btn-outline-primary" id="btn-run-ocr">執行辨識</button>
+            </div>
+            <div class="col-12 col-md-12 d-flex flex-wrap gap-2">
+              <button type="button" class="btn btn-sm btn-outline-success" id="btn-ocr-missing-merge">
+                補辨識：只處理「尚未入庫」的圖
+              </button>
             </div>
           </div>
           <p class="small text-muted mt-2 mb-0" id="manual-ocr-note"></p>
@@ -306,6 +372,109 @@
         const d = document.createElement("div");
         d.textContent = s;
         return d.innerHTML;
+      }
+
+      function writeModeLabel(mode) {
+        if (mode === "merge") return "指定範圍";
+        if (mode === "overwrite") return "整表重寫";
+        return "全體";
+      }
+
+      function buildBronzeOcrPayload(datasetId, writeMode, imagePaths) {
+        const body = { dataset_id: datasetId, write_mode: writeMode, dry_run: false };
+        if (writeMode === "merge" && imagePaths && imagePaths.length) {
+          body.image_paths = imagePaths;
+        }
+        return body;
+      }
+
+      async function refreshRawIngestStatus() {
+        const datasetId = document.getElementById("dataset_id").value.trim().toLowerCase();
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = {};
+        if (tok) headers["X-Admin-Token"] = tok;
+        const tbody = document.querySelector("#raw-ingest-table tbody");
+        if (!datasetId || !tbody) return;
+        try {
+          const res = await fetch(
+            "/api/bronze/raw-ingest-status?dataset_id=" +
+              encodeURIComponent(datasetId) +
+              "&limit=10",
+            { headers: headers }
+          );
+          const data = await res.json();
+          if (!res.ok) throw new Error((data && data.error) || "讀取失敗");
+          tbody.innerHTML = "";
+          const items = (data && data.items) || [];
+          items.forEach(function (row) {
+            const tr = document.createElement("tr");
+            const badge = row.in_bronze
+              ? '<span class="badge text-bg-success">已辨識入庫</span>'
+              : '<span class="badge text-bg-warning">已上傳，尚未辨識</span>';
+            tr.innerHTML =
+              "<td class=\"small text-nowrap\">" +
+              escapeHtml(row.last_modified_display || row.last_modified || "—") +
+              "</td><td class=\"small text-break\">" +
+              escapeHtml(row.filename || "—") +
+              "</td><td class=\"small\">" +
+              badge +
+              "</td><td class=\"small text-break\">" +
+              escapeHtml(row.extracted_text_preview || "—") +
+              "</td>";
+            tbody.appendChild(tr);
+          });
+        } catch (err) {
+          console.warn("refresh ingest status failed", err);
+        }
+      }
+
+      var btnRefreshIngest = document.getElementById("btn-refresh-ingest-status");
+      if (btnRefreshIngest) {
+        btnRefreshIngest.addEventListener("click", refreshRawIngestStatus);
+      }
+
+      function setImageSource(data) {
+        const badge = document.getElementById("image-source-badge");
+        const txt = document.getElementById("image-source-text");
+        if (!data || !data.image_source) {
+          badge.className = "badge text-bg-secondary";
+          badge.textContent = "未檢測";
+          txt.textContent = "無法取得讀圖路徑。";
+          return;
+        }
+        const src = data.image_source;
+        const map = {
+          binaryFile: "text-bg-success",
+          minio_sdk: "text-bg-warning",
+        };
+        badge.className = "badge " + (map[src] || "text-bg-secondary");
+        badge.textContent = src;
+        const lines = [data.image_source_label || src];
+        if (typeof data.ocr_minio_batch_size === "number" && src === "minio_sdk") {
+          lines.push("分批大小：每批最多 " + data.ocr_minio_batch_size + " 張。");
+        }
+        if (data.note) lines.push(data.note);
+        if (data.raw_images_path) lines.push("路徑：" + data.raw_images_path);
+        txt.textContent = lines.join(" ");
+      }
+
+      async function fetchBronzeImageSource(datasetId, headers) {
+        const res = await fetch(
+          "/api/bronze/image-source?dataset_id=" + encodeURIComponent(datasetId),
+          { headers: headers || {} }
+        );
+        const txt = await res.text();
+        let data = {};
+        try {
+          data = JSON.parse(txt);
+        } catch (_) {}
+        if (!res.ok) {
+          setImageSource(null);
+          document.getElementById("image-source-text").textContent =
+            "讀圖路徑檢測失敗：" + ((data && data.error) || txt || res.statusText);
+          return;
+        }
+        setImageSource(data);
       }
 
       function setHealth(status, text, detail) {
@@ -357,8 +526,10 @@
             ((data.spark_binaryfile && data.spark_binaryfile.count) ?? "-") +
             (data.hint ? " | " + data.hint : "");
           setHealth(s, "dataset_id=" + datasetId, detail);
+          await fetchBronzeImageSource(datasetId, headers);
         } catch (err) {
           setHealth("down", "檢查失敗", String(err));
+          setImageSource(null);
         }
       }
 
@@ -402,6 +573,7 @@
 
         btn.disabled = true;
         let anyUploaded = false;
+        const uploadedS3a = [];
 
         try {
           for (let i = 0; i < fileInput.files.length; i++) {
@@ -442,6 +614,7 @@
             }
             appendRow(tbody, parts.folder, parts.name, statusLine, true);
             anyUploaded = true;
+            if (item.s3a_uri) uploadedS3a.push(item.s3a_uri);
           }
 
           if (runPipelineGold && anyUploaded) {
@@ -458,7 +631,8 @@
               writeMode,
               headers,
               uploadProg,
-              getSkipGoldIfNoNewOcr()
+              getSkipGoldIfNoNewOcr(),
+              writeMode === "merge" ? uploadedS3a : null
             );
             if (pipeResult.ok) {
               const gr =
@@ -485,8 +659,8 @@
                 const goldRows =
                   gr && typeof gr.tfidf_output_rows === "number" ? gr.tfidf_output_rows : "—";
                 ocrNote.textContent =
-                  "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" +
-                  writeMode +
+                  "一鍵金層：成功（已跑銅層 → 銀層 → 金層，處理範圍=" +
+                  writeModeLabel(writeMode) +
                   "）｜是否成功寫入金層：" +
                   (goldWritten || "—") +
                   "｜Silver 筆數：" +
@@ -497,7 +671,7 @@
                   summary;
               } else {
                 ocrNote.textContent =
-                  "一鍵金層：成功（已跑 Bronze → Silver → Gold，write_mode=" + writeMode + "）";
+                  "一鍵金層：成功（已跑銅層 → 銀層 → 金層，處理範圍=" + writeModeLabel(writeMode) + "）";
               }
               ocrNote.className = "small text-success mt-2 mb-0";
             } else {
@@ -512,7 +686,13 @@
             const ocrRes = await fetch("/delta/ocr/bronze/run", {
               method: "POST",
               headers: ocrHeaders,
-              body: JSON.stringify({ dataset_id: datasetId, write_mode: writeMode, dry_run: false }),
+              body: JSON.stringify(
+                buildBronzeOcrPayload(
+                  datasetId,
+                  writeMode,
+                  writeMode === "merge" ? uploadedS3a : null
+                )
+              ),
             });
             const ocrText = await ocrRes.text();
             let ocrData = null;
@@ -521,13 +701,16 @@
             } catch (_) {}
             ocrNote.classList.remove("d-none");
             if (ocrRes.ok && ocrData && ocrData.status === "ok") {
-              ocrNote.textContent = "Bronze OCR：成功（write_mode=" + writeMode + "）";
+              ocrNote.textContent = "銅層辨識：成功（處理範圍=" + writeModeLabel(writeMode) + "）";
               ocrNote.className = "small text-success mt-2 mb-0";
             } else {
               const em = ocrData && ocrData.error ? ocrData.error : ocrText.slice(0, 300);
               ocrNote.textContent = "Bronze OCR：失敗 — " + em;
               ocrNote.className = "small text-danger mt-2 mb-0";
             }
+          }
+          if (anyUploaded) {
+            await refreshRawIngestStatus();
           }
         } catch (err) {
           appendRow(tbody, "—", "—", "失敗：" + String(err), false);
@@ -643,7 +826,14 @@
        * 回傳 { ok, error?, step?, result? }
        * @param skipGoldIfNoNewOcr 若為 true（預設），與後端預設相同：本次 Bronze 無新增時跳過銀／金層。
        */
-      async function runPipelineToGoldWithProgress(datasetId, writeMode, headers, progressUi, skipGoldIfNoNewOcr) {
+      async function runPipelineToGoldWithProgress(
+        datasetId,
+        writeMode,
+        headers,
+        progressUi,
+        skipGoldIfNoNewOcr,
+        imagePaths
+      ) {
         if (typeof skipGoldIfNoNewOcr === "undefined") {
           skipGoldIfNoNewOcr = true;
         }
@@ -653,17 +843,22 @@
         progressUi.show();
         progressUi.set(0, 3, "送出背景任務…", 5);
 
+        const pipeBody = {
+          dataset_id: datasetId,
+          write_mode: writeMode,
+          coalesce_partitions: 1,
+          dry_run: false,
+          async: true,
+          skip_gold_if_no_new_ocr: skipGoldIfNoNewOcr,
+        };
+        if (writeMode === "merge" && imagePaths && imagePaths.length) {
+          pipeBody.image_paths = imagePaths;
+        }
+
         const submitRes = await fetch("/delta/pipeline/to-gold/run", {
           method: "POST",
           headers: h,
-          body: JSON.stringify({
-            dataset_id: datasetId,
-            write_mode: writeMode,
-            coalesce_partitions: 1,
-            dry_run: false,
-            async: true,
-            skip_gold_if_no_new_ocr: skipGoldIfNoNewOcr,
-          }),
+          body: JSON.stringify(pipeBody),
         });
         const submitTxt = await submitRes.text();
         let submitData = {};
@@ -945,11 +1140,7 @@
           const res = await fetch("/delta/ocr/bronze/run", {
             method: "POST",
             headers,
-            body: JSON.stringify({
-              dataset_id: datasetId,
-              write_mode: writeMode,
-              dry_run: false,
-            }),
+            body: JSON.stringify(buildBronzeOcrPayload(datasetId, writeMode, null)),
           });
           const txt = await res.text();
           let data = {};
@@ -967,6 +1158,68 @@
             (data.dataset_id || datasetId) +
             "，來源=" +
             (data.raw_images_path || "—");
+          await refreshRawIngestStatus();
+        } catch (err) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "OCR 失敗：" + String(err);
+        }
+      });
+
+      document.getElementById("btn-ocr-missing-merge").addEventListener("click", async function () {
+        const note = document.getElementById("manual-ocr-note");
+        const datasetId = resolveManualDatasetId();
+        if (!datasetId) {
+          note.className = "small text-danger mt-2 mb-0";
+          note.textContent = "請先在上方填寫 dataset_id。";
+          return;
+        }
+        const tok = document.getElementById("admin_token").value.trim();
+        const headers = { "Content-Type": "application/json" };
+        if (tok) headers["X-Admin-Token"] = tok;
+
+        note.className = "small text-muted mt-2 mb-0";
+        note.textContent = "查詢尚未入庫的圖…";
+        try {
+          const stRes = await fetch(
+            "/api/bronze/raw-ingest-status?dataset_id=" +
+              encodeURIComponent(datasetId) +
+              "&limit=50&only_missing=1",
+            { headers: tok ? { "X-Admin-Token": tok } : {} }
+          );
+          const stData = await stRes.json();
+          if (!stRes.ok) {
+            throw new Error((stData && stData.error) || "查詢失敗");
+          }
+          const paths = ((stData && stData.items) || [])
+            .map(function (r) {
+              return r.s3a_uri;
+            })
+            .filter(Boolean);
+          if (!paths.length) {
+            note.className = "small text-warning mt-2 mb-0";
+            note.textContent = "沒有「尚未入庫」的圖；可能都已辨識完成。";
+            return;
+          }
+          note.textContent = "指定範圍辨識中（" + paths.length + " 張）…";
+          const res = await fetch("/delta/ocr/bronze/run", {
+            method: "POST",
+            headers: headers,
+            body: JSON.stringify(buildBronzeOcrPayload(datasetId, "merge", paths)),
+          });
+          const txt = await res.text();
+          let data = {};
+          try {
+            data = JSON.parse(txt);
+          } catch (_) {}
+          if (!res.ok) {
+            note.className = "small text-danger mt-2 mb-0";
+            note.textContent = "OCR 失敗：" + ((data && data.error) || txt || res.statusText);
+            return;
+          }
+          note.className = "small text-success mt-2 mb-0";
+          note.textContent =
+            "補辨識成功：" + paths.length + " 張；實際處理=" + (data.processed_rows || "—");
+          await refreshRawIngestStatus();
         } catch (err) {
           note.className = "small text-danger mt-2 mb-0";
           note.textContent = "OCR 失敗：" + String(err);

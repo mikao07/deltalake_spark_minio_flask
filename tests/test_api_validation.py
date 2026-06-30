@@ -211,6 +211,17 @@ def test_delta_gold_run_dry_run_with_dataset(monkeypatch):
 
 def test_delta_pipeline_to_gold_run_dry_run(monkeypatch):
     c = _client(monkeypatch)
+    import app as flask_app
+
+    monkeypatch.setattr(
+        flask_app,
+        "_resolve_raw_backfill_gap",
+        lambda dataset_id: {
+            "missing_count": 2,
+            "missing_paths": ["s3a://data-lake/raw/images/invoice_ocr/a.png"],
+            "truncated": False,
+        },
+    )
     r = c.post(
         "/delta/pipeline/to-gold/run",
         json={"dry_run": True, "dataset_id": "invoice_ocr"},
@@ -219,6 +230,7 @@ def test_delta_pipeline_to_gold_run_dry_run(monkeypatch):
     j = r.get_json()
     assert j["status"] == "dry_run"
     assert j["dataset_id"] == "invoice_ocr"
+    assert j["raw_backfill_count"] == 2
     assert "steps" in j
 
 
@@ -259,6 +271,11 @@ def test_delta_pipeline_to_gold_async_returns_accepted(monkeypatch):
     c = _client(monkeypatch)
     import app as flask_app
 
+    monkeypatch.setattr(
+        flask_app,
+        "_resolve_raw_backfill_gap",
+        lambda dataset_id: {"missing_count": 0, "missing_paths": [], "truncated": False},
+    )
     monkeypatch.setattr(
         flask_app,
         "preview_raw_images_sample",
@@ -339,11 +356,101 @@ def test_health_storage_ok_with_mock(monkeypatch):
     monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _DummySpark())
     monkeypatch.setattr(flask_app, "get_minio_client", lambda: _DummyClient())
     monkeypatch.setattr(flask_app, "ensure_bucket", lambda client, bucket: None)
-    monkeypatch.setattr(flask_app, "preview_raw_images_sample", lambda spark, path, limit=10: [{"x": 1}])
+    monkeypatch.setattr(
+        flask_app,
+        "count_binaryfile_images",
+        lambda spark, path, limit=None: 3,
+    )
 
     r = c.get("/api/health/storage?dataset_id=drinks&limit=5")
     assert r.status_code == 200
     j = r.get_json()
-    assert j["status"] in ("ok", "degraded")
+    assert j["status"] == "ok"
+    assert j["spark_binaryfile"]["count"] == 3
     assert "minio_sdk" in j
     assert "spark_binaryfile" in j
+
+
+def test_health_storage_degraded_when_binaryfile_zero(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    class _DummySpark:
+        spark = object()
+
+    class _DummyClient:
+        def bucket_exists(self, bucket):
+            return True
+
+        def list_objects(self, bucket, prefix=None, recursive=False):
+            yield object()
+
+    monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _DummySpark())
+    monkeypatch.setattr(flask_app, "get_minio_client", lambda: _DummyClient())
+    monkeypatch.setattr(flask_app, "ensure_bucket", lambda client, bucket: None)
+    monkeypatch.setattr(
+        flask_app,
+        "count_binaryfile_images",
+        lambda spark, path, limit=None: 0,
+    )
+
+    r = c.get("/api/health/storage?dataset_id=drinks&limit=5")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["status"] == "degraded"
+    assert j["spark_binaryfile"]["count"] == 0
+    assert j["minio_sdk"]["count"] == 1
+    assert "binaryFile" in j["hint"]
+
+
+def test_bronze_image_source_with_mock(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    class _DummySpark:
+        spark = object()
+
+    monkeypatch.setattr(flask_app, "_get_spark_manager", lambda: _DummySpark())
+    monkeypatch.setattr(
+        flask_app,
+        "resolve_bronze_image_source",
+        lambda spark, path: "binaryFile",
+    )
+    monkeypatch.setattr(flask_app, "resolve_ocr_minio_batch_size", lambda: 20)
+
+    r = c.get("/api/bronze/image-source?dataset_id=drinks")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["image_source"] == "binaryFile"
+    assert j["will_use_fallback"] is False
+    assert j["ocr_minio_batch_size"] == 20
+
+
+def test_bronze_image_source_requires_dataset(monkeypatch):
+    c = _client(monkeypatch)
+    r = c.get("/api/bronze/image-source")
+    assert r.status_code == 400
+    assert "dataset_id" in r.get_json()["error"]
+
+
+def test_bronze_raw_ingest_status_with_mock(monkeypatch):
+    c = _client(monkeypatch)
+    import app as flask_app
+
+    monkeypatch.setattr(
+        flask_app,
+        "list_raw_ingest_status",
+        lambda dataset_id, limit=10, only_missing=False: [
+            {
+                "filename": "2026-06-30_160218.png",
+                "in_bronze": False,
+                "bronze_status": "已上傳，尚未辨識",
+            }
+        ],
+    )
+    r = c.get("/api/bronze/raw-ingest-status?dataset_id=drinks&limit=10")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["dataset_id"] == "drinks"
+    assert len(j["items"]) == 1
+    assert j["items"][0]["in_bronze"] is False

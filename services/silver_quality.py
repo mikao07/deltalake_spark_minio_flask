@@ -1,7 +1,7 @@
 """
-銀層資料品質：三道防線（Schema、Token 分佈、下游對齊）。
+銀層資料品質：三道防線（Schema、Token 分佈、留存）。
 
-- Hard fail：阻擋 ETL 成功回報（主鍵、雜訊率、Top-N denylist）
+- Hard fail：阻擋 ETL 成功回報（主鍵、雜訊率）
 - Soft warn：寫入報告與 log，不阻擋（空 tokens、超長詞、留存率）
 """
 
@@ -25,7 +25,6 @@ from config import (
     SILVER_QUALITY_MIN_CHAR_RETENTION_RATIO,
     SILVER_QUALITY_MIN_NONEMPTY_TOKENS_RATIO,
     SILVER_QUALITY_TOP_N,
-    SILVER_TOP_TOKEN_DENYLIST,
     SILVER_TRANSFORM_VERSION,
 )
 from services.text_tokens import strip_pure_digit_tokens
@@ -36,34 +35,6 @@ _logger = logging.getLogger(__name__)
 _NOISE_CLEANED_TEXT_RE = re.compile(
     r"(?:\d{4,}|\?{3,}|<\s*html|&[a-z]+;)",
     flags=re.IGNORECASE,
-)
-
-_TOP_DENYLIST_DEFAULT = frozenset(
-    w.lower()
-    for w in (
-        "2222",
-        "????",
-        "<html",
-        "html",
-        "png",
-        "img",
-        "ocr_error",
-        # TF-IDF 探索 Top 不應出現的贅詞／場景詞
-        "自己",
-        "不用",
-        "知道",
-        "結果",
-        "店員",
-        "店员",
-        "飲料",
-        "饮料",
-        "珍珠",
-        "奶茶",
-        "只是",
-        "另外",
-        "到底",
-        "兩次",
-    )
 )
 
 
@@ -154,11 +125,6 @@ def compute_row_metrics(
             p.isdigit() for p in cleaned.split() if p
         ),
     }
-
-
-def _top_token_denylist() -> frozenset[str]:
-    extra = {str(w).strip().lower() for w in SILVER_TOP_TOKEN_DENYLIST if str(w).strip()}
-    return _TOP_DENYLIST_DEFAULT | extra
 
 
 def evaluate_silver_quality_metrics(metrics: Dict[str, Any]) -> SilverQualityReport:
@@ -259,17 +225,6 @@ def evaluate_silver_quality_metrics(metrics: Dict[str, Any]) -> SilverQualityRep
         f"長度 > 10 的 token 占比 {long_ratio:.2%}（門檻 {SILVER_QUALITY_MAX_LONG_TOKEN_RATIO:.2%}）",
         value=long_ratio,
         threshold=SILVER_QUALITY_MAX_LONG_TOKEN_RATIO,
-    )
-
-    denylist = _top_token_denylist()
-    top_tokens: List[str] = list(metrics.get("top_tokens") or [])
-    hits = [t for t in top_tokens[: SILVER_QUALITY_TOP_N] if t in denylist]
-    add_check(
-        "top_token_denylist",
-        "hard",
-        not hits,
-        f"Top-{SILVER_QUALITY_TOP_N} 含禁止詞：{hits}" if hits else "Top-N 未命中禁止詞",
-        value=hits,
     )
 
     # --- 第三道：留存（銀層段）---
@@ -438,67 +393,3 @@ def run_silver_quality_gate(
         raise SilverQualityError("; ".join(report.hard_failures), report=payload)
 
     return payload
-
-
-def evaluate_gold_downstream_quality(
-    *,
-    corpus_doc_count: int,
-    tfidf_output_rows: int,
-    topic_output_rows: int,
-    tfidf_top: Sequence[Dict[str, Any]] | None = None,
-) -> Dict[str, Any]:
-    """第三道防線（金層段）：下游 TF-IDF / 痛點是否可分析。"""
-    checks: List[QualityCheck] = []
-    warnings: List[str] = []
-    hard_failures: List[str] = []
-
-    if corpus_doc_count <= 0:
-        return {"passed": True, "skipped": True, "reason": "empty_corpus"}
-
-    tfidf_ok = tfidf_output_rows > 0
-    checks.append(
-        QualityCheck(
-            "tfidf_nonempty",
-            "warn",
-            tfidf_ok,
-            f"TF-IDF 輸出列數 {tfidf_output_rows}",
-            value=tfidf_output_rows,
-        )
-    )
-    if not tfidf_ok:
-        warnings.append(f"TF-IDF 輸出為 0（語料 {corpus_doc_count} 筆）")
-
-    denylist = _top_token_denylist()
-    top_kw = [str(r.get("keyword", "")).lower() for r in (tfidf_top or [])[:10]]
-    junk_hits = [k for k in top_kw if k in denylist]
-    checks.append(
-        QualityCheck(
-            "tfidf_top_not_junk",
-            "warn",
-            not junk_hits,
-            f"TF-IDF Top 含雜訊詞：{junk_hits}" if junk_hits else "TF-IDF Top 未含禁止詞",
-            value=junk_hits,
-        )
-    )
-    if junk_hits:
-        warnings.append(f"TF-IDF Top 命中禁止詞：{junk_hits}")
-
-    if corpus_doc_count >= 5 and topic_output_rows == 0:
-        warnings.append("語料 ≥5 筆但痛點主題輸出為 0，請檢查 lexicon 是否過濾過頭")
-
-    passed = not hard_failures
-    return {
-        "passed": passed,
-        "warnings": warnings,
-        "hard_failures": hard_failures,
-        "checks": [
-            {
-                "name": c.name,
-                "severity": c.severity,
-                "passed": c.passed,
-                "message": c.message,
-                "value": c.value,
-            }
-            for c in checks
-        ],
-    }

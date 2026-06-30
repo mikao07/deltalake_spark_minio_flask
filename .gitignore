@@ -35,8 +35,10 @@ commitmsg*.txt
 
 # 本機除錯筆記與 AB 暫存（公開 repo 不提交）
 docs/問題日誌.md
-docs/管線執行步驟.txt
+docs/建構日誌.md
+docs/日誌索引.md
 docs/架構與維運手冊.md
+docs/ai/
 var/
 
 # IDE / editor

@@ -10,12 +10,13 @@ Bronze 列級隔離：OCR 明顯無效列不進 Silver，並寫入 quarantine De
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, current_timestamp, length, lit, trim, when
 from pyspark.sql.types import StringType
+
+from services.timezone_policy import utc_now_iso
 
 from config import (
     BRONZE_QUARANTINE_ENABLED,
@@ -343,7 +344,7 @@ def apply_bronze_quarantine_gate(
             "skipped": False,
             "quarantine_path": quarantine_path,
             "dataset_id": dataset_id,
-            "evaluated_at": datetime.utcnow().isoformat(),
+            "evaluated_at": utc_now_iso(),
         }
     )
 

@@ -15,6 +15,7 @@
 - **銀層封板**：`SILVER_TRANSFORM_VERSION=v2.1.0`（CJK 去空格、emoji／洋文垃圾清洗）+ 三道品質閘門；**不**套用領域停用詞（留給 Gold）
 - **Bronze 列級隔離**：Silver ETL 前三層熔斷（≤10% 僅隔離；>10% 軟熔斷擋核准；≥30% 硬停）；首頁顯示母體完整度（有效 OCR：analyzed/raw）
 - **上傳僅截圖**：`POST /api/upload/images` 寫入前拒絕影片與假圖片（副檔名 + 檔頭）；不支援影片 OCR
+- **分層防錯**：P3 Resource Guard（門口）→ Bronze 隔離熔斷 → Silver 品質閘門 → 守護神／manifest 發行；摘要見 `docs/OCR-決策紀錄.md`「防錯與治理體系」
 - **金層雙軌**：`analytics_tokens` → 痛點漏斗（商業輸出）；`tfidf_exploration_tokens` → Phase A 探索（避免虛詞淹沒 Top）
 - **管線守護神**：`python scripts/pipeline_guardian.py --dataset drinks` 比對銅銀簽名與金層辭典 hash（防改詞忘 bump）；詳見 `manifests/README.md`
 - **變更有代價**：改 OCR 須 Bronze `overwrite`；只重跑 Silver **不會**更新 `extracted_text`（見決策紀錄）

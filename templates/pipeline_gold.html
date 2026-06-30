@@ -23,7 +23,7 @@
       <p class="text-muted small mb-3">
         從 Silver 讀取 tokens → 痛點主題／TF-IDF／PMI → 寫入 Gold 表。圖表與痛點快照請至
         <a href="{{ url_for('index', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('index') }}">Dashboard</a>。
-        <strong>write_mode</strong> 僅在<a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">銅層頁</a>設定；一鍵管線在此固定使用 Bronze append。
+        <strong>處理範圍</strong> 請在<a href="{{ url_for('pipeline_bronze_page', dataset_id=selected_dataset_id) if selected_dataset_id else url_for('pipeline_bronze_page') }}">銅層頁</a>設定；一鍵管線在此固定使用「全體」。
       </p>
       <div class="alert alert-info small py-2 mb-4">
         <strong>建議下一步：</strong> ETL 完成後 →

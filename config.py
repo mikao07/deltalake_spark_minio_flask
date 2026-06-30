@@ -118,11 +118,6 @@ SILVER_QUALITY_MAX_EMPTY_CLEANED_RATIO = _env_float("SILVER_QUALITY_MAX_EMPTY_CL
 SILVER_QUALITY_MIN_NONEMPTY_TOKENS_RATIO = _env_float("SILVER_QUALITY_MIN_NONEMPTY_TOKENS_RATIO", 0.3)
 SILVER_QUALITY_MIN_CHAR_RETENTION_RATIO = _env_float("SILVER_QUALITY_MIN_CHAR_RETENTION_RATIO", 0.15)
 SILVER_QUALITY_TOP_N = int(os.getenv("SILVER_QUALITY_TOP_N", "50"))
-SILVER_TOP_TOKEN_DENYLIST = tuple(
-    w.strip()
-    for w in os.getenv("SILVER_TOP_TOKEN_DENYLIST", "").split(",")
-    if w.strip()
-)
 
 # Bronze 列級隔離（Silver ETL 前；寫入 quarantine Delta）
 BRONZE_QUARANTINE_ENABLED = _env_bool("BRONZE_QUARANTINE_ENABLED", True)
@@ -137,6 +132,13 @@ BRONZE_QUARANTINE_MIN_TEXT_LEN = int(os.getenv("BRONZE_QUARANTINE_MIN_TEXT_LEN",
 BRONZE_QUARANTINE_MELT_MODE = os.getenv("BRONZE_QUARANTINE_MELT_MODE", "soft").strip().lower()
 if BRONZE_QUARANTINE_MELT_MODE not in ("soft", "hard"):
     BRONZE_QUARANTINE_MELT_MODE = "soft"
+
+# Bronze merge 前自動歸檔舊列（懶建立：第一次 merge 才 append 至 history Delta）
+BRONZE_HISTORY_ON_MERGE = _env_bool("BRONZE_HISTORY_ON_MERGE", True)
+BRONZE_HISTORY_PATH = os.getenv(
+    "BRONZE_HISTORY_PATH",
+    f"s3a://{BUCKET_NAME}/bronze/history/",
+)
 
 # Notebook：RAW_IMAGE_PREFIX（用於拼 RAW_IMAGES_PATH）
 RAW_IMAGE_PREFIX = os.getenv("RAW_IMAGE_PREFIX", "raw/images/")
@@ -181,6 +183,26 @@ OCR_AB_RESULTS_PATH = os.getenv(
 # 上傳至 MinIO 時若物件已存在：suffix=自動改檔名加時間戳；overwrite=直接覆寫
 UPLOAD_ON_DUPLICATE = os.getenv("UPLOAD_ON_DUPLICATE", "suffix").strip().lower()
 
+# ---------------------------------------------------------------------------
+# Resource Guard（P3：Request / Pipeline / Runtime 三層資源保護）
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
+MAX_UPLOAD_FILES_PER_REQUEST = int(os.getenv("MAX_UPLOAD_FILES_PER_REQUEST", "20"))
+MAX_BRONZE_OCR_IMAGES = int(os.getenv("MAX_BRONZE_OCR_IMAGES", "100"))
+# P4：MinIO SDK fallback 分批讀圖（每批最多 N 張進 driver；不超過 MAX_BRONZE_OCR_IMAGES）
+OCR_MINIO_BATCH_SIZE = int(os.getenv("OCR_MINIO_BATCH_SIZE", "20"))
+ETL_MAX_CONCURRENT_JOBS = int(os.getenv("ETL_MAX_CONCURRENT_JOBS", "1"))
+ETL_MEMORY_MAX_PERCENT = _env_float("ETL_MEMORY_MAX_PERCENT", 85.0)
+ETL_MEMORY_MIN_AVAILABLE_MB = int(os.getenv("ETL_MEMORY_MIN_AVAILABLE_MB", "1536"))
+ETL_RESOURCE_GUARD_ENABLED = _env_bool("ETL_RESOURCE_GUARD_ENABLED", True)
+# Spark local 模式（driver 為主；executor 設定供對齊／未來叢集）
+SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "2g").strip() or "2g"
+SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "2g").strip() or "2g"
+SPARK_DRIVER_MAX_RESULT_SIZE = os.getenv("SPARK_DRIVER_MAX_RESULT_SIZE", "512m").strip() or "512m"
+# P3.1 預留（尚未接入執行逾時）
+OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "30"))
+SPARK_JOB_TIMEOUT_SECONDS = int(os.getenv("SPARK_JOB_TIMEOUT_SECONDS", "300"))
+
 # 管線新鮮度／外部探針（cron：pipeline_freshness_check.py）
 PIPELINE_HEARTBEAT_FILE = os.getenv("PIPELINE_HEARTBEAT_FILE", "var/pipeline_heartbeat.json")
 PIPELINE_FRESHNESS_STATE_FILE = os.getenv(
@@ -199,4 +221,10 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 # LINE Messaging API（Notify 已停服；Bot push 至指定 User ID）
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_PUSH_USER_ID = os.getenv("LINE_PUSH_USER_ID", "").strip()
+
+# -------------------------
+# 時區政策（Delta／指標存 UTC；UI 顯示台北）
+# -------------------------
+STORAGE_TIMEZONE = os.getenv("STORAGE_TIMEZONE", "UTC")
+DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "Asia/Taipei")
 

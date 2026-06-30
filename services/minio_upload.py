@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime
+
+from services.timezone_policy import DISPLAY_TZ
 from typing import BinaryIO
 from urllib.parse import urlparse
 
@@ -168,7 +170,7 @@ def _resolve_object_key(
         dir_part, fname = "", base_key
 
     stem, ext = os.path.splitext(fname)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(DISPLAY_TZ).strftime("%Y%m%d_%H%M%S")
     n = 0
     while True:
         suffix = f"_{ts}" if n == 0 else f"_{ts}_{n}"
@@ -177,6 +179,29 @@ def _resolve_object_key(
         if not _object_exists(client, bucket, candidate_key):
             return candidate_key, True, base_key
         n += 1
+
+
+def _sanitize_upload_basename(filename: str) -> str:
+    """
+    正規化上傳檔名。Spark binaryFile 會忽略以 _ 或 . 開頭的路徑，故須去掉前導底線。
+    """
+    safe = os.path.basename(filename).strip()
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", safe)
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    if not safe or safe in (".", ".."):
+        raise ValueError("檔名無效。")
+    stem, ext = os.path.splitext(safe)
+    # os.path.splitext(".png") -> (".png", "")，視為僅副檔名
+    if not ext and stem.startswith(".") and len(stem) > 1:
+        ext = stem
+        stem = ""
+    stem = stem.strip("_")
+    if not stem:
+        stem = datetime.now(DISPLAY_TZ).strftime("image_%Y%m%d_%H%M%S")
+    safe = f"{stem}{ext}"
+    if safe.startswith("."):
+        safe = f"image{safe}"
+    return safe
 
 
 def normalize_object_key(
@@ -197,11 +222,7 @@ def normalize_object_key(
         if sub:
             parts.append(sub)
 
-    safe = os.path.basename(filename).strip()
-    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", safe)
-    if not safe or safe in (".", ".."):
-        raise ValueError("檔名無效。")
-    parts.append(safe)
+    parts.append(_sanitize_upload_basename(filename))
     return "/".join(parts)
 
 

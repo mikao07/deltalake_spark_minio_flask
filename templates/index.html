@@ -46,7 +46,7 @@
                     value="release"
                     {% if snapshot_mode != "preview" %}checked{% endif %}
                   />
-                  <label class="form-check-label small" for="snapshot-mode-release">發行版（預設）</label>
+                  <label class="form-check-label small" for="snapshot-mode-release">正式版（預設）</label>
                 </div>
                 <div class="form-check form-check-inline mb-0">
                   <input
@@ -57,15 +57,15 @@
                     value="preview"
                     {% if snapshot_mode == "preview" %}checked{% endif %}
                   />
-                  <label class="form-check-label small" for="snapshot-mode-preview">最新預覽</label>
+                  <label class="form-check-label small" for="snapshot-mode-preview">試看版</label>
                 </div>
               </div>
             </div>
             <div class="col-12 col-md-5">
-              <label class="form-label mb-1">痛點快照對照（可複選，Ctrl/Command + 點選）</label>
+              <label class="form-label mb-1">不同時間的痛點對照（可複選，Ctrl/Command + 點選）</label>
               <select class="form-select form-select-sm" name="topic_snapshot" multiple size="3">
                 {% for snap in topic_snapshot_options %}
-                  <option value="{{ snap }}" {% if snap in selected_topic_snapshots %}selected{% endif %}>{{ snap }}</option>
+                  <option value="{{ snap }}" {% if snap in selected_topic_snapshots %}selected{% endif %}>{{ snap | display_time }}</option>
                 {% endfor %}
               </select>
             </div>
@@ -75,20 +75,20 @@
           </div>
           <div class="small text-muted mt-2">
             目前篩選：{% if selected_dataset_id %}<code>{{ selected_dataset_id }}</code>{% else %}全部{% endif %}
-            · 痛點顯示：
+            · 顯示模式：
             {% if snapshot_mode == "preview" %}
-              <span class="badge text-bg-warning">最新預覽</span>
-              {% if latest_snapshot_at %}<code>{{ latest_snapshot_at }}</code>{% endif %}
+              <span class="badge text-bg-warning">試看版</span>
+              {% if latest_snapshot_at %}<span class="text-muted">分析時間 {{ latest_snapshot_at | display_time }}</span>{% endif %}
             {% else %}
-              <span class="badge text-bg-success">發行版</span>
+              <span class="badge text-bg-success">正式版</span>
               {% if release_context and release_context.approved_snapshot_at %}
-                <code>{{ release_context.approved_snapshot_at }}</code>
+                <span class="text-muted">{{ release_filter_summary }}</span>
               {% else %}
-                <span class="text-warning">尚未核准</span>
+                <span class="text-warning">尚未建立正式版</span>
               {% endif %}
             {% endif %}
             {% if selected_topic_snapshots and selected_topic_snapshots|length > 0 %}
-              · 已選快照 {{ selected_topic_snapshots|length }} 個
+              · 已選 {{ selected_topic_snapshots|length }} 個時間點
             {% endif %}
           </div>
         </div>
@@ -118,7 +118,7 @@
                 <select class="form-select form-select-sm" id="topic-snap-del-select" {% if not topic_snapshot_options %}disabled{% endif %}>
                   <option value="">— 請選擇 —</option>
                   {% for snap in topic_snapshot_options %}
-                    <option value="{{ snap }}">{{ snap }}</option>
+                    <option value="{{ snap }}">{{ snap | display_time }}</option>
                   {% endfor %}
                 </select>
                 {% if not topic_snapshot_options %}
@@ -277,11 +277,11 @@
             <h2 class="h5 mb-0">痛點主題分類（topic / frequency）</h2>
             <div class="d-flex flex-wrap align-items-center gap-2">
               {% if snapshot_mode == "preview" %}
-                <span class="badge text-bg-warning">最新預覽 · 非發行版</span>
+                <span class="badge text-bg-warning">試看版</span>
               {% else %}
-                <span class="badge text-bg-success">發行版</span>
-                {% if release_context and release_context.release_id %}
-                  <span class="text-secondary small"><code>{{ release_context.release_id }}</code></span>
+                <span class="badge text-bg-success">正式版</span>
+                {% if release_card_subtitle %}
+                  <span class="text-secondary small">{{ release_card_subtitle }}</span>
                 {% endif %}
               {% endif %}
               <span class="text-secondary small">
@@ -294,13 +294,13 @@
           {% endif %}
           {% if corpus_coverage %}
             <div class="alert alert-secondary py-2 small mb-2">
-              <strong>母體完整度</strong>（MinIO 原圖 vs Silver 已分析）：
+              <strong>資料涵蓋範圍</strong>（MinIO 原圖 vs 已分析）：
               {% if corpus_coverage.error %}
                 <span class="text-warning">無法讀取：{{ corpus_coverage.error }}</span>
               {% else %}
                 <code>{{ corpus_coverage.coverage_label }}</code>
                 <span class="text-muted">
-                  （raw={{ corpus_coverage.raw_image_count }}，analyzed={{ corpus_coverage.analyzed_image_count }}）
+                  （上傳 {{ corpus_coverage.raw_image_count }} 張，已分析 {{ corpus_coverage.analyzed_image_count }} 張）
                 </span>
               {% endif %}
             </div>
@@ -349,7 +349,7 @@
                 <table class="table table-striped table-hover table-sm align-middle">
                   <thead class="table-light">
                     <tr>
-                      <th scope="col">snapshot_at</th>
+                      <th scope="col">分析時間</th>
                       <th scope="col">topic</th>
                       <th scope="col">frequency</th>
                     </tr>
@@ -357,7 +357,7 @@
                   <tbody>
                     {% for row in topic_compare_rows %}
                       <tr>
-                        <td class="small text-nowrap">{{ row.get("snapshot_at") }}</td>
+                        <td class="small text-nowrap">{{ row.get("snapshot_at") | display_time }}</td>
                         <td>{{ row.get("topic") }}</td>
                         <td>{{ row.get("frequency") }}</td>
                       </tr>
@@ -369,11 +369,9 @@
           {% else %}
             <div class="text-muted">
               {% if snapshot_mode == "preview" %}
-                目前沒有最新預覽可顯示。請用目前 dataset 重新執行一次
-                <code>POST /delta/gold/run</code>。
+                目前沒有可顯示的試看資料。請先對此資料集執行一次金層分析。
               {% else %}
-                尚無發行版痛點資料。請先執行 Gold ETL 後以
-                <code>pipeline_guardian --approve-snapshot</code> 核准，或切換至「最新預覽」調參。
+                尚無正式版痛點資料。請先完成金層分析並核准正式版，或暫時切換「試看版」調參。
               {% endif %}
             </div>
           {% endif %}
