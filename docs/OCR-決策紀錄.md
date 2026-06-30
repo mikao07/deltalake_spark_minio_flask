@@ -4,6 +4,49 @@
 
 ---
 
+## 速查：P 路線圖 vs 十項架構優化
+
+<a id="速查-p-vs-十項"></a>
+
+> **兩套東西不要混**：**P0～P4** 是本專案自訂的「治理／護佑」路線（能不能發行、壞資料、OOM）；**十項** 來自外部建議（大型企業 Delta 成熟度），**多數現階段不必做**。
+
+### P0～P4（本專案治理）— 程式面
+
+| 階段 | 一句話 | 狀態 |
+|:----:|--------|:----:|
+| **P0** | 正式版／試看版、manifest、核准快照、可追溯 | ✅ |
+| **P1** | 探針、新鮮度、通知（失敗可發現） | ✅ |
+| **P2** | quarantine、熔斷、銀層閘門、merge history | ✅ |
+| **P3** | Resource Guard（開工前擋過大／過忙） | ✅ |
+| **P4** | 執行期節流（分批 OCR 等） | ✅ 分批、逾時、repartition 接口（預設 0 關） |
+
+**尚未收尾（非漏做）**：drinks 營運驗收、黃金停用詞 v2。詳表 → [治理體系](#治理體系兩大區塊)。
+
+### 十項架構優化（企業級 Delta 建議）— 要不要做？
+
+來源：面試／架構討論之「百萬～千萬筆」視角；**你目前是單 dataset、約 50 張、單機 Spark**。
+
+| # | 建議是什麼 | 你現在 | **現在有必要？** |
+|:-:|------------|--------|:----------------:|
+| 1 | Bronze 真 CDC（`version` 遞增、Append-only） | MERGE 覆寫；Silver 用 `ingestion_timestamp` 取最新 | **否** |
+| 2 | Bronze 不 UPDATE：`history` + `latest_view` 分表 | merge 時可懶歸檔 `bronze/history/`；主表仍 MERGE | **部分**（已有 history；不必整表改 Append） |
+| 3 | Silver **CDF** → Gold 只吃變更 | Gold 整表自 Silver 重算 | **否**（Gold 仍很小） |
+| 4 | **Partition**（如 `dataset_id`） | 未 partition | **否**（僅 drinks 一個 id） |
+| 5 | **OPTIMIZE / ZORDER / VACUUM** 排程 | 未制度化 | **否**（列數極少） |
+| 6 | Delta **Checkpoint** 策略 | 未寫入手冊 | **否**（commit 數遠未成問題） |
+| 7 | **Time Travel** Rollback SOP | 撤回發行用 `--revoke-snapshot`（清 manifest，不還原 Delta） | **文件可補**；程式不急 |
+| 8 | **Schema Evolution** 明確策略 | Gold `mergeSchema` ✅；銀層 Schema 硬檢 | **部分**（已够用；可手冊寫一句） |
+| 9 | 每列 Metadata（`git_commit`、`docker_image`…） | 已有 `ocr_signature`、ETL 版本；run 級 `etl_metrics` | **否**（run 級夠用） |
+| 10 | **`quality_metrics` 表 + 30 天趨勢 Dashboard** | 銀層閘門 PASS/WARN + `etl_metrics.jsonl` | **否**（可選；量級不值得先做表） |
+
+**結論（防過度設計）**：
+
+- **十項全做 ≈ 過度設計**；與 P0～P4 **無關**，不阻塞 drinks 驗收。
+- **現階段值得做的只有**：P 路線圖收尾（**drinks 驗收**）+ 第 7、8 項若要的話 **只寫手冊 SOP**，不必大改程式。
+- **等觸發條件再做程式**：Bronze 要稽核多版 OCR（→ 1、2）、Gold 重算變慢（→ 3）、多 dataset／百萬列（→ 4～6）、品質要畫趨勢給主管（→ 10）。
+
+---
+
 ## 實作現況（對照用）
 
 | 項目 | 狀態 |
@@ -34,9 +77,10 @@
 | 上傳檔名剝前導 `_`（binaryFile 相容） | ✅ `minio_upload._sanitize_upload_basename` |
 | Gold `topic_snapshot` mergeSchema | ✅ 欄位演進時自動合併 schema |
 | preset router 子集調校（階段 4） | ❌ 未執行（**可選**；見下方待實作） |
-| 執行期節流（P4） | ⚠️ 部分 | MinIO fallback 分批 ✅；逾時／repartition 等見下方 |
+| 執行期節流（P4） | ✅ | MinIO fallback 分批、逾時、`OCR_REPARTITION`（預設 0）；見下方 |
 
-> **待完成項** → 見 **[治理體系（兩大區塊）](#治理體系兩大區塊)** 與各區塊「未完成」表。
+> **待完成項** → 見 **[治理體系（兩大區塊）](#治理體系兩大區塊)** 與各區塊「未完成」表。  
+> **P vs 十項架構** → 見上方 **[速查](#速查-p-vs-十項)**。
 
 ---
 
@@ -165,15 +209,15 @@ flowchart TB
 | 總開關 | ✅ | `ETL_RESOURCE_GUARD_ENABLED` |
 | Guard 拒絕時 **不發** LINE（刻意） | ✅ | 僅 HTTP 400；與熔斷通知分工 |
 
-### P3.1／P4 — 執行期節流（⚠️ 部分）
+### P3.1／P4 — 執行期節流（✅）
 
 | 項目 | 狀態 | 說明 |
 |------|:----:|------|
 | MinIO SDK **分批** fallback（degraded 時） | ✅ | `OCR_MINIO_BATCH_SIZE`；修「整批 50 張進 driver」 |
 | `write_mode=merge` + `image_paths` 點讀 | ✅ | 子集不 list 全目錄 |
 | API 回 `image_source`、`minio_batches_processed` | ✅ | 除錯用 |
-| **執行逾時** | ❌ | `OCR_TIMEOUT_SECONDS`、`SPARK_JOB_TIMEOUT_SECONDS` 在 `config.py`，**未接入** |
-| **OCR `repartition(N)`** | ❌ | 對齊 CPU／限制同時 OCR 並行；`OCR_REPARTITION` 未定義 |
+| **執行逾時** | ✅ | `OCR_TIMEOUT_SECONDS`（單張 OCR）、`SPARK_JOB_TIMEOUT_SECONDS`（`pipeline_etl_slot`）；**0=關閉** |
+| **OCR `repartition(N)`** | ✅ | `OCR_REPARTITION`；**預設 0 不強制**；擴量時設為 CPU 核心數 |
 | **Docker `cpus`／Spark `local[N]`** | ❌ | 曾討論，尚未制度化 |
 | **Guard 拒絕時 LINE + 冷卻**（可選） | ❌ | 非 OOM 主因 |
 
@@ -181,9 +225,8 @@ flowchart TB
 
 | 優先 | 項目 | 說明 |
 |:----:|------|------|
-| **P1** | **執行逾時接入** | 掛死 job 占滿 `ETL_MAX_CONCURRENT_JOBS=1`；與資料治理無關但阻塞營運 |
-| **P2** | **OCR repartition** | 本機 50 張若未 OOM 可延後；擴量前建議做 |
-| **P3** | Guard LINE 通知 | 可選；營運可先看 400 訊息 |
+| **P1** | **Guard LINE 通知** | 可選；營運可先看 400 訊息 |
+| **P2** | **Docker cpus／Spark local[N]** | 擴量前再制度化 |
 
 ---
 
@@ -193,11 +236,9 @@ flowchart TB
 
 | 順序 | 項目 | 歸屬 | 類型 |
 |:----:|------|------|------|
-| 1 | 執行逾時接入 | 系統維護 | 程式 |
-| 2 | drinks 缺口圖驗收 | 資料治理 | 營運 |
-| 3 | 黃金停用詞 v2 | 資料治理 | 詞表／manifest |
-| 4 | OCR repartition | 系統維護 | 程式 |
-| 5 | 銅層 merge UI（指定範圍自動帶 path） | 資料治理 | 程式 |
+| 1 | drinks 缺口圖驗收 | 資料治理 | 營運 |
+| 2 | 黃金停用詞 v2 | 資料治理 | 詞表／manifest |
+| 3 | 銅層 merge UI（指定範圍自動帶 path） | 資料治理 | 程式 |
 | — | preset router 子集 AB | 銅層品質 | **可選** |
 | — | 操作 `SOP.md` | 文件 | 可選 |
 

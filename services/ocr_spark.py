@@ -25,6 +25,8 @@ from config import (
     BRONZE_HISTORY_PATH,
     MAX_BRONZE_OCR_IMAGES,
     OCR_MINIO_BATCH_SIZE,
+    OCR_TIMEOUT_SECONDS,
+    SPARK_JOB_TIMEOUT_SECONDS,
     OCR_BINARIZE,
     OCR_CONTRAST,
     OCR_LANG,
@@ -46,6 +48,7 @@ from services.domain_lexicons import (
     resolve_local_ocr_user_words_path,
 )
 from services.minio_upload import ensure_bucket, get_minio_client
+from services.etl_runtime_limits import apply_ocr_repartition, resolve_ocr_repartition, run_ocr_with_timeout
 
 from services.media_validation import (
     SUPPORTED_IMAGE_EXTENSIONS,
@@ -428,7 +431,35 @@ def ocr_image_bytes_with_meta(
 ) -> dict[str, str] | None:
     """
     將影像二進位轉成 OCR 文字與 per-row ocr_signature（依實際 profile／前處理參數）。
+  單張逾時見 OCR_TIMEOUT_SECONDS（0=關閉）。
     """
+
+    def _run() -> dict[str, str] | None:
+        return _ocr_image_bytes_with_meta_impl(
+            image_content,
+            psm=psm,
+            user_words_path=user_words_path,
+            runtime_config=runtime_config,
+        )
+
+    result = run_ocr_with_timeout(_run, timeout_seconds=OCR_TIMEOUT_SECONDS)
+    if result is not None:
+        return result
+    if image_content is None:
+        return None
+    cfg = runtime_config or build_ocr_runtime_config()
+    sig = build_ocr_signature(cfg, profile="dark_ui", preprocess=_dark_ui_preprocess_params(cfg))
+    return {"extracted_text": "OCR_ERROR_TIMEOUT", "ocr_signature": sig}
+
+
+def _ocr_image_bytes_with_meta_impl(
+    image_content,
+    *,
+    psm: str | None = None,
+    user_words_path: str | None = None,
+    runtime_config: dict | None = None,
+) -> dict[str, str] | None:
+    """OCR 實作本體（不含逾時包裝）。"""
     try:
         import pytesseract
         from io import BytesIO
@@ -930,6 +961,7 @@ def _ocr_and_write_bronze_batch(
             "write_rows": 0,
             "history_archived_rows": 0,
             "bronze_history_path": "",
+            "ocr_repartition": 0,
         }
 
     if apply_append_skip and write_mode in ("append", "overwrite"):
@@ -946,7 +978,10 @@ def _ocr_and_write_bronze_batch(
             "write_rows": 0,
             "history_archived_rows": 0,
             "bronze_history_path": "",
+            "ocr_repartition": 0,
         }
+
+    df_base, ocr_repartition = apply_ocr_repartition(df_base)
 
     df_ocr = (
         df_base.withColumn("ocr_result", ocr_result_udf(col("image_content")))
@@ -968,6 +1003,7 @@ def _ocr_and_write_bronze_batch(
             "write_rows": 0,
             "history_archived_rows": 0,
             "bronze_history_path": "",
+            "ocr_repartition": ocr_repartition,
         }
 
     if write_mode == "merge":
@@ -989,6 +1025,7 @@ def _ocr_and_write_bronze_batch(
         "write_rows": write_rows,
         "history_archived_rows": int(merge_info.get("history_archived_rows") or 0),
         "bronze_history_path": str(merge_info.get("bronze_history_path") or ""),
+        "ocr_repartition": ocr_repartition,
     }
 
 
@@ -1034,6 +1071,7 @@ def _run_bronze_ocr_minio_batched(
     batches_processed = 0
     wrote_any = False
     effective_mode = write_mode
+    ocr_repartition_applied = 0
 
     for batch_paths in path_batches:
         rows = _read_minio_image_rows(batch_paths)
@@ -1066,6 +1104,10 @@ def _run_bronze_ocr_minio_batched(
         totals["history_archived_rows"] += int(batch_stats.get("history_archived_rows") or 0)
         if batch_stats.get("bronze_history_path"):
             bronze_history_path = str(batch_stats["bronze_history_path"])
+        ocr_repartition_applied = max(
+            ocr_repartition_applied,
+            int(batch_stats.get("ocr_repartition") or 0),
+        )
 
     return {
         "input_rows": totals["input_rows"],
@@ -1086,6 +1128,17 @@ def _run_bronze_ocr_minio_batched(
             "preprocess_version": ocr_cfg.get("preprocess_version"),
             "preset_router_enabled": ocr_cfg.get("preset_router_enabled"),
         },
+        **_bronze_p4_runtime_meta(ocr_repartition_applied=ocr_repartition_applied),
+    }
+
+
+def _bronze_p4_runtime_meta(*, ocr_repartition_applied: int = 0) -> dict:
+    """P4 執行期節流：API 回傳用（config + 本批實際套用）。"""
+    return {
+        "ocr_timeout_seconds": int(OCR_TIMEOUT_SECONDS),
+        "spark_job_timeout_seconds": int(SPARK_JOB_TIMEOUT_SECONDS),
+        "ocr_repartition_config": resolve_ocr_repartition(),
+        "ocr_repartition_applied": int(ocr_repartition_applied),
     }
 
 
@@ -1169,6 +1222,9 @@ def run_bronze_ocr_ingest(
             "image_source": "binaryFile",
             "minio_batches_processed": 0,
             "ocr_minio_batch_size": batch_size,
+            **_bronze_p4_runtime_meta(
+                ocr_repartition_applied=int(batch_stats.get("ocr_repartition") or 0),
+            ),
         }
 
     return {
@@ -1190,6 +1246,9 @@ def run_bronze_ocr_ingest(
             "preprocess_version": ocr_cfg.get("preprocess_version"),
             "preset_router_enabled": ocr_cfg.get("preset_router_enabled"),
         },
+        **_bronze_p4_runtime_meta(
+            ocr_repartition_applied=int(batch_stats.get("ocr_repartition") or 0),
+        ),
     }
 
 

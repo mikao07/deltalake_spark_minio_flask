@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 
 import psutil
+from pyspark.sql import SparkSession
 
 from config import (
     ETL_MAX_CONCURRENT_JOBS,
@@ -23,6 +24,7 @@ from config import (
     MAX_UPLOAD_FILES_PER_REQUEST,
     MAX_UPLOAD_MB,
 )
+from services.etl_runtime_limits import SparkJobTimeoutError, spark_job_timeout_guard
 
 
 _logger = logging.getLogger(__name__)
@@ -151,12 +153,19 @@ def _release_pipeline_slot() -> None:
 
 
 @contextmanager
-def pipeline_etl_slot(*, operation: str = "ETL") -> Iterator[None]:
-    """Pipeline Guard：併發槽 + Runtime 檢查（進入前）。"""
+def pipeline_etl_slot(
+    *,
+    operation: str = "ETL",
+    spark: SparkSession | None = None,
+) -> Iterator[None]:
+    """Pipeline Guard：併發槽 + Runtime 檢查（進入前）+ 可選 Spark job 逾時（P4）。"""
     check_runtime_for_etl(operation)
     _acquire_pipeline_slot()
     try:
-        yield
+        with spark_job_timeout_guard(spark, operation=operation):
+            yield
+    except SparkJobTimeoutError as e:
+        raise ResourceGuardError(str(e)) from e
     finally:
         _release_pipeline_slot()
 

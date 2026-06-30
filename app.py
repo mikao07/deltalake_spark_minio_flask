@@ -266,6 +266,14 @@ def _get_spark_manager() -> SparkManager:
     return _spark_manager
 
 
+def _spark_for_etl():
+    """ETL 逾時守衛用；Spark 尚未就緒時回傳 None（逾時守衛自動略過）。"""
+    try:
+        return _get_spark_manager().spark
+    except Exception:
+        return None
+
+
 def _noop_progress(_step: int, _total: int, _msg: str) -> None:
     return None
 
@@ -310,7 +318,7 @@ def _execute_pipeline_to_gold_inner(
     missing_paths: list[str] = list(gap.get("missing_paths") or [])
     raw_backfill_count = int(gap.get("missing_count") or 0)
     try:
-        with pipeline_etl_slot(operation="pipeline_to_gold"):
+        with pipeline_etl_slot(operation="pipeline_to_gold", spark=spark):
             if raw_backfill_count > 0:
                 progress(1, 3, f"銅層 Bronze OCR（補 raw 缺口 {raw_backfill_count} 張）…")
                 check_bronze_ocr_batch(raw_backfill_count)
@@ -440,7 +448,7 @@ def _execute_bronze_ocr_inner(
     started = time.perf_counter()
     spark = _get_spark_manager().spark
     try:
-        with pipeline_etl_slot(operation="bronze_ocr"):
+        with pipeline_etl_slot(operation="bronze_ocr", spark=_spark_for_etl()):
             progress(1, 1, "Bronze OCR（讀圖、Tesseract）…")
             bronze_result = run_bronze_ocr_ingest(
                 spark,
@@ -1681,7 +1689,7 @@ def delta_gold_run():
     _get_spark_manager()
     started = time.perf_counter()
     try:
-        with pipeline_etl_slot(operation="gold_etl"):
+        with pipeline_etl_slot(operation="gold_etl", spark=_spark_for_etl()):
             gold_result = run_gold_etl(
                 silver_ocr_path=silver_ocr_path,
                 dataset_id=dataset_id,
@@ -2097,7 +2105,7 @@ def delta_silver_ocr_run():
 
     started = time.perf_counter()
     try:
-        with pipeline_etl_slot(operation="silver_ocr_etl"):
+        with pipeline_etl_slot(operation="silver_ocr_etl", spark=_spark_for_etl()):
             result = run_silver_ocr_etl(
                 bronze_path=bronze_path,
                 silver_ocr_path=silver_ocr_path,
@@ -2840,7 +2848,7 @@ def api_upload_images():
             return _json_error(str(e), 400)
         spark = _get_spark_manager().spark
         try:
-            with pipeline_etl_slot(operation="upload_then_bronze_ocr"):
+            with pipeline_etl_slot(operation="upload_then_bronze_ocr", spark=_spark_for_etl()):
                 bronze_result = run_bronze_ocr_ingest(
                     spark,
                     raw_images_path=raw_path,
