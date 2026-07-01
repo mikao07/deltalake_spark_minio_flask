@@ -59,7 +59,9 @@
 | 管線守護神 + `manifests/drinks.json` | ✅ 已完成 |
 | `approved_snapshot_at` 核准快照 | ✅ 已完成 |
 | `/layers` 黃金／探索雙軌辭典 UI | ✅ 已完成 |
-| 首頁發行版｜最新預覽（發行契約閉環） | ✅ 已完成 |
+| 首頁發行版｜試看版（發行契約閉環） | ✅ 已完成 |
+| 首頁 **快照對照**（多選 `topic_snapshot` 跨時間） | ✅ 已完成 |
+| 首頁 **母體完整度**（有效 OCR N/50，與發行版正交） | ✅ 已完成 |
 | 條件式新鮮度（圖片水位差）+ 外部 cron | ✅ 已完成 |
 | 開發期撤回發行 `--revoke-snapshot` | ✅ 已完成 |
 | 外部探針 + 可換通知後端（Discord／LINE Notify） | ✅ 已完成（`pipeline_probe.py`） |
@@ -140,7 +142,9 @@ flowchart TB
 
 | 項目 | 狀態 | 模組／端點 |
 |------|:----:|------------|
-| 首頁 **發行版**｜**最新預覽**；無核准不靜默 fallback | ✅ | `release_contract.py`、`/` Dashboard |
+| 首頁 **正式版**｜**試看版**；無核准不靜默 fallback | ✅ | `release_contract.py`、`/` Dashboard |
+| 首頁 **快照對照**（多選 `topic_snapshot`） | ✅ | `get_gold_topic_snapshot_comparison`、`/` |
+| 首頁 **母體完整度**（Silver distinct／MinIO raw） | ✅ | `_corpus_coverage_for_dataset`、`/` |
 | `approved_snapshot_at` + `--approve-snapshot`／`--revoke-snapshot` | ✅ | `pipeline_guardian.py`、`manifests/*.json` |
 | 雙軌停用詞（黃金 `v1.0.0`／探索 `dev`） | ✅ | `lexicon.py`、`collect_gold_dual_lexicon()` |
 | `topic_snapshot` 寫入 `release_lexicon_version`、`lexicon_content_hash` | ✅ | Gold ETL |
@@ -295,7 +299,7 @@ flowchart TB
 | `analytics_tokens` | **黃金發行** `v1.0.0/` | 痛點漏斗（`effective_stop = 停用詞 − 痛點保護詞`）→ 主題快照 |
 | `tfidf_exploration_tokens` | **探索測試** `dev/` | Phase A TF-IDF（探索停用詞 + 虛詞，**不**扣痛點保護） |
 
-**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版（`approved_snapshot_at` 對應的 `topic_snapshot`）；探索軌可持續調詞。首頁預設 **發行版**，可切換 **最新預覽**；無核准時不靜默 fallback 至 latest。
+**治理原則**：對外簡報／模型只吃 manifest 核准的黃金發行版（`approved_snapshot_at` 對應的 `topic_snapshot`）；探索軌可持續調詞。首頁預設 **正式版**，可切換 **試看版**；可多選 **快照對照**；無核准時不靜默 fallback 至 latest。
 
 ---
 
