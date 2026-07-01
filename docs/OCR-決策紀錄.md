@@ -64,7 +64,7 @@
 | 首頁 **母體完整度**（有效 OCR N/50，與發行版正交） | ✅ 已完成 |
 | 條件式新鮮度（圖片水位差）+ 外部 cron | ✅ 已完成 |
 | 開發期撤回發行 `--revoke-snapshot` | ✅ 已完成 |
-| 外部探針 + 可換通知後端（Discord／LINE Notify） | ✅ 已完成（`pipeline_probe.py`） |
+| 外部探針 + 可換通知後端（Discord／LINE Messaging API） | ✅ 已完成（`pipeline_probe.py`；`PIPELINE_NOTIFY_BACKEND`） |
 | Compose `manifests`／`var` volume 掛載 | ✅ 已完成 |
 | Compose 全檔 OCR 環境變數明列 | ✅ 三份 compose 已對齊 |
 | per-row `ocr_signature` | ✅ UDF 依實際 profile 產生 |
@@ -161,7 +161,7 @@ flowchart TB
 | `GET /ready`、storage 健康 | ✅ | 部署／探針前置 |
 | 外部探針 `pipeline_probe.py --strict` | ✅ | ready + guardian + freshness |
 | 條件式新鮮度（圖片水位差） | ✅ | `pipeline_freshness_check.py`、`var/pipeline_heartbeat.json` |
-| 探針／新鮮度 FAIL → Discord／LINE | ✅ | `PIPELINE_NOTIFY_BACKEND` |
+| 探針／新鮮度 FAIL → Discord／LINE Messaging API | ✅ | `PIPELINE_NOTIFY_BACKEND`（非 LINE Notify） |
 | Bronze 軟／硬熔斷 → WARN／ALERT 通知 | ✅ | `pipeline_notify.py`（與 cron 探針互補） |
 | Windows 排程包裝 | ✅ | `scripts/run_pipeline_probe.ps1` |
 | 3am 自動排程 ETL | ❌ **不採用** | 本專案手動觸發；靠探針發現「忘了跑／跑掛」 |
